@@ -1,0 +1,4 @@
+These are the two models themselves. Annoying part of the codebase, a few things to note:
+1. Both include a `generate` function which allows for next-token-prediction generation (i.e. responding to question)
+2. `decoder` file is pretty simple
+3. `double_decoder` is more complicated, if we end up using the combo attention, since combo attention requires log-sum-exp which the flex attention block-based method can give but normal scaled-dot-product attention in PyTorch doesn't. So I created one function for both PT and SFT combined, that always takes in **blocks** even though SFT doesn't really need blocks (because SFT acts like a normal encoder decoder with causal in encoder and full in decoder). Would be great for PyTorch to fix this and save us some time, but for now idrk.

@@ -1,0 +1,1 @@
+My attempt at a tokenizer using HFs API. I think it does well -- it did pretty well in my tests -- but one of you might find that there's a problem with it or want to make it faster. 

@@ -1,0 +1,1 @@
+These files train and SFT models. There isn't everything you need to run it directly since these will depend on hydra / omegaconf files that we'll need to create, but in the past they have worked. One thing to note is the whole multi-gpu / accumulation math -- that's the only thing I am confident **is** correct, since I spent like 3 weeks working on it.

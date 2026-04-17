@@ -1,0 +1,1 @@
+Scripts for retrieving data -- slimpajama for PT, ultrachat for SFT. Zero clue how to create multiple datasets here for sharding or similar, Ben can figure that out.

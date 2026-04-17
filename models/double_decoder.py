@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from components.block_masks import create_sft_masks, create_pretrain_masks, create_inference_masks, create_masks
 from components.initialization import initialize_model
 import time
-class BasicEDModel(nn.Module):
+class Double_Decoder(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -21,7 +21,7 @@ class BasicEDModel(nn.Module):
         init_strategy = "xavier_uniform",
         **kwargs
     ):
-        super(BasicEDModel, self).__init__()
+        super(Double_Decoder, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
         # Token embeddings  

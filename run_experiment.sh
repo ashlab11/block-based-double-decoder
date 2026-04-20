@@ -19,8 +19,8 @@ echo "════════════════════════�
 # ── Step 1: Install dependencies ─────────────────────────────────────────────
 echo ""
 echo "── Step 1: Installing dependencies ──"
-pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.9.0 transformers datasets hydra-core omegaconf matplotlib tqdm flash-attn --no-build-isolation 2>/dev/null || true
-pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.9.0 transformers datasets hydra-core omegaconf matplotlib tqdm
+pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets hydra-core omegaconf matplotlib tqdm flash-attn --no-build-isolation 2>/dev/null || true
+pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets hydra-core omegaconf matplotlib tqdm
 
 # Verify GPU
 python -c "

@@ -63,6 +63,7 @@ echo ""
 
 mkdir -p checkpoints
 
+export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 torchrun --nproc_per_node=1 training/pretrain.py
 
 echo ""

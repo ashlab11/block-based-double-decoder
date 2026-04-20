@@ -6,7 +6,7 @@ This module implements a combo-attention and self-attention layer with RoPE.
 import torch
 import torch.nn as nn
 from torchtune.modules import RotaryPositionalEmbeddings
-from torch.nn.attention.flex_attention import flex_attention, AuxRequest
+from torch.nn.attention.flex_attention import flex_attention
 from flash_attn import flash_attn_func
 
 class SelfAttention(nn.Module):
@@ -133,9 +133,8 @@ class ComboAttention(nn.Module):
             
             assert self_mask is not None and cross_mask is not None, "Self and cross masks must both be not None"
 
-            dec_output, dec_aux = flex_attention(query, dec_key, dec_value, block_mask=self_mask, return_aux=AuxRequest(lse=True))
-            enc_output, enc_aux = flex_attention(query, enc_key, enc_value, block_mask=cross_mask, return_aux=AuxRequest(lse=True)) #[B, L, N_h]
-            dec_lse, enc_lse = dec_aux.lse, enc_aux.lse
+            dec_output, dec_lse = flex_attention(query, dec_key, dec_value, block_mask=self_mask, return_lse=True)
+            enc_output, enc_lse = flex_attention(query, enc_key, enc_value, block_mask=cross_mask, return_lse=True)
             
         if self.logit_biases:
             #Temperatures and logit biases help to self-stabilize during training -- they will hopefully be close to 0/1 respectively by the end

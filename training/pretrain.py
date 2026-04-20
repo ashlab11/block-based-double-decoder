@@ -42,8 +42,17 @@ def _all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _get_eager_model(model):
+    """Unwrap DDP and torch.compile to get the eager model for eval."""
+    m = model.module if isinstance(model, DDP) else model
+    if hasattr(m, '_orig_mod'):
+        m = m._orig_mod
+    return m
+
+
 def eval(model, eval_dataloader, device):
-    model.eval()
+    eager_model = _get_eager_model(model)
+    eager_model.eval()
     with torch.no_grad():
         local_loss_times_tokens = torch.zeros(1, dtype=torch.float64, device=device)
         local_tokens = torch.zeros(1, dtype=torch.float64, device=device)
@@ -53,7 +62,7 @@ def eval(model, eval_dataloader, device):
                 for key, value in eval_batch.items()
             }
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                eval_outputs = model(**eval_batch)
+                eval_outputs = eager_model(**eval_batch)
             ntoks = (eval_batch["labels"] != -100).sum().to(dtype=torch.float64)
             local_loss_times_tokens += eval_outputs["loss"].detach().to(dtype=torch.float64) * ntoks
             local_tokens += ntoks
@@ -63,7 +72,7 @@ def eval(model, eval_dataloader, device):
         avg_loss = loss_times_tokens / max(1, total_tokens)
         eval_ppl = float(torch.exp(torch.tensor(avg_loss)))
 
-    model.train()
+    eager_model.train()
     return avg_loss, eval_ppl
 
 

@@ -37,7 +37,7 @@ token_counts = {
 print(f"▶ Retrieving {tok_m}M tokens from SlimPajama")
 
 try:
-    ds = load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
+    ds = load_dataset("DKYoon/SlimPajama-6B", split="train", streaming=True)
 except Exception as e:
     print(f"Error loading dataset: {e}")
     sys.exit(1)

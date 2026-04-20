@@ -73,3 +73,7 @@ with output_file.open("w", encoding="utf-8") as f, test_file.open("w") as tgt:
             print(f"  ✓ {tok_so_far:,} tokens written")
             prev_tokens = tok_so_far
 
+print(f"Done: {tok_so_far:,} tokens written")
+import os
+os._exit(0)
+

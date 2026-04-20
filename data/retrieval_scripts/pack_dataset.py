@@ -66,5 +66,5 @@ if __name__ == "__main__":
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_file="tokenizer/tokenizer.json"
     )
-    build_packed_dataset("data/SFT/slimpajama_eval.jsonl", "data/Pretrain/slimpajama_eval_packed.jsonl", tokenizer, SEQ_LEN)
+    build_packed_dataset("data/Pretrain/slimpajama_eval.jsonl", "data/Pretrain/slimpajama_eval_packed.jsonl", tokenizer, SEQ_LEN)
     build_packed_dataset("data/Pretrain/slimpajama.jsonl", "data/Pretrain/slimpajama_packed.jsonl", tokenizer, SEQ_LEN)

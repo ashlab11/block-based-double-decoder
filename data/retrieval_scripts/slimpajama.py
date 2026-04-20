@@ -19,7 +19,11 @@ def n_tokens(txt:str) -> int:
 OUT_DIR = Path("data/Pretrain")
 OUT_DIR.mkdir(exist_ok=True)
 
-target_tokens = 500_000_000
+import argparse
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--tokens", type=int, default=50_000_000, help="Target token count (default: 50M)")
+_args, _ = _parser.parse_known_args()
+target_tokens = _args.tokens
 tok_m = target_tokens // 1_000_000
 
 token_counts = {

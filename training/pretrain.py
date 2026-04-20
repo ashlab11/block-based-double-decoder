@@ -19,6 +19,7 @@ import time
 
 from models.double_decoder import Double_Decoder
 from models.decoder import DecoderOnlyModel
+from configs import TrainingConfig, build_config_from_dict
 
 def _init_distributed() -> bool:
     if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -106,18 +107,7 @@ def pretrain(cfg: TrainingConfig, verbose = 0) -> str:
     model, hparams = build_model(cfg, tokenizer.vocab_size)
     model = model.to(device)
     
-    #Recurrent model needs to be compiled stepwise since it has a lot of data-dependent breaks, this keeps it fast
-    if issubclass(cfg.model_cls, RecurrentModel):
-        model._prelude = torch.compile(model._prelude, fullgraph=True, dynamic=False)
-        model._coda = torch.compile(model._coda, fullgraph=True, dynamic=False)
-        model._recur_loop = torch.compile(model._recur_loop, fullgraph=True, dynamic=False)
-        model.decode = torch.compile(model.decode, fullgraph=True, dynamic=False)
-    elif issubclass(cfg.model_cls, RecurrentDecoderModel) or issubclass(cfg.model_cls, SimpleRecurrentDecoderModel):
-        model._prelude = torch.compile(model._prelude, fullgraph=True, dynamic=False)
-        model._coda = torch.compile(model._coda, fullgraph=True, dynamic=False)
-        model._recur_loop = torch.compile(model._recur_loop, fullgraph=True, dynamic=False)
-    else: 
-        model = torch.compile(model, fullgraph=False, dynamic=False)
+    model = torch.compile(model, fullgraph=False, dynamic=False)
 
     ds = load_dataset("json", data_files=cfg.train_file, split="train")
     eval_ds = load_dataset("json", data_files=cfg.eval_file, split="train")

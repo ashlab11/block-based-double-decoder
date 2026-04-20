@@ -46,7 +46,7 @@ class ComboDecoderLayer(nn.Module):
         mlp_dim = mlp_dim or 4 * dim 
         
         # Self-attention block
-        self.combo_attn = ComboAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, shared=shared, logit_biases=logit_biases, adapter_rank=adapter_rank)
+        self.combo_attn = ComboAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, shared=shared, logit_biases=logit_biases)
         self.norm1 = nn.RMSNorm(dim)
         
         # MLP block

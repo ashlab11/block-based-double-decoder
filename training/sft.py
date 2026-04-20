@@ -13,7 +13,8 @@ from accelerate import Accelerator
 import matplotlib.pyplot as plt
 import hydra
 from omegaconf import DictConfig
-from src.pretrain import build_model
+from training.pretrain import build_model
+from configs import TrainingConfig, build_config_from_dict
 
 def _init_distributed() -> bool:
     if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:

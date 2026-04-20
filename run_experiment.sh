@@ -11,6 +11,7 @@
 # Estimated time on H100: ~15-30 minutes total (data + train)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+export HYDRA_FULL_ERROR=1
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Block-Based Double Decoder — 15M params, 50M tokens"

@@ -11,6 +11,7 @@ import sys
 import os
 import math
 import argparse
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -160,6 +161,7 @@ def check_micro_train(steps=100):
     model.train()
 
     losses = []
+    train_start = time.time()
     for i in range(steps):
         batch = _random_batch(batch_size=2, device=device)
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
@@ -170,12 +172,19 @@ def check_micro_train(steps=100):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        if (i + 1) % 25 == 0:
-            print(f"    Step {i+1}: loss={losses[-1]:.4f}")
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - train_start
+            steps_per_sec = (i + 1) / max(elapsed, 1e-6)
+            eta = (steps - i - 1) / max(steps_per_sec, 1e-6)
+            print(f"    Step {i+1:>3}/{steps} | loss={losses[-1]:.4f} | "
+                  f"{steps_per_sec:.1f} step/s | elapsed {elapsed:.0f}s | ETA {eta:.0f}s")
 
+    total_time = time.time() - train_start
     first_loss = np.mean(losses[:5])
     last_loss = np.mean(losses[-5:])
     reduction = (first_loss - last_loss) / first_loss
+
+    print(f"    Total: {steps} steps in {total_time:.1f}s ({steps/max(total_time,1e-6):.1f} step/s)")
 
     ok = True
     ok &= _print_result("No NaN losses", all(math.isfinite(l) for l in losses))
@@ -513,14 +522,18 @@ def main():
 
     print("=" * 60)
     print("  PREFLIGHT SANITY CHECKS — 1B Double Decoder")
+    print(f"  Running {len(checks)} checks")
     print("=" * 60)
 
+    suite_start = time.time()
     results = {}
-    for name in checks:
+    timings = {}
+    for i, name in enumerate(checks):
         if name not in ALL_CHECKS:
             print(f"\nUnknown check: {name}")
             print(f"Available: {', '.join(ALL_CHECKS.keys())}")
             sys.exit(1)
+        check_start = time.time()
         try:
             if name == "micro_train":
                 passed = ALL_CHECKS[name](steps=args.steps)
@@ -531,16 +544,25 @@ def main():
             import traceback
             traceback.print_exc()
             passed = False
+        check_elapsed = time.time() - check_start
         results[name] = passed
+        timings[name] = check_elapsed
+
+        suite_elapsed = time.time() - suite_start
+        status = "✓" if passed else "✗"
+        print(f"  [{status}] {name} — {check_elapsed:.1f}s "
+              f"(check {i+1}/{len(checks)}, total elapsed {suite_elapsed:.0f}s)")
 
     # Summary
+    suite_total = time.time() - suite_start
     print("\n" + "=" * 60)
     n_pass = sum(results.values())
     n_total = len(results)
-    print(f"  Results: {n_pass}/{n_total} checks passed")
+    print(f"  Results: {n_pass}/{n_total} checks passed in {suite_total:.1f}s")
+    print()
     for name, passed in results.items():
         status = "✓" if passed else "✗"
-        print(f"    [{status}] {name}")
+        print(f"    [{status}] {name:<30s} {timings[name]:>6.1f}s")
     print("=" * 60)
 
     if not all(results.values()):

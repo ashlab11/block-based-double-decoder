@@ -291,14 +291,18 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     save_steps = cfg.save_steps // cfg.grad_accum_steps
 
     max_steps = cfg.max_steps if cfg.max_steps > 0 else float('inf')
+    effective_max = min(max_steps, num_accumulations)
     tokens_per_step = cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size
     step_start_time = time.time()
+    training_start_time = time.time()
 
     # Skip batches if resuming
     skip_batches = start_step * steps_per_accum_per_gpu
 
     if rank == 0:
-        print(f"Training for {num_accumulations} accumulation steps ({tokens_per_step:,} tokens/step)")
+        print(f"Training for {effective_max:,} accumulation steps ({tokens_per_step:,} tokens/step)")
+        total_tok = effective_max * tokens_per_step
+        print(f"Total tokens to process: {total_tok:,} ({total_tok / 1e9:.2f}B)")
         if cfg.max_steps > 0:
             print(f"Early stopping after {cfg.max_steps} steps")
 
@@ -320,29 +324,49 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
 
         if (batch_idx + 1) % steps_per_accum_per_gpu == 0:
             grad = clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-            if step % 100 == 0 and rank == 0:
-                elapsed = time.time() - step_start_time
-                toks_per_sec = tokens_per_step / max(elapsed, 1e-6) if step > start_step else 0
-                print(f"Step {step}/{num_accumulations} - grad_norm: {grad.item():.4f} - tokens/sec: {toks_per_sec:,.0f}")
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
+
+            # ── Progress reporting ───────────────────────────────────────
+            if rank == 0 and step % 10 == 0:
+                elapsed_total = time.time() - training_start_time
+                steps_done = step - start_step
+                step_elapsed = time.time() - step_start_time
+                toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
+                pct = 100 * step / effective_max
+                steps_remaining = effective_max - step
+                eta_sec = steps_remaining * (elapsed_total / max(steps_done, 1))
+
+                def _fmt(s):
+                    if s < 60: return f"{s:.0f}s"
+                    elif s < 3600: return f"{s/60:.1f}m"
+                    else: return f"{s/3600:.1f}h"
+
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"  [{pct:5.1f}%] Step {step:>6,}/{effective_max:,} | "
+                      f"loss {loss_value:.4f} | grad {grad.item():.4f} | "
+                      f"lr {current_lr:.2e} | {toks_per_sec:,.0f} tok/s | "
+                      f"elapsed {_fmt(elapsed_total)} | ETA {_fmt(eta_sec)}")
+
             step_start_time = time.time()
 
             if logging_steps > 0 and step % logging_steps == 0 and rank == 0:
                 current_lr = scheduler.get_last_lr()[0]
-                if verbose > 1:
-                    print(f"Step {step}/{num_accumulations} - loss: {loss_value:.4f}")
                 train_losses.append(loss_value)
                 train_steps_arr.append(step)
                 grad_norms.append(grad.item())
                 if use_wandb:
+                    elapsed_total = time.time() - training_start_time
+                    steps_done = step - start_step
+                    toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
                     wandb.log({
                         "train/loss": loss_value,
                         "train/grad_norm": grad.item(),
                         "train/lr": current_lr,
                         "train/step": step,
+                        "train/tokens_per_sec": toks_per_sec,
                     }, step=step)
 
             if eval_steps > 0 and step % eval_steps == 0:

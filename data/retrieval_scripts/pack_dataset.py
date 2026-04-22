@@ -16,7 +16,17 @@ Usage:
 from datasets import load_dataset
 import json
 import argparse
+import time
 from transformers import PreTrainedTokenizerFast
+
+
+def _fmt_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        return f"{seconds / 3600:.1f}h"
 
 
 def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
@@ -27,6 +37,8 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
     current = [bos_id]
     buf = []
     num_sequences = 0
+    start_time = time.time()
+    last_report_time = start_time
 
     for doc in ds:
         ids = doc["input_ids"]
@@ -39,8 +51,6 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
                 if len(buf) >= buffer_size:
                     writer.writelines(buf)
                     buf.clear()
-                if num_sequences % 100_000 == 0:
-                    print(f"  Packed {num_sequences:,} sequences...")
                 ids = ids[take:]
                 current = [bos_id]
             else:
@@ -55,8 +65,6 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
                     if len(buf) >= buffer_size:
                         writer.writelines(buf)
                         buf.clear()
-                    if num_sequences % 100_000 == 0:
-                        print(f"  Packed {num_sequences:,} sequences...")
                     current = [bos_id]
                 if space == 0:
                     buf.append(json.dumps({"input_ids": current}) + "\n")
@@ -64,13 +72,23 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
                     if len(buf) >= buffer_size:
                         writer.writelines(buf)
                         buf.clear()
-                    if num_sequences % 100_000 == 0:
-                        print(f"  Packed {num_sequences:,} sequences...")
                     current = [bos_id]
                 ids = []
 
+            # Progress report every 15 seconds
+            now = time.time()
+            if now - last_report_time >= 15:
+                elapsed = now - start_time
+                seqs_per_sec = num_sequences / max(elapsed, 1)
+                tokens_packed = num_sequences * ctx_len
+                print(f"  {num_sequences:>10,} seqs | {tokens_packed:,} tokens | "
+                      f"{seqs_per_sec:,.0f} seq/s | elapsed {_fmt_time(elapsed)}")
+                last_report_time = now
+
     writer.writelines(buf)
-    print(f"  Done: {num_sequences:,} sequences packed")
+    elapsed = time.time() - start_time
+    seqs_per_sec = num_sequences / max(elapsed, 1)
+    print(f"  Done: {num_sequences:,} sequences in {_fmt_time(elapsed)} ({seqs_per_sec:,.0f} seq/s)")
     return num_sequences
 
 
@@ -95,7 +113,9 @@ if __name__ == "__main__":
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
 
+    total_start = time.time()
     # Pack eval first (smaller)
     build_packed_dataset(args.eval_input, args.eval_output, tokenizer, args.seq_len)
     # Pack train
     build_packed_dataset(args.input, args.output, tokenizer, args.seq_len)
+    print(f"\nAll packing complete in {_fmt_time(time.time() - total_start)}")

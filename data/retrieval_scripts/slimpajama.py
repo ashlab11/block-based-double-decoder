@@ -16,11 +16,21 @@ import sys
 import unicodedata
 import numpy as np
 import argparse
+import time
 from tqdm import tqdm
 
 
 def n_tokens(txt: str) -> int:
     return len(txt) // 4  # ~4 chars per token on average
+
+
+def _fmt_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        return f"{seconds / 3600:.1f}h"
 
 
 def main():
@@ -66,7 +76,14 @@ def main():
     print(f"Writing to {output_file}")
 
     tok_so_far = 0
-    pbar = tqdm(total=target_tokens, unit="tok", unit_scale=True, desc="Downloading")
+    docs_written = 0
+    docs_skipped = 0
+    start_time = time.time()
+    last_detail_time = start_time
+
+    # tqdm gives a live progress bar with ETA
+    pbar = tqdm(total=target_tokens, unit="tok", unit_scale=True, desc="Downloading",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
 
     with output_file.open("w", encoding="utf-8") as f, eval_file.open("w", encoding="utf-8") as tgt:
         for ex in ds:
@@ -83,6 +100,7 @@ def main():
             set_name = meta.get("redpajama_set_name")
 
             if set_name not in token_counts or token_counts[set_name]["so_far"] >= token_counts[set_name]["count"]:
+                docs_skipped += 1
                 continue
 
             text = unicodedata.normalize("NFKC", ex["text"])
@@ -95,11 +113,29 @@ def main():
 
             f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
             tok_so_far += n_tok
+            docs_written += 1
             token_counts[set_name]["so_far"] += n_tok
             pbar.update(n_tok)
 
+            # Detailed status every 60 seconds (above the progress bar)
+            now = time.time()
+            if now - last_detail_time >= 60:
+                elapsed = now - start_time
+                pct = 100 * tok_so_far / target_tokens
+                tqdm.write(
+                    f"  [{pct:5.1f}%] {docs_written:,} docs written, {docs_skipped:,} skipped | "
+                    f"elapsed {_fmt_time(elapsed)} | "
+                    f"domains: " + ", ".join(
+                        f"{k.replace('RedPajama','')}: {100*v['so_far']/max(1,v['count']):.0f}%"
+                        for k, v in token_counts.items()
+                    )
+                )
+                last_detail_time = now
+
     pbar.close()
-    print(f"\nDone: {tok_so_far:,} tokens written")
+    elapsed = time.time() - start_time
+    print(f"\nDone: {tok_so_far:,} tokens in {docs_written:,} docs")
+    print(f"Total time: {_fmt_time(elapsed)} ({tok_so_far / max(elapsed, 1):,.0f} tok/s avg)")
     print("Domain breakdown:")
     for name, info in token_counts.items():
         pct = 100 * info["so_far"] / max(1, tok_so_far)

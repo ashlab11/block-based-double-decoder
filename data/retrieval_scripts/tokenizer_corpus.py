@@ -10,6 +10,18 @@ from pathlib import Path
 import json
 import argparse
 import unicodedata
+import time
+
+
+def _fmt_time(seconds):
+    """Format seconds as human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        return f"{seconds / 3600:.1f}h"
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -26,7 +38,9 @@ def main():
     ds = load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
 
     tok_so_far = 0
-    prev_tokens = 0
+    docs_written = 0
+    start_time = time.time()
+    last_report_time = start_time
 
     with out_path.open("w", encoding="utf-8") as f:
         for ex in ds:
@@ -38,12 +52,23 @@ def main():
                 continue
             f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
             tok_so_far += n_tok
+            docs_written += 1
 
-            if tok_so_far - prev_tokens >= 10_000_000:
-                print(f"  ✓ {tok_so_far:,} tokens written")
-                prev_tokens = tok_so_far
+            now = time.time()
+            if now - last_report_time >= 10:  # report every 10 seconds
+                elapsed = now - start_time
+                pct = 100 * tok_so_far / args.tokens
+                toks_per_sec = tok_so_far / max(elapsed, 1)
+                remaining = (args.tokens - tok_so_far) / max(toks_per_sec, 1)
+                print(f"  [{pct:5.1f}%] {tok_so_far:>13,} / {args.tokens:,} tokens | "
+                      f"{toks_per_sec:,.0f} tok/s | "
+                      f"elapsed {_fmt_time(elapsed)} | ETA {_fmt_time(remaining)} | "
+                      f"{docs_written:,} docs")
+                last_report_time = now
 
-    print(f"Done: {tok_so_far:,} tokens written to {out_path}")
+    elapsed = time.time() - start_time
+    print(f"\nDone: {tok_so_far:,} tokens in {docs_written:,} docs written to {out_path}")
+    print(f"Total time: {_fmt_time(elapsed)} ({tok_so_far / max(elapsed, 1):,.0f} tok/s avg)")
 
 if __name__ == "__main__":
     main()

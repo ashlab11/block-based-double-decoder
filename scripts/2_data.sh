@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2: Build tokenizer + download & pack 20B tokens
+#
+# Wall clock: ~2-5 hours total
+#   - Tokenizer corpus download: ~15-30 min
+#   - Tokenizer training: ~10-20 min
+#   - 20B token download: ~1-3 hours
+#   - Packing: ~30-60 min
+# Devices:    CPU + network (no GPU needed)
+# Cost:       ~$5-12 (RunPod instance time during download)
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Step 2: Data Pipeline (tokenizer + 20B tokens)"
+echo "═══════════════════════════════════════════════════════════════"
+
+# ── 2a: Build 32K tokenizer ──────────────────────────────────────────────────
+echo ""
+echo "── 2a: Building 32K tokenizer ──"
+if [ -f "tokenizer/tokenizer_32k.json" ]; then
+    echo "  32K tokenizer already exists, skipping."
+else
+    if [ -f "data/Pretrain/tokenizer_corpus.jsonl" ]; then
+        echo "  Tokenizer corpus already downloaded, skipping download."
+    else
+        echo "  Downloading tokenizer corpus (500M tokens)..."
+        python data/retrieval_scripts/tokenizer_corpus.py --tokens 500000000
+    fi
+    echo "  Training 32K BPE tokenizer..."
+    python tokenizer/hf_tokenizer.py \
+        --vocab-size 32768 \
+        --corpus data/Pretrain/tokenizer_corpus.jsonl \
+        --output tokenizer/tokenizer_32k.json
+fi
+
+# ── 2b: Download 20B tokens ─────────────────────────────────────────────────
+echo ""
+echo "── 2b: Downloading 20B tokens from SlimPajama-627B ──"
+if [ -f "data/Pretrain/slimpajama_20b.jsonl" ]; then
+    echo "  Data already downloaded, skipping."
+else
+    python data/retrieval_scripts/slimpajama.py \
+        --tokens 20000000000 \
+        --output-prefix slimpajama_20b
+fi
+
+# ── 2c: Pack dataset ────────────────────────────────────────────────────────
+echo ""
+echo "── 2c: Packing dataset ──"
+if [ -f "data/Pretrain/slimpajama_20b_packed.jsonl" ]; then
+    echo "  Packed data already exists, skipping."
+else
+    python data/retrieval_scripts/pack_dataset.py \
+        --tokenizer tokenizer/tokenizer_32k.json \
+        --input data/Pretrain/slimpajama_20b.jsonl \
+        --output data/Pretrain/slimpajama_20b_packed.jsonl \
+        --eval-input data/Pretrain/slimpajama_20b_eval.jsonl \
+        --eval-output data/Pretrain/slimpajama_20b_eval_packed.jsonl
+fi
+
+TRAIN_LINES=$(wc -l < data/Pretrain/slimpajama_20b_packed.jsonl)
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Data pipeline complete ✓"
+echo "  Packed sequences: $TRAIN_LINES"
+echo "  Next: bash scripts/3_preflight.sh"
+echo "═══════════════════════════════════════════════════════════════"

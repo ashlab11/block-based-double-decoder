@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 1B Double Decoder — Micro dry run (50 steps) for validation
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Same 1B architecture as pretrain_1b.yaml but stops after 50 steps.
+# Purpose: validate the full pipeline (model, data, wandb, DDP, checkpointing)
+# before committing to the full ~$250 training run.
+#
+# Expected: ~5-10 minutes on 4x H100
+#
+# Usage:
+#   torchrun --nproc_per_node=4 training/pretrain.py --config-name=runs/pretrain_1b_micro
+#
+
+# ── Model (identical to pretrain_1b) ─────────────────────────────────────────
+model_cls: "Double_Decoder"
+dim: 1536
+num_encoder_layers: 24
+num_decoder_layers: 12
+seq_len: 2048
+shared: true
+logit_biases: false
+init_strategy: "xavier_uniform"
+gradient_checkpointing: true
+
+# ── Data (same files as full run) ────────────────────────────────────────────
+collator_cls: "BasicPretrainCollator"
+train_file: "data/Pretrain/slimpajama_20b_packed.jsonl"
+eval_file: "data/Pretrain/slimpajama_20b_eval_packed.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+# ── Training (small batch, early stop) ───────────────────────────────────────
+batch_size: 4
+grad_accum_steps: 2
+lr: 3e-4
+end_lr_ratio: 0.1
+total_tokens: 10000000
+max_steps: 50
+
+# ── Logging & checkpoints ───────────────────────────────────────────────────
+logging_steps: 10
+eval_steps: 25
+save_steps: 50
+output_dir: "checkpoints"
+output_file_name: "dd_1b_micro"
+
+# ── Wandb ────────────────────────────────────────────────────────────────────
+wandb_project: "block-based-double-decoder"
+wandb_run_name: "dd_1b_micro_dryrun"
+wandb_entity: "benjamin_bradley"

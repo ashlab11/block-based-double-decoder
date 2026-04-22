@@ -29,12 +29,15 @@ class TrainingConfig:
     logit_biases: bool = False
     init_strategy: str = "xavier_uniform"
     label_pad_token_id: int = -100
+    gradient_checkpointing: bool = False
 
     # ── Training loop ────────────────────────────────────────────────────
     batch_size: int = 64
     grad_accum_steps: int = 2
     lr: float = 6e-4
     end_lr_ratio: float = 0.1
+    total_tokens: int = 0
+    max_steps: int = 0
     logging_steps: int = 100
     eval_steps: int = 500
     save_steps: int = 2000
@@ -46,6 +49,12 @@ class TrainingConfig:
     output_file_name: str = "model"
     tokenizer_file: str = "tokenizer/tokenizer.json"
     input_model_name: str = ""
+    resume_from: str = ""
+
+    # ── Logging ──────────────────────────────────────────────────────────
+    wandb_project: str = ""
+    wandb_run_name: str = ""
+    wandb_entity: str = ""
 
     # ── Class references (set by build_config_from_dict) ─────────────────
     model_cls: Any = None

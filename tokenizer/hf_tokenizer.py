@@ -1,15 +1,10 @@
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, processors
 from tokenizers.normalizers import NFKC, Sequence, Strip
 import os
-
-# Constants
-NUM_SENTINELS = 100
-VOCAB_SIZE = 8192
-CORPUS_FILE = "data/Pretrain/slimpajama.jsonl"
-MODEL_PREFIX = "tokenizer/tokenizer"
+import argparse
 
 
-def create_tokenizer():
+def create_tokenizer(vocab_size=8192, corpus_file="data/Pretrain/slimpajama.jsonl", output_file="tokenizer/tokenizer.json"):
     # 1) Initialize a BPE tokenizer with an unk token
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
 
@@ -23,23 +18,23 @@ def create_tokenizer():
         "<user>", "<assistant>", "<pad>"
     ]
 
-    # 5) Trainer
+    # 4) Trainer
     trainer = trainers.BpeTrainer(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size,
         special_tokens=special_tokens,
         show_progress=True
     )
 
-    if not os.path.exists(CORPUS_FILE):
-        raise FileNotFoundError(f"Corpus file not found: {CORPUS_FILE}")
+    if not os.path.exists(corpus_file):
+        raise FileNotFoundError(f"Corpus file not found: {corpus_file}")
 
-    tokenizer.train([CORPUS_FILE], trainer)
+    tokenizer.train([corpus_file], trainer)
 
-
-    # 7) Decoder (optional)
+    # 5) Decoder
     tokenizer.decoder = decoders.ByteLevel()
-    
-    tokenizer.save(f"{MODEL_PREFIX}.json")
+
+    tokenizer.save(output_file)
+    print(f"Tokenizer saved to {output_file} (vocab_size={vocab_size})")
     return tokenizer
 
 
@@ -52,5 +47,15 @@ def test_tokenizer(tokenizer):
         print(f"{text} -> ids={output.ids}, tokens={output.tokens}")
 
 if __name__ == "__main__":
-    tokenizer = create_tokenizer()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vocab-size", type=int, default=8192)
+    parser.add_argument("--corpus", type=str, default="data/Pretrain/slimpajama.jsonl")
+    parser.add_argument("--output", type=str, default="tokenizer/tokenizer.json")
+    args = parser.parse_args()
+
+    tokenizer = create_tokenizer(
+        vocab_size=args.vocab_size,
+        corpus_file=args.corpus,
+        output_file=args.output,
+    )
     test_tokenizer(tokenizer)

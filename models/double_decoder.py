@@ -16,28 +16,31 @@ class Double_Decoder(nn.Module):
         num_decoder_layers: int = 7,
         seq_len: int = 2048,
         mlp_dim: int = None,
-        label_pad_token_id: int = -100, 
+        label_pad_token_id: int = -100,
         logit_biases = False,
         init_strategy = "xavier_uniform",
+        gradient_checkpointing = False,
         **kwargs
     ):
         super(Double_Decoder, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
-        # Token embeddings  
+        # Token embeddings
         self.embedding = nn.Embedding(vocab_size, dim)
         self.seq_len = seq_len
-        
+
         # Encoder
         self.encoder_layers = nn.ModuleList([
-            CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len)
+            CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
+                        use_checkpoint=gradient_checkpointing)
             for _ in range(num_encoder_layers)
         ])
-        
+
         # Decoder
         self.decoder_layers = nn.ModuleList([
-            ComboDecoderLayer(dim=dim, num_heads=num_heads, seq_len=seq_len, mlp_dim=mlp_dim, 
-                              shared=shared, logit_biases=logit_biases)
+            ComboDecoderLayer(dim=dim, num_heads=num_heads, seq_len=seq_len, mlp_dim=mlp_dim,
+                              shared=shared, logit_biases=logit_biases,
+                              use_checkpoint=gradient_checkpointing)
             for _ in range(num_decoder_layers)
         ])
         

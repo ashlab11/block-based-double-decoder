@@ -7,7 +7,7 @@
 #            checkpoint save/load, eval loop.
 #
 # Wall clock: ~5-10 minutes
-# Devices:    4x H100 (or set NUM_GPUS)
+# Devices:    1x H100 (or set NUM_GPUS)
 # Cost:       ~$0.50
 #
 # After this completes, check your wandb dashboard:
@@ -19,7 +19,7 @@ set -euo pipefail
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export HYDRA_FULL_ERROR=1
 
-NUM_GPUS=${NUM_GPUS:-4}
+NUM_GPUS=${NUM_GPUS:-1}
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Step 4: Micro Dry Run (300M model, 50 steps, ${NUM_GPUS} GPUs)"

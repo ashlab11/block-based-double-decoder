@@ -6,10 +6,10 @@
 # Purpose: validate the full pipeline (model, data, wandb, DDP, checkpointing)
 # before committing to the full training run.
 #
-# Expected: ~5-10 minutes on 4x H100
+# Expected: ~5-10 minutes on 1x H100
 #
 # Usage:
-#   torchrun --nproc_per_node=4 training/pretrain.py --config-name=runs/pretrain_300m_micro
+#   torchrun --nproc_per_node=1 training/pretrain.py --config-name=runs/pretrain_300m_micro
 #
 
 # ── Model (identical to pretrain_300m) ───────────────────────────────────────
@@ -31,7 +31,7 @@ tokenizer_file: "tokenizer/tokenizer_32k.json"
 
 # ── Training (small batch, early stop) ───────────────────────────────────────
 batch_size: 4
-grad_accum_steps: 2
+grad_accum_steps: 8
 lr: 3e-4
 end_lr_ratio: 0.1
 total_tokens: 10000000

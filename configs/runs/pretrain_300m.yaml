@@ -3,13 +3,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Estimated: ~335M params (dim=1024, enc=16, dec=8)
-# Data: 6B tokens from DKYoon/SlimPajama-6B, packed to seq_len=2048
-# Hardware: 4x H100
-# Effective batch: 16 * 4 * 4 GPUs = 256 seqs = ~524K tokens/step
-# Total steps: 6B / 524K ≈ 11,444 accumulation steps
+# Data: ~4B tokens from DKYoon/SlimPajama-6B, packed to seq_len=2048
+# Hardware: 1x H100
+# Effective batch: 16 * 16 * 1 GPU = 256 seqs = ~524K tokens/step
+# Total steps: 4B / 524K ≈ 7,629 accumulation steps
 #
 # Usage:
-#   torchrun --nproc_per_node=4 training/pretrain.py --config-name=runs/pretrain_300m
+#   torchrun --nproc_per_node=1 training/pretrain.py --config-name=runs/pretrain_300m
 #
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -31,10 +31,10 @@ tokenizer_file: "tokenizer/tokenizer_32k.json"
 
 # ── Training ─────────────────────────────────────────────────────────────────
 batch_size: 16
-grad_accum_steps: 4
+grad_accum_steps: 16
 lr: 3e-4
 end_lr_ratio: 0.1
-total_tokens: 6000000000
+total_tokens: 4000000000
 
 # ── Logging & checkpoints ───────────────────────────────────────────────────
 logging_steps: 100

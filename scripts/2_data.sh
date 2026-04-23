@@ -34,13 +34,17 @@ else
         --vocab-size 32768 \
         --corpus data/Pretrain/tokenizer_corpus.jsonl \
         --output tokenizer/tokenizer_32k.json
+
+    # Clean up tokenizer corpus — it's been consumed and won't be needed again
+    echo "  Removing tokenizer corpus to free disk space..."
+    rm -f data/Pretrain/tokenizer_corpus.jsonl
 fi
 
 # ── 2b: Download 6B tokens ──────────────────────────────────────────────────
 echo ""
 echo "── 2b: Downloading 6B tokens from DKYoon/SlimPajama-6B ──"
-if [ -f "data/Pretrain/slimpajama_6b.jsonl" ]; then
-    echo "  Data already downloaded, skipping."
+if [ -f "data/Pretrain/slimpajama_6b.jsonl" ] || [ -f "data/Pretrain/slimpajama_6b_packed.jsonl" ]; then
+    echo "  Data already downloaded (or already packed), skipping."
 else
     python data/retrieval_scripts/slimpajama.py \
         --tokens 6000000000 \
@@ -59,6 +63,10 @@ else
         --output data/Pretrain/slimpajama_6b_packed.jsonl \
         --eval-input data/Pretrain/slimpajama_6b_eval.jsonl \
         --eval-output data/Pretrain/slimpajama_6b_eval_packed.jsonl
+
+    # Clean up raw JSONL files — the packed versions are all we need from here
+    echo "  Removing raw JSONL files to free disk space..."
+    rm -f data/Pretrain/slimpajama_6b.jsonl data/Pretrain/slimpajama_6b_eval.jsonl
 fi
 
 TRAIN_LINES=$(wc -l < data/Pretrain/slimpajama_6b_packed.jsonl)

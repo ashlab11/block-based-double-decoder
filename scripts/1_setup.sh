@@ -15,20 +15,31 @@ echo "════════════════════════�
 echo ""
 echo "── Installing core dependencies ──"
 echo "  (1/3) Installing PyTorch + core packages..."
-pip install torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
-    hydra-core omegaconf matplotlib tqdm wandb hf_transfer 2>&1 | tail -5
+pip install --progress-bar on torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
+    hydra-core omegaconf matplotlib tqdm wandb hf_transfer
 echo "  ✓ Core packages done"
 
 echo ""
 echo "  (2/3) Installing flash-attn (compiles CUDA kernels — may take 10-20 min)..."
-pip install flash-attn --no-build-isolation 2>&1 | \
-    grep -E '(Building|Compiling|Installing|error|ERROR|Successfully|already satisfied)' || true
+echo "        You will see compiler output scrolling — this is normal."
+pip install -v flash-attn --no-build-isolation 2>&1 | \
+    while IFS= read -r line; do
+        case "$line" in
+            *running\ build_ext*) echo "    ▶ Starting CUDA kernel compilation..." ;;
+            *ninja*) echo "    ▶ Compiling with ninja: $line" | head -c 120 ;;
+            *nvcc*) echo "    ▶ [nvcc] $(echo "$line" | grep -oP '[^/]+\.cu' | head -1)" ;;
+            *Successfully\ installed*) echo "    $line" ;;
+            *already\ satisfied*) echo "    $line" ;;
+            *error*|*ERROR*|*Error*) echo "    ⚠ $line" ;;
+            *building*|*Building*) echo "    ▶ $line" ;;
+        esac
+    done
 echo "  ✓ flash-attn done"
 
 echo ""
 echo "  (3/3) Verifying all packages installed..."
 pip install torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
-    hydra-core omegaconf matplotlib tqdm wandb hf_transfer flash-attn 2>&1 | tail -3
+    hydra-core omegaconf matplotlib tqdm wandb hf_transfer flash-attn
 echo "  ✓ All packages verified"
 
 echo ""

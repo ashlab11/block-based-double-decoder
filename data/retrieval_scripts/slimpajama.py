@@ -56,11 +56,8 @@ def main():
         "RedPajamaBook":        {"count": 0.1 * target_tokens, "so_far": 0},
     }
 
-    # Use the small dataset for <=6B tokens, full dataset for larger
-    if target_tokens <= 6_000_000_000:
-        dataset_name = "DKYoon/SlimPajama-6B"
-    else:
-        dataset_name = "cerebras/SlimPajama-627B"
+    # Use the small dataset (cerebras/SlimPajama-627B is no longer available)
+    dataset_name = "DKYoon/SlimPajama-6B"
 
     print(f"▶ Retrieving {tok_m}M tokens from {dataset_name}")
 

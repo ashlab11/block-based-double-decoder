@@ -33,9 +33,9 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"▶ Streaming ~{args.tokens // 1_000_000}M tokens from cerebras/SlimPajama-627B for tokenizer training")
+    print(f"▶ Streaming ~{args.tokens // 1_000_000}M tokens from DKYoon/SlimPajama-6B for tokenizer training")
 
-    ds = load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
+    ds = load_dataset("DKYoon/SlimPajama-6B", split="train", streaming=True)
 
     tok_so_far = 0
     docs_written = 0

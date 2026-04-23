@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Preflight sanity checks for 1B Double Decoder training.
+"""Preflight sanity checks for 300M Double Decoder training.
 
 Usage:
     python tests/sanity_checks.py --check param_count
@@ -28,14 +28,14 @@ def _print_result(name, passed, detail=""):
     return passed
 
 
-def _build_1b_model(device="cpu"):
+def _build_model(device="cpu"):
     from models.double_decoder import Double_Decoder
     model = Double_Decoder(
         vocab_size=32768,
-        dim=1536,
-        num_heads=24,
-        num_encoder_layers=24,
-        num_decoder_layers=12,
+        dim=1024,
+        num_heads=16,
+        num_encoder_layers=16,
+        num_decoder_layers=8,
         seq_len=2048,
         shared=True,
         logit_biases=False,
@@ -55,7 +55,7 @@ def _random_batch(batch_size=2, seq_len=2048, vocab_size=32768, device="cpu"):
 
 def check_param_count():
     print("\n── Check 1: Parameter Count ──")
-    model = _build_1b_model()
+    model = _build_model()
 
     total = sum(p.numel() for p in model.parameters())
     unique = sum(p.numel() for p in {id(p): p for id_, p in ((id(p), p) for p in model.parameters())}.values())
@@ -68,18 +68,18 @@ def check_param_count():
                   sum(p.numel() for p in model.output_norm.parameters())
 
     print(f"  Embedding:      {embed_params:>12,}")
-    print(f"  Encoder (24L):  {enc_params:>12,}")
-    print(f"  Decoder (12L):  {dec_params:>12,}")
+    print(f"  Encoder (16L):  {enc_params:>12,}")
+    print(f"  Decoder (8L):   {dec_params:>12,}")
     print(f"  Norms:          {norm_params:>12,}")
     print(f"  Total (raw):    {total:>12,}")
     print(f"  Total (unique): {unique:>12,}")
 
     ok = True
-    ok &= _print_result("Total params ~1B", 0.9e9 < unique < 1.2e9, f"{unique / 1e9:.3f}B")
+    ok &= _print_result("Total params ~300M", 0.25e9 < unique < 0.45e9, f"{unique / 1e6:.1f}M")
     ok &= _print_result("Tied weights", model.output_projection.weight is model.embedding.weight)
-    ok &= _print_result("dim=1536", model.dim == 1536)
-    ok &= _print_result("24 encoder layers", len(model.encoder_layers) == 24)
-    ok &= _print_result("12 decoder layers", len(model.decoder_layers) == 12)
+    ok &= _print_result("dim=1024", model.dim == 1024)
+    ok &= _print_result("16 encoder layers", len(model.encoder_layers) == 16)
+    ok &= _print_result("8 decoder layers", len(model.decoder_layers) == 8)
     return ok
 
 
@@ -88,7 +88,7 @@ def check_param_count():
 def check_forward_pass():
     print("\n── Check 2: Forward Pass ──")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = _build_1b_model(device)
+    model = _build_model(device)
     batch = _random_batch(batch_size=2, device=device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
@@ -115,7 +115,7 @@ def check_forward_pass():
 def check_gradient_flow():
     print("\n── Check 3: Gradient Flow ──")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = _build_1b_model(device)
+    model = _build_model(device)
     batch = _random_batch(batch_size=2, device=device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
@@ -156,7 +156,7 @@ def check_gradient_flow():
 def check_micro_train(steps=100):
     print(f"\n── Check 4: Micro Training ({steps} steps) ──")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = _build_1b_model(device)
+    model = _build_model(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=(device == "cuda"))
     model.train()
 
@@ -204,7 +204,7 @@ def check_memory_profile():
     device = "cuda"
     torch.cuda.reset_peak_memory_stats()
 
-    model = _build_1b_model(device)
+    model = _build_model(device)
     batch = _random_batch(batch_size=16, device=device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -231,7 +231,7 @@ def check_data_pipeline():
     from datasets import load_dataset
 
     # Try 1B data files first, fall back to original
-    for prefix in ["slimpajama_20b", "slimpajama"]:
+    for prefix in ["slimpajama_6b", "slimpajama_20b", "slimpajama"]:
         train_file = f"data/Pretrain/{prefix}_packed.jsonl"
         if os.path.exists(train_file):
             break
@@ -246,7 +246,7 @@ def check_data_pipeline():
     n_checked = 0
     bad_len = 0
     bad_range = 0
-    vocab_size = 32768 if "20b" in train_file else 8192
+    vocab_size = 32768 if ("20b" in train_file or "6b" in train_file) else 8192
 
     for example in ds:
         ids = example["input_ids"]
@@ -345,14 +345,14 @@ def check_block_masks():
 # ── Check 9: ComboAttention Stability ───────────────────────────────────────
 
 def check_combo_attn_stability():
-    print("\n── Check 9: ComboAttention Stability (dim=1536, bf16) ──")
+    print("\n── Check 9: ComboAttention Stability (dim=1024, bf16) ──")
     from components.attention import ComboAttention
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    attn = ComboAttention(dim=1536, num_heads=24, seq_len=2048, shared=True).to(device)
+    attn = ComboAttention(dim=1024, num_heads=16, seq_len=2048, shared=True).to(device)
 
-    x = torch.randn(2, 128, 1536, device=device)  # short seq for speed
-    enc = torch.randn(2, 128, 1536, device=device)
+    x = torch.randn(2, 128, 1024, device=device)  # short seq for speed
+    enc = torch.randn(2, 128, 1024, device=device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
         # No block masks → uses flash_attn path
@@ -372,9 +372,9 @@ def check_config_validation():
     from omegaconf import OmegaConf
     from configs import build_config_from_dict
 
-    config_path = "configs/runs/pretrain_1b.yaml"
+    config_path = "configs/runs/pretrain_300m.yaml"
     if not os.path.exists(config_path):
-        print("  [SKIP] pretrain_1b.yaml not found")
+        print("  [SKIP] pretrain_300m.yaml not found")
         return True
 
     cfg_dict = OmegaConf.load(config_path)
@@ -403,7 +403,7 @@ def check_compile_compat():
         return True
 
     device = "cuda"
-    model = _build_1b_model(device)
+    model = _build_model(device)
     batch = _random_batch(batch_size=2, device=device)
 
     # Eager forward
@@ -452,7 +452,7 @@ def check_ddp_smoke():
     if rank == 0:
         print(f"  Running DDP with {world_size} GPUs")
 
-    model = _build_1b_model(device)
+    model = _build_model(device)
     model = DDP(model, device_ids=[device.index])
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)
     model.train()
@@ -521,7 +521,7 @@ def main():
         checks = [args.check]
 
     print("=" * 60)
-    print("  PREFLIGHT SANITY CHECKS — 1B Double Decoder")
+    print("  PREFLIGHT SANITY CHECKS — 300M Double Decoder")
     print(f"  Running {len(checks)} checks")
     print("=" * 60)
 

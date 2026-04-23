@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 5: FULL 1B TRAINING RUN — 20B tokens
+# Step 5: FULL 300M TRAINING RUN — 6B tokens
 #
-# ⚠️  THIS IS THE EXPENSIVE STEP (~$250)
+# ⚠️  THIS IS THE EXPENSIVE STEP (~$25-50)
 #
-# Wall clock: ~20-24 hours on 4x H100
+# Wall clock: ~2-4 hours on 4x H100
 # Devices:    4x H100 (or set NUM_GPUS)
-# Cost:       ~$250 (RunPod on-demand) / ~$180 (spot)
+# Cost:       ~$25-50 (RunPod on-demand)
 #
-# The run logs to wandb and saves checkpoints every 5000 steps.
+# The run logs to wandb and saves checkpoints every 2000 steps.
 # If preempted, resume with:
-#   bash scripts/5_train.sh --resume checkpoints/dd_1b_20btok_<step>.pt
+#   bash scripts/5_train.sh --resume checkpoints/dd_300m_6btok_<step>.pt
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
@@ -26,23 +26,23 @@ if [ "${1:-}" = "--resume" ] && [ -n "${2:-}" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Step 5: FULL TRAINING — 1B params, 20B tokens"
+echo "  Step 5: FULL TRAINING — 300M params, 6B tokens"
 echo "  GPUs: ${NUM_GPUS}"
 echo "  Effective batch: $((16 * 4 * NUM_GPUS)) sequences/step"
-echo "  Estimated time: ~20-24 hours"
-echo "  Estimated cost: ~\$250"
+echo "  Estimated time: ~2-4 hours"
+echo "  Estimated cost: ~\$25-50"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
 mkdir -p checkpoints
 
 torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
-    --config-name=runs/pretrain_1b \
+    --config-name=runs/pretrain_300m \
     ${RESUME_ARGS}
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Training complete!"
-echo "  Checkpoint: checkpoints/dd_1b_20btok.pt"
+echo "  Checkpoint: checkpoints/dd_300m_6btok.pt"
 echo "  wandb: https://wandb.ai/benjamin_bradley/block-based-double-decoder"
 echo "═══════════════════════════════════════════════════════════════"

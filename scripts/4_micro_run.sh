@@ -11,7 +11,7 @@
 # Cost:       ~$0.50
 #
 # After this completes, check your wandb dashboard:
-#   Entity:  benjamin_bradley
+#   Entity:  block-based-double-decoders
 #   Project: block-based-double-decoder
 #   Run:     dd_300m_micro_dryrun
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ echo "════════════════════════�
 echo "  Micro dry run complete ✓"
 echo ""
 echo "  Check wandb dashboard before proceeding:"
-echo "    https://wandb.ai/benjamin_bradley/block-based-double-decoder"
+echo "    https://wandb.ai/block-based-double-decoders/block-based-double-decoder"
 echo "    Run: dd_300m_micro_dryrun"
 echo ""
 echo "  Verify:"

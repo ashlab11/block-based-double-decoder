@@ -107,7 +107,7 @@ echo "  wandb login:"
 if ! python -c "import wandb; wandb.login(verify=True)" 2>/dev/null; then
     echo "  ✗ wandb not logged in. Run: wandb login"
     echo "  Make sure you have access to project 'block-based-double-decoder'"
-    echo "  under entity 'benjamin_bradley'"
+    echo "  under entity 'block-based-double-decoders'"
     exit 1
 fi
 echo "    ✓ wandb login verified"

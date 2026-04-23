@@ -46,7 +46,7 @@ pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
 # ── (3/4) Install flash-attn ─────────────────────────────────────────────────
 echo ""
 echo "── (3/4) Installing flash-attn (compiles CUDA kernels — may take 10-20 min) ──"
-pip install flash-attn --no-build-isolation
+pip install flash-attn --no-build-isolation --no-cache-dir
 
 # ── (4/4) Full environment verification ──────────────────────────────────────
 echo ""

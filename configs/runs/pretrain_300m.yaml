@@ -21,7 +21,7 @@ seq_len: 2048
 shared: true
 logit_biases: false
 init_strategy: "xavier_uniform"
-gradient_checkpointing: true
+gradient_checkpointing: false
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 collator_cls: "BasicPretrainCollator"

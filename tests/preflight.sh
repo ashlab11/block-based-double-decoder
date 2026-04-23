@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Preflight checks for 300M Double Decoder training run
+# Preflight checks for 50M Double Decoder training run
 #
 # Runs all sanity checks sequentially, stopping on first failure.
 # The DDP smoke test requires at least 2 GPUs.
@@ -13,7 +13,7 @@ set -euo pipefail
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  PREFLIGHT CHECKS — 300M Double Decoder"
+echo "  PREFLIGHT CHECKS — 50M Double Decoder"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 

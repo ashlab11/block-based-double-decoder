@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 50M Double Decoder — Micro dry run (50 steps) for validation
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Same 50M architecture as pretrain_50m.yaml but stops after 50 steps.
+# Purpose: validate the full pipeline (model, data, wandb, checkpointing)
+# before committing to the full training run.
+#
+# Expected: ~1 minute on 1x H100
+#
+# Usage:
+#   torchrun --nproc_per_node=1 training/pretrain.py --config-name=runs/pretrain_50m_micro
+#
+
+# ── Model (identical to pretrain_50m) ───────────────────────────────────────
+model_cls: "Double_Decoder"
+dim: 512
+num_encoder_layers: 8
+num_decoder_layers: 4
+seq_len: 2048
+shared: true
+logit_biases: false
+init_strategy: "xavier_uniform"
+gradient_checkpointing: false
+
+# ── Data (same files as full run) ────────────────────────────────────────────
+collator_cls: "BasicPretrainCollator"
+train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
+eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+# ── Training (auto batch, early stop) ────────────────────────────────────────
+auto_batch_size: true
+target_effective_batch: 256
+batch_size: 16
+grad_accum_steps: 4
+lr: 6e-4
+end_lr_ratio: 0.1
+total_tokens: 10000000
+max_steps: 50
+
+# ── Logging & checkpoints ───────────────────────────────────────────────────
+logging_steps: 4
+eval_steps: 400
+save_steps: 400
+output_dir: "checkpoints"
+output_file_name: "dd_50m_micro"
+
+# ── Wandb ────────────────────────────────────────────────────────────────────
+wandb_project: "block-based-double-decoder"
+wandb_run_name: "dd_50m_micro_dryrun"
+wandb_entity: "block-based-double-decoders"

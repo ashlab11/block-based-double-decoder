@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Preflight sanity checks (12 automated checks)
+# Step 3: Preflight sanity checks (11 automated checks for 50M model)
 #
-# Wall clock: ~10-15 minutes
+# Wall clock: ~3-5 minutes
 #   - Most checks: seconds each
-#   - micro_train (100 steps): ~5-8 min
-#   - memory_profile: ~1 min
-#   - compile_compat: ~2 min
+#   - micro_train (100 steps): ~1-2 min
+#   - memory_profile: ~30s
+#   - compile_compat: ~1 min
 # Devices:    1+ GPU (DDP smoke test needs 2+)
 # Cost:       ~$0.50 (minimal GPU time)
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Preflight sanity checks for 300M Double Decoder training.
+"""Preflight sanity checks for 50M Double Decoder training.
 
 Usage:
     python tests/sanity_checks.py --check param_count
@@ -35,14 +35,14 @@ def _build_model(device="cpu"):
     from models.double_decoder import Double_Decoder
     model = Double_Decoder(
         vocab_size=32768,
-        dim=1024,
-        num_heads=16,
-        num_encoder_layers=16,
-        num_decoder_layers=8,
+        dim=512,
+        num_heads=8,
+        num_encoder_layers=8,
+        num_decoder_layers=4,
         seq_len=2048,
         shared=True,
         logit_biases=False,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
     )
     return model.to(device)
 
@@ -71,18 +71,18 @@ def check_param_count():
                   sum(p.numel() for p in model.output_norm.parameters())
 
     print(f"  Embedding:      {embed_params:>12,}")
-    print(f"  Encoder (16L):  {enc_params:>12,}")
-    print(f"  Decoder (8L):   {dec_params:>12,}")
+    print(f"  Encoder ({len(model.encoder_layers)}L):  {enc_params:>12,}")
+    print(f"  Decoder ({len(model.decoder_layers)}L):   {dec_params:>12,}")
     print(f"  Norms:          {norm_params:>12,}")
     print(f"  Total (raw):    {total:>12,}")
     print(f"  Total (unique): {unique:>12,}")
 
     ok = True
-    ok &= _print_result("Total params ~300M", 0.25e9 < unique < 0.45e9, f"{unique / 1e6:.1f}M")
+    ok &= _print_result("Total params ~50M", 0.04e9 < unique < 0.07e9, f"{unique / 1e6:.1f}M")
     ok &= _print_result("Tied weights", model.output_projection.weight is model.embedding.weight)
-    ok &= _print_result("dim=1024", model.dim == 1024)
-    ok &= _print_result("16 encoder layers", len(model.encoder_layers) == 16)
-    ok &= _print_result("8 decoder layers", len(model.decoder_layers) == 8)
+    ok &= _print_result("dim=512", model.dim == 512)
+    ok &= _print_result("8 encoder layers", len(model.encoder_layers) == 8)
+    ok &= _print_result("4 decoder layers", len(model.decoder_layers) == 4)
     return ok
 
 
@@ -351,14 +351,14 @@ def check_block_masks():
 # ── Check 9: ComboAttention Stability ───────────────────────────────────────
 
 def check_combo_attn_stability():
-    print("\n── Check 9: ComboAttention Stability (dim=1024, bf16) ──")
+    print("\n── Check 9: ComboAttention Stability (dim=512, bf16) ──")
     from components.attention import ComboAttention
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    attn = ComboAttention(dim=1024, num_heads=16, seq_len=2048, shared=True).to(device)
+    attn = ComboAttention(dim=512, num_heads=8, seq_len=2048, shared=True).to(device)
 
-    x = torch.randn(2, 128, 1024, device=device)  # short seq for speed
-    enc = torch.randn(2, 128, 1024, device=device)
+    x = torch.randn(2, 128, 512, device=device)  # short seq for speed
+    enc = torch.randn(2, 128, 512, device=device)
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
         # No block masks → uses flash_attn path
@@ -378,9 +378,9 @@ def check_config_validation():
     from omegaconf import OmegaConf
     from configs import build_config_from_dict
 
-    config_path = "configs/runs/pretrain_300m.yaml"
+    config_path = "configs/runs/pretrain_50m.yaml"
     if not os.path.exists(config_path):
-        print("  [SKIP] pretrain_300m.yaml not found")
+        print("  [SKIP] pretrain_50m.yaml not found")
         return True
 
     cfg_dict = OmegaConf.load(config_path)
@@ -390,12 +390,11 @@ def check_config_validation():
     ok &= _print_result("dim % 64 == 0", cfg.dim % 64 == 0, f"dim={cfg.dim}")
     ok &= _print_result("enc = 2 * dec layers", cfg.num_encoder_layers == 2 * cfg.num_decoder_layers)
     ok &= _print_result("total_tokens > 0", cfg.total_tokens > 0, f"{cfg.total_tokens:,}")
-    ok &= _print_result("gradient_checkpointing enabled", cfg.gradient_checkpointing)
     ok &= _print_result("wandb_entity set", bool(cfg.wandb_entity), cfg.wandb_entity)
     ok &= _print_result("wandb_project set", bool(cfg.wandb_project), cfg.wandb_project)
 
     steps = cfg.total_tokens // (cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len)
-    ok &= _print_result("Enough training steps (>1000)", steps > 1000, f"{steps:,} steps")
+    ok &= _print_result("Enough training steps (>100)", steps > 100, f"{steps:,} steps")
 
     return ok
 
@@ -527,7 +526,7 @@ def main():
         checks = [args.check]
 
     print("=" * 60)
-    print("  PREFLIGHT SANITY CHECKS — 300M Double Decoder")
+    print("  PREFLIGHT SANITY CHECKS — 50M Double Decoder")
     print(f"  Running {len(checks)} checks")
     print("=" * 60)
 

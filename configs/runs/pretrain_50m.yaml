@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 50M Double Decoder — Pretrain on 1B tokens (Chinchilla-optimal)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Estimated: ~54.5M params (dim=512, enc=8, dec=4)
+# Data: 1B tokens from SlimPajama, packed to seq_len=2048
+# Hardware: 1x H100 (auto batch size scales to any GPU)
+# Chinchilla optimal: ~20 tokens/param → 54.5M * 20 ≈ 1.09B → 1B tokens
+#
+# Usage:
+#   torchrun --nproc_per_node=1 training/pretrain.py --config-name=runs/pretrain_50m
+#
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model_cls: "Double_Decoder"
+dim: 512
+num_encoder_layers: 8
+num_decoder_layers: 4
+seq_len: 2048
+shared: true
+logit_biases: false
+init_strategy: "xavier_uniform"
+gradient_checkpointing: false
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+collator_cls: "BasicPretrainCollator"
+train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
+eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+auto_batch_size: true
+target_effective_batch: 256
+batch_size: 64
+grad_accum_steps: 4
+lr: 6e-4
+end_lr_ratio: 0.1
+total_tokens: 1000000000
+
+# ── Logging & checkpoints ───────────────────────────────────────────────────
+logging_steps: 10
+eval_steps: 500
+save_steps: 500
+output_dir: "checkpoints"
+output_file_name: "dd_50m_1btok"
+
+# ── Wandb ────────────────────────────────────────────────────────────────────
+wandb_project: "block-based-double-decoder"
+wandb_run_name: "dd_50m_1btok"
+wandb_entity: "block-based-double-decoders"

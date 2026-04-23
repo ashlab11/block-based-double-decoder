@@ -133,6 +133,58 @@ def _save_checkpoint(model, hparams, optimizer, scheduler, step, cfg, suffix="")
     return filename
 
 
+def _find_max_batch_size(model, seq_len, vocab_size, device, target_fraction=0.80):
+    """Binary search for the largest micro-batch that fits in GPU memory.
+
+    Uses 80% of GPU memory to leave headroom for torch.compile overhead,
+    optimizer states, and temporary buffers during training.
+    """
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    target_mem = int(total_mem * target_fraction)
+
+    lo, hi = 1, 1024
+    best = 1
+
+    model.eval()
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+        try:
+            input_ids = torch.randint(0, vocab_size, (mid, seq_len), device=device)
+            labels = input_ids.clone()
+            blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:5] + 1)[0]
+
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                out = model(input_ids=input_ids, labels=labels, blocks=blocks, sft=False)
+            out["loss"].backward()
+
+            peak = torch.cuda.max_memory_allocated(device)
+            del input_ids, labels, blocks, out
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+
+            if peak <= target_mem:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                model.zero_grad(set_to_none=True)
+                hi = mid - 1
+            else:
+                raise
+
+    model.train()
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    return best
+
+
 def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -141,9 +193,6 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     _init_distributed()
     world_size = _get_world_size()
     rank = _get_rank()
-
-    assert (cfg.grad_accum_steps % world_size == 0) and (cfg.grad_accum_steps >= world_size), \
-        "grad_accum_steps must be divisible by and geq than world_size"
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_file)
     bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
@@ -156,6 +205,29 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
+
+    # ── Auto batch size ─────────────────────────────────────────────────
+    if cfg.auto_batch_size:
+        if rank == 0:
+            print("Auto batch size: profiling GPU memory...")
+        max_bs = _find_max_batch_size(model, cfg.seq_len, tokenizer.vocab_size, device)
+        target = cfg.target_effective_batch
+        if max_bs >= target:
+            cfg.batch_size = target
+            cfg.grad_accum_steps = 1
+        else:
+            cfg.batch_size = max_bs
+            cfg.grad_accum_steps = max(1, target // max_bs)
+        effective = cfg.batch_size * cfg.grad_accum_steps
+        if rank == 0:
+            total_gpu_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+            print(f"Auto batch size: max_micro_batch={max_bs}, "
+                  f"selected micro_batch={cfg.batch_size}, grad_accum={cfg.grad_accum_steps}, "
+                  f"effective_batch={effective} seqs ({effective * cfg.seq_len:,} tokens/step) "
+                  f"[GPU: {total_gpu_gb:.0f} GB]")
+
+    assert (cfg.grad_accum_steps % world_size == 0) and (cfg.grad_accum_steps >= world_size), \
+        "grad_accum_steps must be divisible by and geq than world_size"
 
     model = torch.compile(model, fullgraph=False, dynamic=False)
 

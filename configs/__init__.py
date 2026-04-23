@@ -60,6 +60,10 @@ class TrainingConfig:
     model_cls: Any = None
     collator_cls: Any = None
 
+    # ── Auto batch size ─────────────────────────────────────────────────
+    auto_batch_size: bool = False
+    target_effective_batch: int = 256  # target sequences per optimizer step
+
     # ── Sink tokens (unused for now, but referenced in build_model) ──────
     self_sinks: int = 0
     cross_sinks: int = 0

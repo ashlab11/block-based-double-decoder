@@ -13,8 +13,8 @@ echo "  Step 1: Setup & Dependencies"
 echo "═══════════════════════════════════════════════════════════════"
 
 echo ""
-echo "── (1/3) Installing core packages ──"
-echo "  (uses whatever PyTorch is pre-installed on the pod)"
+echo "── (1/3) Installing core packages (including PyTorch 2.6) ──"
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
     hydra-core omegaconf matplotlib tqdm wandb hf_transfer
 
@@ -43,7 +43,7 @@ print(f'    CUDA:      {torch.cuda.is_available()}')
 print(f'    GPU count: {torch.cuda.device_count()}')
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
-        print(f'    GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f} GB)')
+        print(f'    GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)')
 "
 
 echo ""

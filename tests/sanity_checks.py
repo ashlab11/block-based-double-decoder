@@ -154,16 +154,19 @@ def check_gradient_flow():
 # ── Check 4: Micro Training ─────────────────────────────────────────────────
 
 def check_micro_train(steps=100):
-    print(f"\n── Check 4: Micro Training ({steps} steps) ──")
+    print(f"\n── Check 4: Micro Training ({steps} steps, fixed batch overfit test) ──")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = _build_model(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, fused=(device == "cuda"))
     model.train()
 
+    # Use a single fixed batch — the model should memorize it, proving it can learn
+    fixed_batch = _random_batch(batch_size=2, device=device)
+
     losses = []
     train_start = time.time()
     for i in range(steps):
-        batch = _random_batch(batch_size=2, device=device)
+        batch = fixed_batch
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
             out = model(**batch)
         loss = out["loss"]

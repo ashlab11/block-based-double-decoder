@@ -8,6 +8,11 @@ from torch.optim import AdamW
 from transformers import get_polynomial_decay_schedule_with_warmup, PreTrainedTokenizerFast
 import torch
 torch.set_float32_matmul_precision('high')
+# Workaround for PyTorch 2.6.0 inductor bug: quantization pattern matcher
+# crashes on non-quantized models. Disabling it is safe — we don't use quantization,
+# and core inductor optimizations (kernel fusion, triton codegen) still apply.
+import torch._inductor.config as _inductor_config
+_inductor_config.pattern_matcher = False
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_

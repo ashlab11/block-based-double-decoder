@@ -83,6 +83,8 @@ echo ""
 echo "  torch.compile:"
 python -c "
 import torch, sys
+import torch._inductor.config as _inductor_config
+_inductor_config.pattern_matcher = False  # workaround for 2.6.0 quantization bug
 
 # Quick compile smoke test — catches inductor bugs before they waste time later
 class TinyModel(torch.nn.Module):

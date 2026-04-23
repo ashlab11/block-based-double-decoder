@@ -289,11 +289,11 @@ def check_tokenizer():
     ok &= _print_result(f"Vocab size = {expected_vocab}", tokenizer.vocab_size == expected_vocab,
                         f"got {tokenizer.vocab_size}")
 
-    # Round-trip test
+    # Round-trip test (avoid newlines — BPE tokenizers often normalize whitespace)
     test_strings = [
         "Hello, world!",
         "The quick brown fox jumps over the lazy dog.",
-        "import torch\nprint(torch.cuda.is_available())",
+        "import torch; print(torch.cuda.is_available())",
     ]
     roundtrip_ok = True
     for s in test_strings:

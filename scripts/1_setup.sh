@@ -13,12 +13,23 @@ echo "  Step 1: Setup & Dependencies"
 echo "═══════════════════════════════════════════════════════════════"
 
 echo ""
-echo "── Installing dependencies ──"
-pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
-    hydra-core omegaconf matplotlib tqdm wandb hf_transfer \
-    flash-attn --no-build-isolation 2>/dev/null || true
-pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
-    hydra-core omegaconf matplotlib tqdm wandb hf_transfer
+echo "── Installing core dependencies ──"
+echo "  (1/3) Installing PyTorch + core packages..."
+pip install torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
+    hydra-core omegaconf matplotlib tqdm wandb hf_transfer 2>&1 | tail -5
+echo "  ✓ Core packages done"
+
+echo ""
+echo "  (2/3) Installing flash-attn (compiles CUDA kernels — may take 10-20 min)..."
+pip install flash-attn --no-build-isolation 2>&1 | \
+    grep -E '(Building|Compiling|Installing|error|ERROR|Successfully|already satisfied)' || true
+echo "  ✓ flash-attn done"
+
+echo ""
+echo "  (3/3) Verifying all packages installed..."
+pip install torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
+    hydra-core omegaconf matplotlib tqdm wandb hf_transfer flash-attn 2>&1 | tail -3
+echo "  ✓ All packages verified"
 
 echo ""
 echo "── Verifying GPU ──"

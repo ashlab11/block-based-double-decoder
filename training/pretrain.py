@@ -17,7 +17,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
-import hydra
 from omegaconf import DictConfig
 import time
 
@@ -556,10 +555,26 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
         dist.destroy_process_group()
     return eval_ppl, f"{cfg.output_dir}/{cfg.output_file_name}.pt"
 
-_config_name = os.environ.get("CONFIG_NAME", "runs/pretrain")
+def main():
+    import argparse
+    from omegaconf import OmegaConf
 
-@hydra.main(version_base=None, config_path="../configs", config_name=_config_name)
-def main(cfg: DictConfig):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config-name", type=str, default="runs/pretrain",
+                        help="Config file name relative to configs/ (without .yaml)")
+    args, overrides = parser.parse_known_args()
+
+    # Load config YAML directly — no Hydra, no working-directory surprises
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "..", "configs", f"{args.config_name}.yaml")
+    cfg = OmegaConf.load(config_path)
+
+    # Apply any key=value overrides from the command line
+    for override in overrides:
+        if "=" in override:
+            key, value = override.split("=", 1)
+            OmegaConf.update(cfg, key, value)
+
     training_cfg = build_config_from_dict(cfg)
     pretrain(training_cfg, verbose=1)
 

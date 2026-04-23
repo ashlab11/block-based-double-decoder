@@ -23,10 +23,14 @@ echo "  ✓ Installed PyTorch $(python -c 'import torch; print(torch.__version__
 echo "  ✓ CUDA build: $(python -c 'import torch; print(torch.version.cuda)')"
 
 # ── (2/4) Install training stack ─────────────────────────────────────────────
+# Pin torch here too so pip doesn't silently swap our cu124 build for a
+# different one pulled transitively via torchdata→torch.
 echo ""
 echo "── (2/4) Installing training stack ──"
 pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
-    hydra-core omegaconf matplotlib tqdm wandb hf_transfer
+    hydra-core omegaconf matplotlib tqdm wandb hf_transfer \
+    "torch==2.6.0" --index-url https://download.pytorch.org/whl/cu124 \
+    --extra-index-url https://pypi.org/simple/
 
 # ── (3/4) Install flash-attn (must be AFTER torch, compiled against it) ──────
 echo ""

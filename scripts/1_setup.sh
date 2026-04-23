@@ -2,9 +2,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1: Install dependencies and verify environment
 #
-# Wall clock: ~2-5 minutes
+# Wall clock: ~10-20 minutes (flash-attn compilation dominates)
 # Devices:    CPU only (no GPU needed)
-# Cost:       ~$0.10 (minimal RunPod time)
+# Cost:       ~$0.10-0.50 (minimal RunPod time)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -13,45 +13,37 @@ echo "  Step 1: Setup & Dependencies"
 echo "═══════════════════════════════════════════════════════════════"
 
 echo ""
-echo "── Installing core dependencies ──"
-echo "  (1/3) Installing PyTorch + core packages..."
-pip install --progress-bar on torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
+echo "── (1/3) Installing core packages ──"
+echo "  (uses whatever PyTorch is pre-installed on the pod)"
+pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
     hydra-core omegaconf matplotlib tqdm wandb hf_transfer
-echo "  ✓ Core packages done"
 
 echo ""
-echo "  (2/3) Installing flash-attn (compiles CUDA kernels — may take 10-20 min)..."
-echo "        You will see compiler output scrolling — this is normal."
-pip install -v flash-attn --no-build-isolation 2>&1 | \
-    while IFS= read -r line; do
-        case "$line" in
-            *running\ build_ext*) echo "    ▶ Starting CUDA kernel compilation..." ;;
-            *ninja*) echo "    ▶ Compiling with ninja: $line" | head -c 120 ;;
-            *nvcc*) echo "    ▶ [nvcc] $(echo "$line" | grep -oP '[^/]+\.cu' | head -1)" ;;
-            *Successfully\ installed*) echo "    $line" ;;
-            *already\ satisfied*) echo "    $line" ;;
-            *error*|*ERROR*|*Error*) echo "    ⚠ $line" ;;
-            *building*|*Building*) echo "    ▶ $line" ;;
-        esac
-    done
-echo "  ✓ flash-attn done"
+echo "── (2/3) Installing flash-attn (compiles CUDA kernels — 10-20 min) ──"
+pip install flash-attn --no-build-isolation
 
 echo ""
-echo "  (3/3) Verifying all packages installed..."
-pip install torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets \
-    hydra-core omegaconf matplotlib tqdm wandb hf_transfer flash-attn
-echo "  ✓ All packages verified"
+echo "── (3/3) Verifying environment ──"
+echo ""
+echo "  Packages:"
+python -c "
+import torch, flash_attn, wandb, transformers, datasets
+print(f'    PyTorch:      {torch.__version__}')
+print(f'    flash-attn:   {flash_attn.__version__}')
+print(f'    transformers: {transformers.__version__}')
+print(f'    datasets:     {datasets.__version__}')
+print(f'    wandb:        {wandb.__version__}')
+"
 
 echo ""
-echo "── Verifying GPU ──"
+echo "  GPU:"
 python -c "
 import torch
-print(f'PyTorch: {torch.__version__}')
-print(f'CUDA: {torch.cuda.is_available()}')
-print(f'GPU count: {torch.cuda.device_count()}')
+print(f'    CUDA:      {torch.cuda.is_available()}')
+print(f'    GPU count: {torch.cuda.device_count()}')
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
-        print(f'  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)')
+        print(f'    GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f} GB)')
 "
 
 echo ""

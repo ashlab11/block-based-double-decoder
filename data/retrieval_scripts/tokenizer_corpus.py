@@ -70,5 +70,9 @@ def main():
     print(f"\nDone: {tok_so_far:,} tokens in {docs_written:,} docs written to {out_path}")
     print(f"Total time: {_fmt_time(elapsed)} ({tok_so_far / max(elapsed, 1):,.0f} tok/s avg)")
 
+    import os
+    os._exit(0)
+
+
 if __name__ == "__main__":
     main()

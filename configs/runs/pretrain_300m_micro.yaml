@@ -38,9 +38,9 @@ total_tokens: 10000000
 max_steps: 50
 
 # ── Logging & checkpoints ───────────────────────────────────────────────────
-logging_steps: 1
-eval_steps: 25
-save_steps: 50
+logging_steps: 8
+eval_steps: 400
+save_steps: 400
 output_dir: "checkpoints"
 output_file_name: "dd_300m_micro"
 

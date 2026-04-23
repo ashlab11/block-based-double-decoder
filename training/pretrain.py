@@ -449,8 +449,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
 
                 wandb.log(heavy_metrics, step=step)
 
-            # ── Console progress reporting ───────────────────────────────
-            if rank == 0 and step % 10 == 0:
+            # ── Console progress reporting (every step) ──────���─────────────
+            if rank == 0:
                 elapsed_total = time.time() - training_start_time
                 steps_done = step - start_step
                 avg_toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)

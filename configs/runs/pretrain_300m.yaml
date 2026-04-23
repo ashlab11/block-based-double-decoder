@@ -37,9 +37,9 @@ end_lr_ratio: 0.1
 total_tokens: 4000000000
 
 # ── Logging & checkpoints ───────────────────────────────────────────────────
-logging_steps: 100
-eval_steps: 2000
-save_steps: 2000
+logging_steps: 160
+eval_steps: 16000
+save_steps: 8000
 output_dir: "checkpoints"
 output_file_name: "dd_300m_6btok"
 

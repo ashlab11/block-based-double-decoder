@@ -1,4 +1,5 @@
 import os
+import math
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import DataLoader
@@ -265,14 +266,33 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     use_wandb = bool(cfg.wandb_project) and rank == 0
     if use_wandb:
         import wandb
+        eager_model_for_watch = _get_eager_model(model)
+        wandb_config = {
+            **hparams,
+            "lr": lr,
+            "lr_end": lr_end,
+            "batch_size": cfg.batch_size,
+            "grad_accum_steps": cfg.grad_accum_steps,
+            "total_tokens": cfg.total_tokens,
+            "world_size": world_size,
+            "seq_len": cfg.seq_len,
+            "max_steps": cfg.max_steps,
+            "warmup_steps": int(num_accumulations * 0.05),
+            "total_accumulation_steps": num_accumulations,
+            "tokens_per_step": cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size,
+            "gpu_name": torch.cuda.get_device_name(0),
+            "gpu_count": world_size,
+            "gpu_memory_gb": torch.cuda.get_device_properties(0).total_mem / 1e9,
+        }
         wandb.init(
             project=cfg.wandb_project,
             name=cfg.wandb_run_name or None,
             entity=cfg.wandb_entity or None,
-            config={**hparams, "lr": lr, "batch_size": cfg.batch_size,
-                    "grad_accum_steps": cfg.grad_accum_steps, "total_tokens": cfg.total_tokens},
+            config=wandb_config,
             resume="allow" if cfg.resume_from else None,
         )
+        # Log gradient & parameter histograms every 500 steps
+        wandb.watch(eager_model_for_watch, log="all", log_freq=500, log_graph=True)
 
     model.train()
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -285,6 +305,10 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     eval_steps_arr = []
     eval_losses = []
 
+    # EMA loss for smoothed curve
+    loss_ema = None
+    loss_ema_alpha = 0.99
+
     steps_per_accum_per_gpu = cfg.grad_accum_steps // world_size
     logging_steps = cfg.logging_steps // cfg.grad_accum_steps
     eval_steps = cfg.eval_steps // cfg.grad_accum_steps
@@ -295,6 +319,11 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     tokens_per_step = cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size
     step_start_time = time.time()
     training_start_time = time.time()
+    tokens_seen = start_step * tokens_per_step
+
+    # Track peak memory
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
 
     # Skip batches if resuming
     skip_batches = start_step * steps_per_accum_per_gpu
@@ -305,6 +334,10 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
         print(f"Total tokens to process: {total_tok:,} ({total_tok / 1e9:.2f}B)")
         if cfg.max_steps > 0:
             print(f"Early stopping after {cfg.max_steps} steps")
+
+    # Accumulate micro-batch losses within an accumulation step
+    accum_loss_sum = 0.0
+    accum_loss_count = 0
 
     for batch_idx, batch in enumerate(dataloader):
         # Skip already-processed batches when resuming
@@ -320,6 +353,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
             loss = outputs["loss"]
 
         loss_value = loss.detach().item()
+        accum_loss_sum += loss_value
+        accum_loss_count += 1
         (loss / steps_per_accum_per_gpu).backward()
 
         if (batch_idx + 1) % steps_per_accum_per_gpu == 0:
@@ -328,13 +363,93 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
+            tokens_seen += tokens_per_step
 
-            # ── Progress reporting ───────────────────────────────────────
+            # Average loss across micro-batches in this accumulation
+            avg_step_loss = accum_loss_sum / max(accum_loss_count, 1)
+            accum_loss_sum = 0.0
+            accum_loss_count = 0
+
+            # Update EMA
+            if loss_ema is None:
+                loss_ema = avg_step_loss
+            else:
+                loss_ema = loss_ema_alpha * loss_ema + (1 - loss_ema_alpha) * avg_step_loss
+
+            step_elapsed = time.time() - step_start_time
+            current_lr = scheduler.get_last_lr()[0]
+
+            # ── Per-step wandb logging (lightweight) ────────────────────
+            if rank == 0 and use_wandb:
+                elapsed_total = time.time() - training_start_time
+                steps_done = step - start_step
+                toks_per_sec = tokens_per_step / max(step_elapsed, 1e-6)
+                avg_toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
+
+                wandb.log({
+                    # Core training metrics
+                    "train/loss": avg_step_loss,
+                    "train/loss_ema": loss_ema,
+                    "train/perplexity": math.exp(min(avg_step_loss, 20)),  # clamp to avoid overflow
+                    "train/grad_norm": grad.item(),
+                    "train/lr": current_lr,
+                    # Throughput
+                    "throughput/tokens_per_sec": toks_per_sec,
+                    "throughput/tokens_per_sec_avg": avg_toks_per_sec,
+                    "throughput/step_time_ms": step_elapsed * 1000,
+                    "throughput/samples_per_sec": cfg.batch_size * cfg.grad_accum_steps / max(step_elapsed, 1e-6),
+                    # Progress
+                    "progress/tokens_seen": tokens_seen,
+                    "progress/tokens_seen_B": tokens_seen / 1e9,
+                    "progress/pct_complete": 100 * step / effective_max,
+                    "progress/step": step,
+                }, step=step)
+
+            # ── Periodic heavy metrics (GPU memory, component grad norms) ─
+            if rank == 0 and use_wandb and step % 50 == 0:
+                heavy_metrics = {}
+
+                # GPU memory
+                if torch.cuda.is_available():
+                    heavy_metrics["gpu/memory_allocated_gb"] = torch.cuda.memory_allocated(device) / 1e9
+                    heavy_metrics["gpu/memory_reserved_gb"] = torch.cuda.memory_reserved(device) / 1e9
+                    heavy_metrics["gpu/memory_peak_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+                    total_gpu_mem = torch.cuda.get_device_properties(device).total_mem / 1e9
+                    heavy_metrics["gpu/memory_utilization_pct"] = 100 * torch.cuda.memory_allocated(device) / torch.cuda.get_device_properties(device).total_mem
+
+                # Per-component gradient norms
+                eager = _get_eager_model(model)
+                component_grads = {}
+                for comp_name, module in [
+                    ("embedding", eager.embedding),
+                    ("encoder", eager.encoder_layers),
+                    ("decoder", eager.decoder_layers),
+                    ("encoder_norm", eager.encoder_norm),
+                    ("output_norm", eager.output_norm),
+                ]:
+                    params_with_grad = [p for p in module.parameters() if p.grad is not None]
+                    if params_with_grad:
+                        total_norm = torch.norm(torch.stack([p.grad.detach().float().norm() for p in params_with_grad]))
+                        heavy_metrics[f"grad_norm/{comp_name}"] = total_norm.item()
+
+                # Per-component parameter norms (tracks weight growth/decay)
+                for comp_name, module in [
+                    ("embedding", eager.embedding),
+                    ("encoder", eager.encoder_layers),
+                    ("decoder", eager.decoder_layers),
+                ]:
+                    params = [p for p in module.parameters()]
+                    if params:
+                        total_norm = torch.norm(torch.stack([p.detach().float().norm() for p in params]))
+                        heavy_metrics[f"weight_norm/{comp_name}"] = total_norm.item()
+
+                wandb.log(heavy_metrics, step=step)
+
+            # ── Console progress reporting ───────────────────────────────
             if rank == 0 and step % 10 == 0:
                 elapsed_total = time.time() - training_start_time
                 steps_done = step - start_step
-                step_elapsed = time.time() - step_start_time
-                toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
+                avg_toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
                 pct = 100 * step / effective_max
                 steps_remaining = effective_max - step
                 eta_sec = steps_remaining * (elapsed_total / max(steps_done, 1))
@@ -344,42 +459,33 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                     elif s < 3600: return f"{s/60:.1f}m"
                     else: return f"{s/3600:.1f}h"
 
-                current_lr = scheduler.get_last_lr()[0]
                 print(f"  [{pct:5.1f}%] Step {step:>6,}/{effective_max:,} | "
-                      f"loss {loss_value:.4f} | grad {grad.item():.4f} | "
-                      f"lr {current_lr:.2e} | {toks_per_sec:,.0f} tok/s | "
+                      f"loss {avg_step_loss:.4f} (ema {loss_ema:.4f}) | grad {grad.item():.4f} | "
+                      f"lr {current_lr:.2e} | {avg_toks_per_sec:,.0f} tok/s | "
                       f"elapsed {_fmt(elapsed_total)} | ETA {_fmt(eta_sec)}")
 
             step_start_time = time.time()
 
             if logging_steps > 0 and step % logging_steps == 0 and rank == 0:
-                current_lr = scheduler.get_last_lr()[0]
-                train_losses.append(loss_value)
+                train_losses.append(avg_step_loss)
                 train_steps_arr.append(step)
                 grad_norms.append(grad.item())
-                if use_wandb:
-                    elapsed_total = time.time() - training_start_time
-                    steps_done = step - start_step
-                    toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
-                    wandb.log({
-                        "train/loss": loss_value,
-                        "train/grad_norm": grad.item(),
-                        "train/lr": current_lr,
-                        "train/step": step,
-                        "train/tokens_per_sec": toks_per_sec,
-                    }, step=step)
 
             if eval_steps > 0 and step % eval_steps == 0:
                 eval_start = time.time()
                 avg_loss, eval_ppl = eval(model, eval_dataloader, device)
+                eval_elapsed = time.time() - eval_start
                 if rank == 0:
-                    print(f"Eval time: {time.time() - eval_start:.2f}s - eval ppl: {eval_ppl:.4f}")
+                    print(f"Eval time: {eval_elapsed:.2f}s - eval loss: {avg_loss:.4f} - eval ppl: {eval_ppl:.4f}")
                     eval_losses.append(avg_loss)
                     eval_steps_arr.append(step)
                     if use_wandb:
                         wandb.log({
                             "eval/loss": avg_loss,
                             "eval/perplexity": eval_ppl,
+                            "eval/time_sec": eval_elapsed,
+                            # Gap between train and eval (overfitting indicator)
+                            "eval/train_eval_gap": avg_step_loss - avg_loss,
                         }, step=step)
 
             if save_steps > 0 and step % save_steps == 0:
@@ -425,7 +531,19 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
         print(f"Final checkpoint: {fname}")
 
         if use_wandb:
-            wandb.log({"eval/final_perplexity": eval_ppl}, step=step)
+            wandb.log({
+                "eval/final_loss": avg_loss,
+                "eval/final_perplexity": eval_ppl,
+                "progress/total_tokens_seen": tokens_seen,
+                "progress/total_steps": step,
+                "progress/total_time_hours": (time.time() - training_start_time) / 3600,
+            }, step=step)
+            # Log final loss plot as artifact
+            if train_steps_arr:
+                wandb.log({
+                    "plots/loss_curve": wandb.Image(f"{cfg.output_dir}/{cfg.output_file_name}_losses.png"),
+                    "plots/grad_norms": wandb.Image(f"{cfg.output_dir}/{cfg.output_file_name}_grad_norms.png"),
+                }, step=step)
             wandb.finish()
 
     if dist.is_available() and dist.is_initialized():

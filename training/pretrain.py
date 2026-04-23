@@ -286,7 +286,7 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
             "tokens_per_step": cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size,
             "gpu_name": torch.cuda.get_device_name(0),
             "gpu_count": world_size,
-            "gpu_memory_gb": torch.cuda.get_device_properties(0).total_mem / 1e9,
+            "gpu_memory_gb": torch.cuda.get_device_properties(0).total_memory / 1e9,
         }
         wandb.init(
             project=cfg.wandb_project,
@@ -418,8 +418,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                     heavy_metrics["gpu/memory_allocated_gb"] = torch.cuda.memory_allocated(device) / 1e9
                     heavy_metrics["gpu/memory_reserved_gb"] = torch.cuda.memory_reserved(device) / 1e9
                     heavy_metrics["gpu/memory_peak_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
-                    total_gpu_mem = torch.cuda.get_device_properties(device).total_mem / 1e9
-                    heavy_metrics["gpu/memory_utilization_pct"] = 100 * torch.cuda.memory_allocated(device) / torch.cuda.get_device_properties(device).total_mem
+                    total_gpu_mem = torch.cuda.get_device_properties(device).total_memory / 1e9
+                    heavy_metrics["gpu/memory_utilization_pct"] = 100 * torch.cuda.memory_allocated(device) / torch.cuda.get_device_properties(device).total_memory
 
                 # Per-component gradient norms
                 eager = _get_eager_model(model)

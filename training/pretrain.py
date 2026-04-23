@@ -133,53 +133,70 @@ def _save_checkpoint(model, hparams, optimizer, scheduler, step, cfg, suffix="")
     return filename
 
 
+def _try_batch_size(model, bs, seq_len, vocab_size, device):
+    """Try a single forward+backward at the given batch size. Returns peak memory or -1 on OOM."""
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    try:
+        input_ids = torch.randint(0, vocab_size, (bs, seq_len), device=device)
+        labels = input_ids.clone()
+        blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:5] + 1)[0]
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            out = model(input_ids=input_ids, labels=labels, blocks=blocks, sft=False)
+        out["loss"].backward()
+        peak = torch.cuda.max_memory_allocated(device)
+    except RuntimeError:
+        peak = -1
+    finally:
+        # Clean up regardless of success or failure — use gc to handle
+        # any partially-constructed tensors that might not be in local scope
+        for p in model.parameters():
+            p.grad = None
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
+    return peak
+
+
 def _find_max_batch_size(model, seq_len, vocab_size, device, target_fraction=0.80):
-    """Binary search for the largest micro-batch that fits in GPU memory.
+    """Find the largest micro-batch that fits in GPU memory via linear ramp then binary search.
 
     Uses 80% of GPU memory to leave headroom for torch.compile overhead,
     optimizer states, and temporary buffers during training.
+
+    Strategy: first ramp up by powers of 2 to find the approximate ceiling,
+    then binary search within the last good range. This avoids starting the
+    binary search at a huge batch size that could trigger a hard OOM.
     """
     total_mem = torch.cuda.get_device_properties(device).total_memory
     target_mem = int(total_mem * target_fraction)
 
-    lo, hi = 1, 1024
-    best = 1
-
     model.eval()
+
+    # Phase 1: exponential ramp to find the ceiling
+    last_good = 1
+    probe = 1
+    while probe <= 1024:
+        peak = _try_batch_size(model, probe, seq_len, vocab_size, device)
+        if peak < 0 or peak > target_mem:
+            break
+        last_good = probe
+        probe *= 2
+
+    # Phase 2: binary search between last_good and the failed probe
+    lo, hi = last_good, min(probe, 1024)
+    best = last_good
     while lo <= hi:
         mid = (lo + hi) // 2
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-
-        try:
-            input_ids = torch.randint(0, vocab_size, (mid, seq_len), device=device)
-            labels = input_ids.clone()
-            blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:5] + 1)[0]
-
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                out = model(input_ids=input_ids, labels=labels, blocks=blocks, sft=False)
-            out["loss"].backward()
-
-            peak = torch.cuda.max_memory_allocated(device)
-            del input_ids, labels, blocks, out
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-
-            if peak <= target_mem:
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                torch.cuda.empty_cache()
-                model.zero_grad(set_to_none=True)
-                hi = mid - 1
-            else:
-                raise
+        peak = _try_batch_size(model, mid, seq_len, vocab_size, device)
+        if peak >= 0 and peak <= target_mem:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
 
     model.train()
-    model.zero_grad(set_to_none=True)
+    for p in model.parameters():
+        p.grad = None
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     return best

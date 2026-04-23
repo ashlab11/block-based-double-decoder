@@ -36,8 +36,8 @@ echo ""
 
 mkdir -p checkpoints
 
-torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
-    --config-name=runs/pretrain_300m \
+CONFIG_NAME=runs/pretrain_300m \
+    torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
     ${RESUME_ARGS}
 
 echo ""

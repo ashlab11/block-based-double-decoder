@@ -556,7 +556,9 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
         dist.destroy_process_group()
     return eval_ppl, f"{cfg.output_dir}/{cfg.output_file_name}.pt"
 
-@hydra.main(version_base=None, config_path="../configs", config_name="runs/pretrain")
+_config_name = os.environ.get("CONFIG_NAME", "runs/pretrain")
+
+@hydra.main(version_base=None, config_path="../configs", config_name=_config_name)
 def main(cfg: DictConfig):
     training_cfg = build_config_from_dict(cfg)
     pretrain(training_cfg, verbose=1)

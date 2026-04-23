@@ -27,8 +27,8 @@ echo "════════════════════════�
 
 mkdir -p checkpoints
 
-torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
-    --config-name=runs/pretrain_300m_micro
+CONFIG_NAME=runs/pretrain_300m_micro \
+    torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

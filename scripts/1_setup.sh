@@ -28,14 +28,9 @@ echo "── (1/4) Installing PyTorch ──"
 TORCH_INDEX="https://download.pytorch.org/whl/${CUDA_VERSION}"
 echo "  Using index: ${TORCH_INDEX}"
 
-# Try latest stable first, fall back to 2.6.0 if wheel not found
-if pip install 'torch>=2.7.0' --index-url "${TORCH_INDEX}" 2>/dev/null; then
-    echo "  ✓ Installed PyTorch $(python -c 'import torch; print(torch.__version__)')"
-else
-    echo "  No torch>=2.7.0 found for ${CUDA_VERSION}, trying 2.6.0..."
-    pip install 'torch==2.6.0' --index-url "${TORCH_INDEX}"
-    echo "  ✓ Installed PyTorch $(python -c 'import torch; print(torch.__version__)')"
-fi
+# Pin torch from the CUDA-specific index to avoid pulling wrong builds from PyPI
+pip install 'torch>=2.6.0' --index-url "${TORCH_INDEX}"
+echo "  ✓ Installed PyTorch $(python -c 'import torch; print(torch.__version__)')"
 
 # ── (2/4) Install training stack ─────────────────────────────────────────────
 echo ""
@@ -46,7 +41,10 @@ pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
 # ── (3/4) Install flash-attn ─────────────────────────────────────────────────
 echo ""
 echo "── (3/4) Installing flash-attn (compiles CUDA kernels — may take 10-20 min) ──"
-pip install flash-attn --no-build-isolation --no-cache-dir
+# Force rebuild to ensure flash-attn is compiled against the installed torch version.
+# Without --force-reinstall, pip skips the build if flash-attn is already installed
+# but compiled against a different torch ABI.
+pip install flash-attn --no-build-isolation --no-cache-dir --force-reinstall --no-deps
 
 # ── (4/4) Full environment verification ──────────────────────────────────────
 echo ""

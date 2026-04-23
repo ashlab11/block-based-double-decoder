@@ -46,4 +46,4 @@ output_file_name: "dd_300m_6btok"
 # ── Wandb ────────────────────────────────────────────────────────────────────
 wandb_project: "block-based-double-decoder"
 wandb_run_name: "dd_300m_6btok"
-wandb_entity: "benjamin_bradley"
+wandb_entity: "block-based-double-decoders"

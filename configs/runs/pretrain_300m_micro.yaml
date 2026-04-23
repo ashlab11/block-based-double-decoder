@@ -47,4 +47,4 @@ output_file_name: "dd_300m_micro"
 # ── Wandb ────────────────────────────────────────────────────────────────────
 wandb_project: "block-based-double-decoder"
 wandb_run_name: "dd_300m_micro_dryrun"
-wandb_entity: "benjamin_bradley"
+wandb_entity: "block-based-double-decoders"

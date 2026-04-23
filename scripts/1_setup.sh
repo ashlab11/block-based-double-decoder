@@ -2,6 +2,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1: Install dependencies and verify environment
 #
+# Pinned versions (tested on RunPod H100 SXM with CUDA 12.4):
+#   torch==2.6.0+cu124   flash-attn==2.8.3   torchtune==0.6.0
+#
 # Wall clock: ~10-20 minutes (flash-attn compilation dominates)
 # Devices:    GPU needed for verification steps
 # Cost:       ~$0.10-0.50 (minimal RunPod time)
@@ -12,25 +15,12 @@ echo "════════════════════════�
 echo "  Step 1: Setup & Dependencies"
 echo "═══════════════════════════════════════════════════════════════"
 
-# ── Detect CUDA version for correct PyTorch wheel ────────────────────────────
-CUDA_VERSION=$(python -c "
-import subprocess, re
-out = subprocess.check_output(['nvcc', '--version'], text=True)
-m = re.search(r'release (\d+)\.(\d+)', out)
-if m: print(f'cu{m.group(1)}{m.group(2)}')
-else: print('cu124')
-" 2>/dev/null || echo "cu124")
-echo "  Detected CUDA: ${CUDA_VERSION}"
-
-# ── (1/4) Install PyTorch ────────────────────────────────────────────────────
+# ── (1/4) Install PyTorch (pinned to cu124 for CUDA 12.4 pods) ──────────────
 echo ""
-echo "── (1/4) Installing PyTorch ──"
-TORCH_INDEX="https://download.pytorch.org/whl/${CUDA_VERSION}"
-echo "  Using index: ${TORCH_INDEX}"
-
-# Pin torch from the CUDA-specific index to avoid pulling wrong builds from PyPI
-pip install 'torch>=2.6.0' --index-url "${TORCH_INDEX}"
+echo "── (1/4) Installing PyTorch 2.6.0+cu124 ──"
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 echo "  ✓ Installed PyTorch $(python -c 'import torch; print(torch.__version__)')"
+echo "  ✓ CUDA build: $(python -c 'import torch; print(torch.version.cuda)')"
 
 # ── (2/4) Install training stack ─────────────────────────────────────────────
 echo ""
@@ -38,12 +28,14 @@ echo "── (2/4) Installing training stack ──"
 pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
     hydra-core omegaconf matplotlib tqdm wandb hf_transfer
 
-# ── (3/4) Install flash-attn ─────────────────────────────────────────────────
+# ── (3/4) Install flash-attn (must be AFTER torch, compiled against it) ──────
 echo ""
 echo "── (3/4) Installing flash-attn (compiles CUDA kernels — may take 10-20 min) ──"
-# Force rebuild to ensure flash-attn is compiled against the installed torch version.
-# Without --force-reinstall, pip skips the build if flash-attn is already installed
-# but compiled against a different torch ABI.
+echo "  torch.version.cuda = $(python -c 'import torch; print(torch.version.cuda)')"
+echo "  System CUDA: $(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' || echo 'nvcc not found')"
+# --no-deps: prevent flash-attn from pulling a different torch from PyPI
+# --no-cache-dir: prevent reuse of wheels compiled against a different torch
+# --force-reinstall: always recompile even if version matches
 pip install flash-attn --no-build-isolation --no-cache-dir --force-reinstall --no-deps
 
 # ── (4/4) Full environment verification ──────────────────────────────────────
@@ -53,11 +45,10 @@ echo "── (4/4) Verifying environment ──"
 echo ""
 echo "  Packages:"
 python -c "
-import torch, flash_attn, wandb, transformers, datasets, torchtune
+import torch, flash_attn, wandb, transformers, datasets
 print(f'    PyTorch:      {torch.__version__}')
 print(f'    CUDA build:   {torch.version.cuda}')
 print(f'    flash-attn:   {flash_attn.__version__}')
-print(f'    torchtune:    {torchtune.__version__}')
 print(f'    transformers: {transformers.__version__}')
 print(f'    datasets:     {datasets.__version__}')
 print(f'    wandb:        {wandb.__version__}')
@@ -84,7 +75,6 @@ import torch, sys
 import torch._inductor.config as _inductor_config
 _inductor_config.pattern_matcher = False  # workaround for 2.6.0 quantization bug
 
-# Quick compile smoke test — catches inductor bugs before they waste time later
 class TinyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()

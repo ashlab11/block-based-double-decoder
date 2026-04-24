@@ -145,46 +145,54 @@ def _make_copy_example(seq_len, vocab_size, repeat_offset, rng):
 
 
 def eval_copy_retrieval(model, tokenizer, device, is_enc_dec,
-                        num_examples=200, max_offset=512):
-    """Test exact token copying from earlier in the sequence.
-
-    Creates sequences where a pattern appears twice, with the last token
-    of the second occurrence missing. The model must predict it by copying.
-    """
+                        num_examples=200, max_offset=512, batch_size=64):
+    """Test exact token copying from earlier in the sequence (batched per offset)."""
     vocab_size = tokenizer.vocab_size
     rng = random.Random(42)
 
-    # Test at multiple distances between pattern occurrences
     offsets = [32, 64, 128, 256, min(max_offset, 512)]
     examples_per_offset = max(num_examples // len(offsets), 10)
 
     results_by_offset = {}
     total_correct = total_tests = 0
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
 
     for offset in tqdm(offsets, desc="Copy/Retrieval"):
-        correct = count = 0
+        # Generate all examples for this offset
+        seqs, targets, pred_positions = [], [], []
         for _ in range(examples_per_offset):
             seq, target, pred_pos = _make_copy_example(
                 seq_len=offset + 20, vocab_size=vocab_size,
                 repeat_offset=offset, rng=rng
             )
+            seqs.append(seq)
+            targets.append(target)
+            pred_positions.append(pred_pos)
 
-            input_t = torch.tensor([seq], device=device)
+        # Batch forward pass
+        correct = 0
+        for batch_start in range(0, len(seqs), batch_size):
+            batch_seqs = seqs[batch_start:batch_start + batch_size]
+            batch_targets = targets[batch_start:batch_start + batch_size]
+            batch_ppos = pred_positions[batch_start:batch_start + batch_size]
 
-            if is_enc_dec:
-                blocks = torch.tensor([len(seq) // 2], device=device)
-                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                                          enabled=device.type == "cuda"):
+            max_len = max(len(s) for s in batch_seqs)
+            padded = [s + [pad_id] * (max_len - len(s)) for s in batch_seqs]
+            input_t = torch.tensor(padded, device=device)
+
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                                      enabled=device.type == "cuda"):
+                if is_enc_dec:
+                    blocks = torch.tensor([max_len // 2], device=device)
                     logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
-            else:
-                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                                          enabled=device.type == "cuda"):
+                else:
                     logits = model(input_ids=input_t)["logits"]
 
-            predicted = logits[0, pred_pos].argmax().item()
-            correct += int(predicted == target)
-            count += 1
+            for i in range(len(batch_seqs)):
+                predicted = logits[i, batch_ppos[i]].argmax().item()
+                correct += int(predicted == batch_targets[i])
 
+        count = len(seqs)
         acc = correct / max(count, 1)
         results_by_offset[offset] = {"accuracy": acc, "correct": correct, "total": count}
         total_correct += correct

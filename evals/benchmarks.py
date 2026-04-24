@@ -1,37 +1,70 @@
 """
 Log-likelihood benchmarks: multiple-choice evaluations, LAMBADA,
 GLUE, and SuperGLUE formatted for generative scoring.
+
+All MC benchmarks use batched GPU scoring for maximum throughput.
 """
 
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from evals.utils import score_choices, get_log_probs, get_sequence_log_probs
+from evals.utils import get_log_probs_batch, get_sequence_log_probs_batch
 
 
-# ── Generic MC evaluator ──────────────────────────────────────────────────
+# ── Generic batched MC evaluator ─────────────────────────────────────────
 
 def _eval_mc(name, model, tokenizer, device, is_enc_dec,
-             dataset_args, format_fn, max_examples=None):
-    """Run a multiple-choice benchmark.
+             dataset_args, format_fn, max_examples=None, batch_size=64):
+    """Run a multiple-choice benchmark with batched scoring.
 
     format_fn(example) -> (context_str, [choices_str], gold_idx)
     """
     ds = load_dataset(**dataset_args)
-    if max_examples and not hasattr(ds, '__iter__'):
-        ds = ds.select(range(min(max_examples, len(ds))))
 
-    correct = total = 0
-    for ex in tqdm(ds, desc=name):
-        if max_examples and total >= max_examples:
+    # 1. Collect and format all examples
+    examples = []
+    for ex in ds:
+        if max_examples and len(examples) >= max_examples:
             break
         try:
             context, choices, gold = format_fn(ex)
-            pred, _ = score_choices(model, tokenizer, context, choices, device, is_enc_dec)
-            correct += int(pred == gold)
-            total += 1
-        except Exception as e:
-            print(f"  [{name}] Skipped example: {e}")
+            examples.append((context, choices, gold))
+        except Exception:
+            continue
+
+    if not examples:
+        return {"name": name, "accuracy": 0, "correct": 0, "total": 0}
+
+    # 2. Tokenize and flatten to (context_ids, choice_ids) pairs
+    all_pairs = []
+    num_choices_per = []
+
+    for ctx_str, choices, _ in examples:
+        ctx_ids = tokenizer.encode(ctx_str, add_special_tokens=False)
+        n = 0
+        for ch_str in choices:
+            ch_ids = tokenizer.encode(ch_str, add_special_tokens=False)
+            if ch_ids:
+                all_pairs.append((ctx_ids, ch_ids))
+                n += 1
+        num_choices_per.append(n)
+
+    # 3. Batch score all pairs
+    all_scores = get_log_probs_batch(
+        model, tokenizer, all_pairs, device, is_enc_dec,
+        batch_size=batch_size, desc=name
+    )
+
+    # 4. Aggregate per example
+    correct = total = 0
+    score_idx = 0
+    for ex_idx, (_, choices, gold) in enumerate(examples):
+        n = num_choices_per[ex_idx]
+        scores = all_scores[score_idx:score_idx + n]
+        score_idx += n
+        pred = max(range(n), key=lambda i: scores[i])
+        correct += int(pred == gold)
+        total += 1
 
     return {"name": name, "accuracy": correct / max(total, 1),
             "correct": correct, "total": total}
@@ -47,10 +80,10 @@ def _fmt_hellaswag(ex):
     ctx = ex["activity_label"] + ". " + ex["ctx_a"] + " " + ex["ctx_b"]
     return ctx, ex["endings"], int(ex["label"])
 
-def eval_hellaswag(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_hellaswag(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("HellaSwag", model, tokenizer, device, is_enc_dec,
                     {"path": "Rowan/hellaswag", "split": "validation"},
-                    _fmt_hellaswag, max_examples)
+                    _fmt_hellaswag, max_examples, batch_size)
 
 
 # ── PIQA ───────────────────────────────────────────────────────────────────
@@ -58,10 +91,10 @@ def eval_hellaswag(model, tokenizer, device, is_enc_dec, max_examples=None):
 def _fmt_piqa(ex):
     return ex["goal"], [" " + ex["sol1"], " " + ex["sol2"]], ex["label"]
 
-def eval_piqa(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_piqa(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("PIQA", model, tokenizer, device, is_enc_dec,
                     {"path": "lighteval/piqa", "split": "validation"},
-                    _fmt_piqa, max_examples)
+                    _fmt_piqa, max_examples, batch_size)
 
 
 # ── ARC-Easy / ARC-Challenge ──────────────────────────────────────────────
@@ -73,15 +106,15 @@ def _fmt_arc(ex):
     gold = labels.index(ex["answerKey"])
     return ctx, choices, gold
 
-def eval_arc_easy(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_arc_easy(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("ARC-Easy", model, tokenizer, device, is_enc_dec,
                     {"path": "allenai/ai2_arc", "name": "ARC-Easy", "split": "test"},
-                    _fmt_arc, max_examples)
+                    _fmt_arc, max_examples, batch_size)
 
-def eval_arc_challenge(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_arc_challenge(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("ARC-Challenge", model, tokenizer, device, is_enc_dec,
                     {"path": "allenai/ai2_arc", "name": "ARC-Challenge", "split": "test"},
-                    _fmt_arc, max_examples)
+                    _fmt_arc, max_examples, batch_size)
 
 
 # ── WinoGrande ────────────────────────────────────────────────────────────
@@ -94,11 +127,11 @@ def _fmt_winogrande(ex):
     gold = int(ex["answer"]) - 1  # "1"/"2" → 0/1
     return ctx, choices, gold
 
-def eval_winogrande(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_winogrande(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("WinoGrande", model, tokenizer, device, is_enc_dec,
                     {"path": "allenai/winogrande", "name": "winogrande_xl",
                      "split": "validation"},
-                    _fmt_winogrande, max_examples)
+                    _fmt_winogrande, max_examples, batch_size)
 
 
 # ── BoolQ ──────────────────────────────────────────────────────────────────
@@ -107,10 +140,10 @@ def _fmt_boolq(ex):
     ctx = ex["passage"] + "\nQuestion: " + ex["question"] + "?\nAnswer:"
     return ctx, [" No", " Yes"], int(ex["answer"])
 
-def eval_boolq(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_boolq(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("BoolQ", model, tokenizer, device, is_enc_dec,
                     {"path": "google/boolq", "split": "validation"},
-                    _fmt_boolq, max_examples)
+                    _fmt_boolq, max_examples, batch_size)
 
 
 # ── MMLU ───────────────────────────────────────────────────────────────────
@@ -125,10 +158,10 @@ def _fmt_mmlu(ex):
     gold = ex["answer"]  # 0-3
     return q, label_choices, gold
 
-def eval_mmlu(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_mmlu(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("MMLU", model, tokenizer, device, is_enc_dec,
                     {"path": "cais/mmlu", "name": "all", "split": "test"},
-                    _fmt_mmlu, max_examples)
+                    _fmt_mmlu, max_examples, batch_size)
 
 
 # ── TruthfulQA (MC1) ──────────────────────────────────────────────────────
@@ -139,52 +172,54 @@ def _fmt_truthfulqa(ex):
     gold = ex["mc1_targets"]["labels"].index(1)
     return ctx, choices, gold
 
-def eval_truthfulqa(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_truthfulqa(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     return _eval_mc("TruthfulQA-MC1", model, tokenizer, device, is_enc_dec,
                     {"path": "truthfulqa/truthful_qa", "name": "multiple_choice",
                      "split": "validation"},
-                    _fmt_truthfulqa, max_examples)
+                    _fmt_truthfulqa, max_examples, batch_size)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LAMBADA (last-word prediction — exact match, not MC)
+#  LAMBADA (last-word prediction — batched exact match)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def eval_lambada(model, tokenizer, device, is_enc_dec, max_examples=None):
+def eval_lambada(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
     """LAMBADA: predict the final word of a passage. Greedy exact match."""
     ds = load_dataset("EleutherAI/lambada_openai", split="test")
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 
-    correct = total = 0
-    for ex in tqdm(ds, desc="LAMBADA"):
+    # Collect all examples
+    examples = []
+    for ex in ds:
         text = ex["text"]
         idx = text.rfind(" ")
         if idx < 0:
             continue
-        context = text[:idx]
-        target = text[idx:]  # includes leading space
+        context_ids = tokenizer.encode(text[:idx], add_special_tokens=False)
+        target_ids = tokenizer.encode(text[idx:], add_special_tokens=False)
+        if target_ids:
+            examples.append((context_ids, target_ids))
 
-        context_ids = tokenizer.encode(context, add_special_tokens=False)
-        target_ids = tokenizer.encode(target, add_special_tokens=False)
-        if not target_ids:
-            continue
+    # Batch score full sequences
+    all_id_lists = [ctx + tgt for ctx, tgt in examples]
+    all_results = get_sequence_log_probs_batch(
+        model, tokenizer, all_id_lists, device, is_enc_dec,
+        batch_size=batch_size, desc="LAMBADA"
+    )
 
-        # Get model predictions via full-sequence forward
-        full_ids = context_ids + target_ids
-        _, predicted = get_sequence_log_probs(model, tokenizer, full_ids, device, is_enc_dec)
-
-        # Check greedy match for each target token
-        all_correct = True
-        for i, tid in enumerate(target_ids):
-            pos = len(context_ids) - 1 + i  # logits[pos] predicts full_ids[pos+1]
-            if predicted[pos].item() != tid:
-                all_correct = False
+    correct = 0
+    for i, (ctx_ids, tgt_ids) in enumerate(examples):
+        _, predicted = all_results[i]
+        all_match = True
+        for j, tid in enumerate(tgt_ids):
+            pos = len(ctx_ids) - 1 + j
+            if pos >= len(predicted) or predicted[pos].item() != tid:
+                all_match = False
                 break
+        correct += int(all_match)
 
-        correct += int(all_correct)
-        total += 1
-
+    total = len(examples)
     return {"name": "LAMBADA", "accuracy": correct / max(total, 1),
             "correct": correct, "total": total}
 
@@ -226,7 +261,7 @@ _GLUE_TASKS = {
             "Question: " + ex["question"] + "\n" + ex["sentence"]
             + "\nDoes this answer the question?",
             [" Yes", " No"],
-            ex["label"],  # 0=entailment(Yes), 1=not(No)
+            ex["label"],
         ),
     },
     "rte": {
@@ -257,13 +292,13 @@ _GLUE_TASKS = {
 }
 
 
-def eval_glue(model, tokenizer, device, is_enc_dec, max_examples=None):
-    """Run all GLUE subtasks. Returns per-task and average accuracy."""
+def eval_glue(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
+    """Run all GLUE subtasks with batched scoring."""
     results = {}
     accs = []
     for task_name, cfg in _GLUE_TASKS.items():
         r = _eval_mc(f"GLUE/{task_name}", model, tokenizer, device, is_enc_dec,
-                     cfg["dataset"], cfg["format"], max_examples)
+                     cfg["dataset"], cfg["format"], max_examples, batch_size)
         results[task_name] = r
         accs.append(r["accuracy"])
 
@@ -330,13 +365,13 @@ _SUPERGLUE_TASKS = {
 }
 
 
-def eval_superglue(model, tokenizer, device, is_enc_dec, max_examples=None):
-    """Run all SuperGLUE subtasks. Returns per-task and average accuracy."""
+def eval_superglue(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
+    """Run all SuperGLUE subtasks with batched scoring."""
     results = {}
     accs = []
     for task_name, cfg in _SUPERGLUE_TASKS.items():
         r = _eval_mc(f"SuperGLUE/{task_name}", model, tokenizer, device, is_enc_dec,
-                     cfg["dataset"], cfg["format"], max_examples)
+                     cfg["dataset"], cfg["format"], max_examples, batch_size)
         results[task_name] = r
         accs.append(r["accuracy"])
 

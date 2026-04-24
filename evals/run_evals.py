@@ -109,6 +109,8 @@ def main():
                              "generation, probes, quick, paper")
     parser.add_argument("--max-examples", type=int, default=None,
                         help="Cap examples per eval (useful for fast debugging)")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Batch size for GPU scoring (default 64, auto-halves on OOM)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", default=None, help="Save results JSON to this path")
     parser.add_argument("--eval-file", default="data/Pretrain/slimpajama_eval_packed.jsonl",
@@ -135,6 +137,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  Loading model from {args.checkpoint}")
     print(f"  Device: {device}")
+    print(f"  Batch size: {args.batch_size}")
     print(f"  Evals: {eval_names}")
     print(f"{'='*60}\n")
 
@@ -178,6 +181,8 @@ def main():
                 kwargs["max_examples"] = args.max_examples
             if "num_examples" in sig.parameters and args.max_examples is not None:
                 kwargs["num_examples"] = args.max_examples
+            if "batch_size" in sig.parameters:
+                kwargs["batch_size"] = args.batch_size
             if "eval_file" in sig.parameters:
                 kwargs["eval_file"] = args.eval_file
 

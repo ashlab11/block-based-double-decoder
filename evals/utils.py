@@ -1,7 +1,7 @@
 """
 Core utilities for evaluating block-based double-decoder models.
-Handles model loading, log-likelihood scoring, and text generation
-for both Double_Decoder (encoder-decoder) and DecoderOnlyModel architectures.
+Handles model loading, log-likelihood scoring (single + batched),
+and text generation for both Double_Decoder and DecoderOnlyModel.
 """
 
 import sys
@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
+from tqdm import tqdm
 
 
 def load_model(checkpoint_path, tokenizer_path=None, device="cuda"):
@@ -51,103 +52,248 @@ def load_model(checkpoint_path, tokenizer_path=None, device="cuda"):
     return model, tokenizer, is_enc_dec
 
 
-# ── Log-likelihood scoring ─────────────────────────────────────────────────
+# ── OOM-safe batching ─────────────────────────────────────────────────────
+
+def _safe_batch(fn, items, batch_size):
+    """Run fn on batches of items, halving batch size on OOM."""
+    results = []
+    i = 0
+    bs = batch_size
+    while i < len(items):
+        batch = items[i:i + bs]
+        try:
+            results.extend(fn(batch))
+            i += bs
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if bs <= 1:
+                raise
+            bs = max(1, bs // 2)
+            print(f"  [OOM] Reducing batch size to {bs}")
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BATCHED LOG-PROB SCORING (for MC benchmarks)
+# ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def get_log_probs(model, tokenizer, context_ids, continuation_ids, device, is_enc_dec):
-    """Per-token log probs of continuation given context.
+def get_log_probs_batch(model, tokenizer, pairs, device, is_enc_dec, batch_size=64,
+                        desc=None):
+    """Score (context_ids, continuation_ids) pairs in batches.
 
-    Returns: tensor of shape [len(continuation_ids)]
+    Returns: list of float (length-normalized mean log-prob per pair)
     """
-    if is_enc_dec:
-        return _log_probs_enc_dec(model, tokenizer, context_ids, continuation_ids, device)
-    else:
-        return _log_probs_decoder_only(model, tokenizer, context_ids, continuation_ids, device)
+    if not pairs:
+        return []
 
-
-def _log_probs_decoder_only(model, tokenizer, context_ids, continuation_ids, device):
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
-    input_ids = [bos_id] + context_ids + continuation_ids
-    input_t = torch.tensor([input_ids], device=device)
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+    model_seq_len = getattr(model, "seq_len", 2048)
+
+    if is_enc_dec:
+        fn = lambda batch: _log_probs_batch_enc_dec(model, batch, device, bos_id, pad_id, model_seq_len)
+    else:
+        fn = lambda batch: _log_probs_batch_decoder_only(model, batch, device, bos_id, pad_id)
+
+    # Sort by total length for efficient padding, track original order
+    indexed = sorted(enumerate(pairs), key=lambda x: len(x[1][0]) + len(x[1][1]))
+    sorted_pairs = [p for _, p in indexed]
+    orig_indices = [i for i, _ in indexed]
+
+    pbar = tqdm(total=len(sorted_pairs), desc=desc, leave=False) if desc else None
+
+    sorted_scores = []
+    i = 0
+    bs = batch_size
+    while i < len(sorted_pairs):
+        batch = sorted_pairs[i:i + bs]
+        try:
+            scores = fn(batch)
+            sorted_scores.extend(scores)
+            i += bs
+            if pbar:
+                pbar.update(len(batch))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if bs <= 1:
+                raise
+            bs = max(1, bs // 2)
+            print(f"  [OOM] Reducing batch size to {bs}")
+
+    if pbar:
+        pbar.close()
+
+    # Restore original order
+    results = [0.0] * len(pairs)
+    for sorted_idx, orig_idx in enumerate(orig_indices):
+        results[orig_idx] = sorted_scores[sorted_idx]
+    return results
+
+
+def _log_probs_batch_decoder_only(model, pairs, device, bos_id, pad_id):
+    sequences = []
+    cont_starts = []
+    cont_lens = []
+
+    for ctx_ids, cont_ids in pairs:
+        seq = [bos_id] + ctx_ids + cont_ids
+        sequences.append(seq)
+        cont_starts.append(1 + len(ctx_ids))
+        cont_lens.append(len(cont_ids))
+
+    max_len = max(len(s) for s in sequences)
+    padded = [s + [pad_id] * (max_len - len(s)) for s in sequences]
+    input_t = torch.tensor(padded, device=device)
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         logits = model(input_ids=input_t)["logits"]
 
-    log_probs = F.log_softmax(logits[0].float(), dim=-1)
+    log_probs_all = F.log_softmax(logits.float(), dim=-1)
 
-    # logits[t] predicts input[t+1]; continuation starts at index 1+len(context)
-    cont_start = 1 + len(context_ids)
-    return torch.stack([
-        log_probs[cont_start - 1 + i, continuation_ids[i]]
-        for i in range(len(continuation_ids))
-    ])
+    scores = []
+    for i in range(len(pairs)):
+        start = cont_starts[i]
+        n = cont_lens[i]
+        cont_t = torch.tensor(pairs[i][1], device=device)
+        token_lps = log_probs_all[i, start - 1:start - 1 + n].gather(
+            1, cont_t.unsqueeze(1)
+        ).squeeze(1)
+        scores.append(token_lps.sum().item() / n)
+
+    return scores
 
 
-def _log_probs_enc_dec(model, tokenizer, context_ids, continuation_ids, device):
-    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+def _log_probs_batch_enc_dec(model, pairs, device, bos_id, pad_id, model_seq_len):
+    enc_seqs = [[bos_id] + ctx for ctx, _ in pairs]
+    dec_seqs = [[bos_id] + cont for _, cont in pairs]
+    enc_lens = [len(s) for s in enc_seqs]
+    cont_lens = [len(cont) for _, cont in pairs]
 
-    enc_ids = [bos_id] + context_ids
-    dec_ids = [bos_id] + continuation_ids  # BOS as decoder start token
+    max_enc = max(enc_lens)
+    max_dec = max(len(s) for s in dec_seqs)
 
-    encoder_input_ids = torch.tensor([enc_ids], device=device)
-    decoder_input_ids = torch.tensor([dec_ids], device=device)
+    padded_enc = [s + [pad_id] * (max_enc - len(s)) for s in enc_seqs]
+    padded_dec = [s + [pad_id] * (max_dec - len(s)) for s in dec_seqs]
 
-    enc_len = len(enc_ids)
-    dec_len = len(dec_ids)
+    enc_t = torch.tensor(padded_enc, device=device)
+    dec_t = torch.tensor(padded_dec, device=device)
+    blocks = torch.tensor(enc_lens, device=device)
 
-    decoder_input_positions = torch.arange(enc_len, enc_len + dec_len, device=device).unsqueeze(0)
-    seq_len = getattr(model, "seq_len", 2048)
-    decoder_input_positions = decoder_input_positions.clamp(max=seq_len - 1)
-
-    blocks = torch.tensor([enc_len], device=device)
+    dec_pos = []
+    for el in enc_lens:
+        positions = [min(el + j, model_seq_len - 1) for j in range(max_dec)]
+        dec_pos.append(positions)
+    dec_pos_t = torch.tensor(dec_pos, device=device)
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
         logits = model(
-            encoder_input_ids=encoder_input_ids,
-            decoder_input_ids=decoder_input_ids,
-            decoder_input_positions=decoder_input_positions,
+            encoder_input_ids=enc_t,
+            decoder_input_ids=dec_t,
+            decoder_input_positions=dec_pos_t,
             blocks=blocks,
             sft=True,
         )["logits"]
 
-    log_probs = F.log_softmax(logits[0].float(), dim=-1)
+    log_probs_all = F.log_softmax(logits.float(), dim=-1)
 
-    # logits[i] predicts continuation[i] (since decoder = [BOS, c0, c1, ...])
-    return torch.stack([
-        log_probs[i, continuation_ids[i]]
-        for i in range(len(continuation_ids))
-    ])
-
-
-# ── Multiple-choice scoring ───────────────────────────────────────────────
-
-def score_choices(model, tokenizer, context_str, choices, device, is_enc_dec):
-    """Score continuation choices. Returns (best_idx, list_of_scores).
-
-    Scores are length-normalized mean log-probs.
-    """
-    context_ids = tokenizer.encode(context_str, add_special_tokens=False)
     scores = []
-    for choice in choices:
-        choice_ids = tokenizer.encode(choice, add_special_tokens=False)
-        if not choice_ids:
-            scores.append(float("-inf"))
-            continue
-        lp = get_log_probs(model, tokenizer, context_ids, choice_ids, device, is_enc_dec)
-        scores.append(lp.sum().item() / len(choice_ids))
+    for i in range(len(pairs)):
+        n = cont_lens[i]
+        cont_t = torch.tensor(pairs[i][1], device=device)
+        # logits[i, 0] predicts first continuation token (after decoder BOS)
+        token_lps = log_probs_all[i, :n].gather(1, cont_t.unsqueeze(1)).squeeze(1)
+        scores.append(token_lps.sum().item() / n)
 
-    best = max(range(len(scores)), key=lambda i: scores[i])
-    return best, scores
+    return scores
 
 
-# ── Full-sequence log probs (for PPL / BPB) ───────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  BATCHED SEQUENCE LOG-PROBS (for intrinsic evals + LAMBADA)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def get_sequence_log_probs_batch(model, tokenizer, id_lists, device, is_enc_dec,
+                                 batch_size=64, desc=None):
+    """Batched per-token log probs for multiple sequences.
+
+    Returns: list of (log_probs tensor [seq_len-1], predicted_ids tensor [seq_len-1])
+    """
+    if not id_lists:
+        return []
+
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+
+    fn = lambda batch: _seq_lp_batch_inner(model, batch, device, pad_id, is_enc_dec)
+
+    # Sort by length for efficient padding
+    indexed = sorted(enumerate(id_lists), key=lambda x: len(x[1]))
+    sorted_lists = [ids for _, ids in indexed]
+    orig_indices = [i for i, _ in indexed]
+
+    pbar = tqdm(total=len(sorted_lists), desc=desc, leave=False) if desc else None
+
+    sorted_results = []
+    i = 0
+    bs = batch_size
+    while i < len(sorted_lists):
+        batch = sorted_lists[i:i + bs]
+        try:
+            sorted_results.extend(fn(batch))
+            i += bs
+            if pbar:
+                pbar.update(len(batch))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if bs <= 1:
+                raise
+            bs = max(1, bs // 2)
+            print(f"  [OOM] Reducing batch size to {bs}")
+
+    if pbar:
+        pbar.close()
+
+    # Restore original order
+    results = [None] * len(id_lists)
+    for sorted_idx, orig_idx in enumerate(orig_indices):
+        results[orig_idx] = sorted_results[sorted_idx]
+    return results
+
+
+def _seq_lp_batch_inner(model, id_lists, device, pad_id, is_enc_dec):
+    lengths = [len(ids) for ids in id_lists]
+    max_len = max(lengths)
+    padded = [ids + [pad_id] * (max_len - len(ids)) for ids in id_lists]
+    input_t = torch.tensor(padded, device=device)
+
+    if is_enc_dec:
+        blocks = torch.tensor([max_len // 2], device=device)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
+    else:
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = model(input_ids=input_t)["logits"]
+
+    logits = logits.float()
+    log_probs_all = F.log_softmax(logits, dim=-1)
+
+    results = []
+    for i, length in enumerate(lengths):
+        targets = torch.tensor(id_lists[i][1:], device=device)
+        token_lps = log_probs_all[i, :length - 1].gather(1, targets.unsqueeze(1)).squeeze(1)
+        predicted = logits[i, :length - 1].argmax(dim=-1)
+        results.append((token_lps, predicted))
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SINGLE-EXAMPLE FUNCTIONS (kept for generation evals, NIAH)
+# ═══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def get_sequence_log_probs(model, tokenizer, input_ids_list, device, is_enc_dec):
-    """Per-token log probs for a packed sequence (pretraining-style forward).
-
-    Returns: (log_probs tensor [seq_len-1], predicted_ids tensor [seq_len-1])
-    """
+    """Per-token log probs for a single packed sequence."""
     input_t = torch.tensor([input_ids_list], device=device)
 
     if is_enc_dec:
@@ -159,7 +305,7 @@ def get_sequence_log_probs(model, tokenizer, input_ids_list, device, is_enc_dec)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(input_ids=input_t)["logits"]
 
-    logits = logits[0].float()  # [seq_len, vocab]
+    logits = logits[0].float()
     log_probs = F.log_softmax(logits, dim=-1)
 
     targets = torch.tensor(input_ids_list[1:], device=device)
@@ -247,7 +393,7 @@ def _gen_enc_dec(model, tokenizer, prompt, max_new_tokens, device, temperature, 
         if next_tok.item() == eos_id:
             break
 
-    gen_ids = dec_ids[0, 1:].tolist()  # skip assistant token
+    gen_ids = dec_ids[0, 1:].tolist()
     if eos_id in gen_ids:
         gen_ids = gen_ids[:gen_ids.index(eos_id)]
     return tokenizer.decode(gen_ids, skip_special_tokens=True)

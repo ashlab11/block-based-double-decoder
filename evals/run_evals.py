@@ -170,12 +170,14 @@ def main():
                 "device": device,
                 "is_enc_dec": is_enc_dec,
             }
-            if args.max_examples is not None:
-                kwargs["max_examples"] = args.max_examples
-
-            # Some evals need eval_file
+            # Only pass kwargs the function actually accepts
             import inspect
             sig = inspect.signature(eval_fn)
+
+            if args.max_examples is not None and "max_examples" in sig.parameters:
+                kwargs["max_examples"] = args.max_examples
+            if "num_examples" in sig.parameters and args.max_examples is not None:
+                kwargs["num_examples"] = args.max_examples
             if "eval_file" in sig.parameters:
                 kwargs["eval_file"] = args.eval_file
 

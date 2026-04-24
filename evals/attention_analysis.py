@@ -12,6 +12,7 @@ import torch
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
+from evals.intrinsic import _load_eval_dataset
 
 
 def _has_combo_attention(model):
@@ -130,14 +131,10 @@ def eval_attention_weights(model, tokenizer, device, is_enc_dec,
         combo_attn.forward = make_patched_forward(original_forwards[key], key)
 
     # Run forward passes to collect weights
-    ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
-
     model.eval()
     with torch.no_grad():
-        for i, example in enumerate(tqdm(ds, desc="Attention Analysis", total=max_examples)):
-            if i >= max_examples:
-                break
-            ids = example["input_ids"]
+        for ids in tqdm(_load_eval_dataset(eval_file, tokenizer, max_examples),
+                        desc="Attention Analysis", total=max_examples):
             input_t = torch.tensor([ids], device=device)
             seq_len = len(ids)
             blocks = torch.tensor([seq_len // 2], device=device)

@@ -3,12 +3,38 @@ Intrinsic evaluation metrics: Held-out Perplexity, Bits-per-Byte,
 Next-Token Accuracy, and Positional Accuracy.
 """
 
+import os
 import math
 import torch
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 from evals.utils import get_sequence_log_probs
+
+
+def _load_eval_dataset(eval_file, tokenizer, max_examples, fallback_name="Wikitext-103"):
+    """Load packed eval data from local file, or fall back to Wikitext-103."""
+    if os.path.exists(eval_file):
+        ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
+        for i, example in enumerate(ds):
+            if i >= max_examples:
+                break
+            yield example["input_ids"]
+    else:
+        print(f"  [INFO] {eval_file} not found — falling back to {fallback_name}")
+        ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
+        count = 0
+        for example in ds:
+            if count >= max_examples:
+                break
+            text = example["text"]
+            if len(text.strip()) < 50:
+                continue
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(ids) < 10:
+                continue
+            yield ids
+            count += 1
 
 
 # ── Held-Out Perplexity ───────────────────────────────────────────────────
@@ -20,15 +46,11 @@ def eval_held_out_perplexity(model, tokenizer, device, is_enc_dec,
 
     Returns: {"perplexity": float, "avg_loss": float, "total_tokens": int}
     """
-    ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
-
     total_nll = 0.0
     total_tokens = 0
 
-    for i, example in enumerate(tqdm(ds, desc="Held-out PPL", total=max_examples)):
-        if i >= max_examples:
-            break
-        ids = example["input_ids"]
+    for ids in tqdm(_load_eval_dataset(eval_file, tokenizer, max_examples),
+                    desc="Held-out PPL", total=max_examples):
         log_probs, _ = get_sequence_log_probs(model, tokenizer, ids, device, is_enc_dec)
         total_nll += -log_probs.sum().item()
         total_tokens += log_probs.shape[0]
@@ -80,15 +102,11 @@ def eval_token_accuracy(model, tokenizer, device, is_enc_dec,
                         eval_file="data/Pretrain/slimpajama_eval_packed.jsonl",
                         max_examples=500):
     """Top-1 next-token prediction accuracy on held-out data."""
-    ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
-
     correct = 0
     total = 0
 
-    for i, example in enumerate(tqdm(ds, desc="Token Accuracy", total=max_examples)):
-        if i >= max_examples:
-            break
-        ids = example["input_ids"]
+    for ids in tqdm(_load_eval_dataset(eval_file, tokenizer, max_examples),
+                    desc="Token Accuracy", total=max_examples):
         _, predicted = get_sequence_log_probs(model, tokenizer, ids, device, is_enc_dec)
 
         targets = torch.tensor(ids[1:], device=device)
@@ -109,18 +127,14 @@ def eval_positional_accuracy(model, tokenizer, device, is_enc_dec,
     Returns accuracy for each position bucket, showing how prediction
     improves with more context.
     """
-    ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
-
     # Bin into 64 buckets across the sequence length
     num_bins = 64
     bin_size = max(seq_len // num_bins, 1)
     correct_bins = np.zeros(num_bins, dtype=np.int64)
     total_bins = np.zeros(num_bins, dtype=np.int64)
 
-    for i, example in enumerate(tqdm(ds, desc="Positional Accuracy", total=max_examples)):
-        if i >= max_examples:
-            break
-        ids = example["input_ids"]
+    for ids in tqdm(_load_eval_dataset(eval_file, tokenizer, max_examples),
+                    desc="Positional Accuracy", total=max_examples):
         _, predicted = get_sequence_log_probs(model, tokenizer, ids, device, is_enc_dec)
 
         targets = torch.tensor(ids[1:], device=device)

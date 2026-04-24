@@ -37,10 +37,15 @@ echo ""
 echo "── (3/4) Installing flash-attn (compiles CUDA kernels — may take 10-20 min) ──"
 echo "  torch.version.cuda = $(python -c 'import torch; print(torch.version.cuda)')"
 echo "  System CUDA: $(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' || echo 'nvcc not found')"
+# Force flash-attn to use the same C++ ABI as torch (official torch wheels
+# use _GLIBCXX_USE_CXX11_ABI=0, but the system compiler may default to 1).
+TORCH_ABI=$(python -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))")
+echo "  torch _GLIBCXX_USE_CXX11_ABI: $TORCH_ABI"
 # --no-deps: prevent flash-attn from pulling a different torch from PyPI
 # --no-cache-dir: prevent reuse of wheels compiled against a different torch
 # --force-reinstall: always recompile even if version matches
-pip install flash-attn --no-build-isolation --no-cache-dir --force-reinstall --no-deps
+CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=$TORCH_ABI" \
+  pip install flash-attn --no-build-isolation --no-cache-dir --force-reinstall --no-deps
 
 # ── (4/4) Full environment verification ──────────────────────────────────────
 echo ""

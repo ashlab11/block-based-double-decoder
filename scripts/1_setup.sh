@@ -37,15 +37,16 @@ echo ""
 echo "── (3/4) Installing flash-attn (compiles CUDA kernels — may take 10-20 min) ──"
 echo "  torch.version.cuda = $(python -c 'import torch; print(torch.version.cuda)')"
 echo "  System CUDA: $(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' || echo 'nvcc not found')"
-# Force flash-attn to use the same C++ ABI as torch (official torch wheels
-# use _GLIBCXX_USE_CXX11_ABI=0, but the system compiler may default to 1).
-TORCH_ABI=$(python -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))")
-echo "  torch _GLIBCXX_USE_CXX11_ABI: $TORCH_ABI"
-# --no-deps: prevent flash-attn from pulling a different torch from PyPI
-# --no-cache-dir: prevent reuse of wheels compiled against a different torch
-# --force-reinstall: always recompile even if version matches
-CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=$TORCH_ABI" \
-  pip install flash-attn --no-build-isolation --no-cache-dir --force-reinstall --no-deps
+# flash-attn is optional — only used in inference mode (ComboAttention
+# without block masks).  Training always uses flex_attention instead.
+# The source build often hits ABI mismatches on RunPod images, so treat
+# installation as best-effort.
+python -c "from flash_attn import flash_attn_func; print('  ✓ flash-attn already works')" 2>/dev/null || {
+    echo "  Pre-installed flash-attn broken or missing — attempting rebuild..."
+    pip install flash-attn --no-build-isolation --no-cache-dir --force-reinstall --no-deps 2>&1 | tail -5
+    python -c "from flash_attn import flash_attn_func; print('  ✓ flash-attn rebuilt successfully')" 2>/dev/null || \
+        echo "  ⚠ flash-attn unavailable (will use flex_attention fallback during training)"
+}
 
 # ── (4/4) Full environment verification ──────────────────────────────────────
 echo ""
@@ -54,10 +55,14 @@ echo "── (4/4) Verifying environment ──"
 echo ""
 echo "  Packages:"
 python -c "
-import torch, flash_attn, wandb, transformers, datasets
+import torch, wandb, transformers, datasets
 print(f'    PyTorch:      {torch.__version__}')
 print(f'    CUDA build:   {torch.version.cuda}')
-print(f'    flash-attn:   {flash_attn.__version__}')
+try:
+    import flash_attn
+    print(f'    flash-attn:   {flash_attn.__version__}')
+except ImportError:
+    print(f'    flash-attn:   UNAVAILABLE (training will use flex_attention)')
 print(f'    transformers: {transformers.__version__}')
 print(f'    datasets:     {datasets.__version__}')
 print(f'    wandb:        {wandb.__version__}')

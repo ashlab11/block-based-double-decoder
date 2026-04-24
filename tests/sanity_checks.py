@@ -352,13 +352,17 @@ def check_block_masks():
 
 def check_combo_attn_stability():
     print("\n── Check 9: ComboAttention Stability (dim=512, bf16) ──")
-    from components.attention import ComboAttention
+    from components.attention import ComboAttention, HAS_FLASH_ATTN
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     attn = ComboAttention(dim=512, num_heads=8, seq_len=2048, shared=True).to(device)
 
     x = torch.randn(2, 128, 512, device=device)  # short seq for speed
     enc = torch.randn(2, 128, 512, device=device)
+
+    if not HAS_FLASH_ATTN:
+        print("  ⚠ flash-attn unavailable — skipping inference-mode test (training unaffected)")
+        return True
 
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device == "cuda"):
         # No block masks → uses flash_attn path

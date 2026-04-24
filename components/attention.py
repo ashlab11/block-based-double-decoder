@@ -7,7 +7,11 @@ import torch
 import torch.nn as nn
 from torchtune.modules import RotaryPositionalEmbeddings
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
 
 class SelfAttention(nn.Module):
     def __init__(self, dim, num_heads, seq_len = 1024, gating = False):
@@ -119,14 +123,19 @@ class ComboAttention(nn.Module):
         enc_value = enc_value.transpose(1, 2)
         
         # --- ATTENTION ---
-        use_flash = block_masks is None  #Only happens if we're in inference mode AND on a gpu that can handle flash attn
+        use_flash = block_masks is None and HAS_FLASH_ATTN  #Only happens if we're in inference mode AND on a gpu that can handle flash attn
         if use_flash:
             #Flash attention expects [B, L, N_h, D_h]
             query, enc_key, dec_key, enc_value, dec_value = query.transpose(1, 2), enc_key.transpose(1, 2), dec_key.transpose(1, 2), enc_value.transpose(1, 2), dec_value.transpose(1, 2)
-            
+
             dec_output, dec_lse, _ = flash_attn_func(query, dec_key, dec_value, causal=True, return_attn_probs = True)
             enc_output, enc_lse, _ = flash_attn_func(query, enc_key, enc_value, causal=False, return_attn_probs = True)
-       
+
+        elif block_masks is None:
+            raise RuntimeError(
+                "Inference without block_masks requires flash-attn, which failed to import. "
+                "Install a compatible flash-attn or provide block_masks for flex_attention."
+            )
         else:
             self_mask = block_masks.get('self_mask')
             cross_mask = block_masks.get('cross_mask')

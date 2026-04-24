@@ -60,8 +60,7 @@ def _fmt_piqa(ex):
 
 def eval_piqa(model, tokenizer, device, is_enc_dec, max_examples=None):
     return _eval_mc("PIQA", model, tokenizer, device, is_enc_dec,
-                    {"path": "ybisk/piqa", "split": "validation",
-                     "trust_remote_code": True},
+                    {"path": "piqa", "split": "validation"},
                     _fmt_piqa, max_examples)
 
 

@@ -111,6 +111,8 @@ def main():
                         help="Cap examples per eval (useful for fast debugging)")
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for GPU scoring (default 64, auto-halves on OOM)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (use if compile causes issues)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", default=None, help="Save results JSON to this path")
     parser.add_argument("--eval-file", default="data/Pretrain/slimpajama_eval_packed.jsonl",
@@ -146,6 +148,12 @@ def main():
     param_count = sum(p.numel() for p in model.parameters())
     print(f"  Model type: {model_type}")
     print(f"  Parameters: {param_count / 1e6:.1f}M")
+
+    # torch.compile for faster forward passes
+    if device.type == "cuda" and not args.no_compile:
+        print(f"  Compiling model with torch.compile...")
+        model = torch.compile(model, fullgraph=False, dynamic=False)
+        print(f"  Compiled (first forward will be slower due to tracing)")
     print()
 
     # Run evals

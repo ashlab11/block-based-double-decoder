@@ -7,7 +7,7 @@ information from context — directly relevant to the combo attention mechanism.
 import random
 import torch
 from tqdm import tqdm
-from evals.utils import generate_text, get_log_probs
+from evals.utils import generate_text
 
 
 # ═══════════════════════════════════════════════════════════════════════════

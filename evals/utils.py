@@ -330,17 +330,33 @@ def get_sequence_log_probs_batch(model, tokenizer, id_lists, device, is_enc_dec,
     """Batched per-token log probs for multiple sequences.
 
     Returns: list of (log_probs tensor [seq_len-1], predicted_ids tensor [seq_len-1])
+    where seq_len is the ORIGINAL length (without any prepended BOS).
     """
     if not id_lists:
         return []
 
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
     pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+
+    # Prepend BOS to sequences that don't already start with one.
+    # Training data always starts with BOS; raw text (Wikitext, LAMBADA) doesn't.
+    prepended = []
+    for ids in id_lists:
+        if ids and ids[0] != bos_id:
+            prepended.append(True)
+        else:
+            prepended.append(False)
+    id_lists_fixed = [
+        [bos_id] + ids if added else ids
+        for ids, added in zip(id_lists, prepended)
+    ]
 
     fn = lambda batch: _seq_lp_batch_inner(model, batch, device, pad_id, is_enc_dec)
 
     # Sort by length for efficient padding
-    indexed = sorted(enumerate(id_lists), key=lambda x: len(x[1]))
+    indexed = sorted(enumerate(id_lists_fixed), key=lambda x: len(x[1]))
     sorted_lists = [ids for _, ids in indexed]
+    sorted_prepended = [prepended[i] for i, _ in indexed]
     orig_indices = [i for i, _ in indexed]
 
     pbar = tqdm(total=len(sorted_lists), desc=desc, leave=False) if desc else None
@@ -365,10 +381,24 @@ def get_sequence_log_probs_batch(model, tokenizer, id_lists, device, is_enc_dec,
     if pbar:
         pbar.close()
 
-    # Restore original order
+    # Restore original order and strip the extra BOS position from results
+    # where we prepended one. _seq_lp_batch_inner returns (log_probs[seq-1],
+    # predicted[seq-1]). If we prepended BOS, the first entry in each tensor
+    # corresponds to predicting the original first token — keep that, but the
+    # caller's indices assume the original sequence length, so we trim the
+    # extra position added by BOS (position 0 predicts BOS→first_token,
+    # which is the token the caller considers position 0).
     results = [None] * len(id_lists)
     for sorted_idx, orig_idx in enumerate(orig_indices):
-        results[orig_idx] = sorted_results[sorted_idx]
+        log_probs, predicted = sorted_results[sorted_idx]
+        if sorted_prepended[sorted_idx]:
+            # BOS was prepended: position 0 in results predicts the original
+            # first token (BOS→tok[0]). The caller expects results indexed to
+            # the original sequence where tok[0]→tok[1] is position 0.
+            # So skip the first entry (BOS→tok[0] prediction).
+            log_probs = log_probs[1:]
+            predicted = predicted[1:]
+        results[orig_idx] = (log_probs, predicted)
     return results
 
 
@@ -408,6 +438,12 @@ def _seq_lp_batch_inner(model, id_lists, device, pad_id, is_enc_dec):
 @torch.no_grad()
 def get_sequence_log_probs(model, tokenizer, input_ids_list, device, is_enc_dec):
     """Per-token log probs for a single packed sequence."""
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+    added_bos = False
+    if input_ids_list and input_ids_list[0] != bos_id:
+        input_ids_list = [bos_id] + input_ids_list
+        added_bos = True
+
     input_t = torch.tensor([input_ids_list], device=device)
 
     if is_enc_dec:
@@ -425,6 +461,11 @@ def get_sequence_log_probs(model, tokenizer, input_ids_list, device, is_enc_dec)
     targets = torch.tensor(input_ids_list[1:], device=device)
     token_lps = log_probs[:-1].gather(1, targets.unsqueeze(1)).squeeze(1)
     predicted = logits[:-1].argmax(dim=-1)
+
+    if added_bos:
+        # Strip the BOS→first_token prediction so indices match the original sequence
+        token_lps = token_lps[1:]
+        predicted = predicted[1:]
 
     return token_lps, predicted
 

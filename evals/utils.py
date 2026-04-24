@@ -10,8 +10,32 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from transformers import PreTrainedTokenizerFast
 from tqdm import tqdm
+
+
+def _sample_pretrain_blocks(max_len, device, seed=42):
+    """Sample block boundaries matching the pretrain collator distribution.
+
+    Training (BasicPretrainCollator) uses:
+        block_num = rng.integers(2, 8)          # 2-7 boundaries → 3-8 blocks
+        blocks = sorted sample from [2, seq_len-2]
+
+    Using a fixed seed ensures eval is deterministic across runs.
+    """
+    rng = np.random.default_rng(seed)
+    block_num = int(rng.integers(2, 8))  # 2-7 boundaries, matching training
+    # Ensure enough positions exist for the requested boundaries
+    available = max(max_len - 3, 0)  # usable positions in [2, max_len-2]
+    block_num = min(block_num, available)
+    if block_num < 1:
+        # Sequence too short for proper blocks — fall back to midpoint
+        return torch.tensor([max(1, max_len // 2)], dtype=torch.int64, device=device)
+    boundaries = np.sort(
+        rng.choice(np.arange(2, max_len - 1), size=block_num, replace=False)
+    )
+    return torch.tensor(boundaries, dtype=torch.int64, device=device)
 
 
 def load_model(checkpoint_path, tokenizer_path=None, device="cuda"):
@@ -267,7 +291,9 @@ def _seq_lp_batch_inner(model, id_lists, device, pad_id, is_enc_dec):
     input_t = torch.tensor(padded, device=device)
 
     if is_enc_dec:
-        blocks = torch.tensor([max_len // 2], device=device)
+        # Sample block boundaries matching training distribution (3-8 blocks).
+        # Use max_len as seed so the same batch shape gives reproducible results.
+        blocks = _sample_pretrain_blocks(max_len, device, seed=max_len)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
     else:
@@ -298,7 +324,7 @@ def get_sequence_log_probs(model, tokenizer, input_ids_list, device, is_enc_dec)
 
     if is_enc_dec:
         seq_len = len(input_ids_list)
-        blocks = torch.tensor([seq_len // 2], device=device)
+        blocks = _sample_pretrain_blocks(seq_len, device, seed=seq_len)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
     else:

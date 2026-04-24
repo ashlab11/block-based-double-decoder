@@ -13,6 +13,7 @@ import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 from evals.intrinsic import _load_eval_dataset
+from evals.utils import _sample_pretrain_blocks
 
 
 def _has_combo_attention(model):
@@ -137,7 +138,7 @@ def eval_attention_weights(model, tokenizer, device, is_enc_dec,
                         desc="Attention Analysis", total=max_examples):
             input_t = torch.tensor([ids], device=device)
             seq_len = len(ids)
-            blocks = torch.tensor([seq_len // 2], device=device)
+            blocks = _sample_pretrain_blocks(seq_len, device, seed=seq_len)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 model(input_ids=input_t, blocks=blocks, sft=False)
@@ -152,24 +153,32 @@ def eval_attention_weights(model, tokenizer, device, is_enc_dec,
     for key, weight_list in blending_weights.items():
         if not weight_list:
             continue
-        # Stack: [num_examples, B, num_heads, seq_len]
-        # Since B=1 during eval, squeeze
-        weights = np.concatenate(weight_list, axis=0)  # [N, num_heads, seq_len]
+        # Pad variable-length weight arrays to the same seq_len before stacking.
+        # Each element is [1, num_heads, seq_len_i] — seq_len varies with input length.
+        max_seq = max(w.shape[-1] for w in weight_list)
+        padded = []
+        for w in weight_list:
+            pad_width = max_seq - w.shape[-1]
+            if pad_width > 0:
+                w = np.pad(w, ((0, 0), (0, 0), (0, pad_width)),
+                           mode='constant', constant_values=np.nan)
+            padded.append(w)
+        weights = np.concatenate(padded, axis=0)  # [N, num_heads, max_seq]
 
         # Per-head mean blending weight (how much does each head prefer self vs cross?)
-        per_head_mean = weights.mean(axis=(0, 2)).tolist()  # [num_heads]
+        per_head_mean = np.nanmean(weights, axis=(0, 2)).tolist()  # [num_heads]
 
         # Per-position mean (averaged over examples and heads)
-        per_position_mean = weights.mean(axis=(0, 1)).tolist()  # [seq_len]
+        per_position_mean = np.nanmean(weights, axis=(0, 1)).tolist()  # [max_seq]
 
         # Overall statistics
         analysis[key] = {
             "per_head_mean_dec_weight": per_head_mean,
             "per_position_mean_dec_weight": per_position_mean,
-            "overall_mean": float(weights.mean()),
-            "overall_std": float(weights.std()),
-            "min": float(weights.min()),
-            "max": float(weights.max()),
+            "overall_mean": float(np.nanmean(weights)),
+            "overall_std": float(np.nanstd(weights)),
+            "min": float(np.nanmin(weights)),
+            "max": float(np.nanmax(weights)),
         }
 
     # Save to disk

@@ -44,6 +44,8 @@ _register("ppl",                  "evals.intrinsic",           "eval_held_out_pe
 _register("bpb",                  "evals.intrinsic",           "eval_bpb",                 "intrinsic")
 _register("token_accuracy",      "evals.intrinsic",           "eval_token_accuracy",      "intrinsic")
 _register("positional_accuracy", "evals.intrinsic",           "eval_positional_accuracy", "intrinsic")
+_register("wikitext_ppl",        "evals.intrinsic",           "eval_wikitext_ppl",        "intrinsic")
+_register("wikitext_bpb",        "evals.intrinsic",           "eval_wikitext_bpb",        "intrinsic")
 
 # MC / Ranking benchmarks
 _register("hellaswag",           "evals.benchmarks",          "eval_hellaswag",           "benchmark")
@@ -80,7 +82,8 @@ GROUPS = {
     "generation": [k for k, v in EVAL_REGISTRY.items() if v["category"] == "generation"],
     "probes":     [k for k, v in EVAL_REGISTRY.items() if v["category"] == "probe"],
     "quick":      ["ppl", "hellaswag", "piqa", "lambada", "token_accuracy"],
-    "paper":      ["ppl", "bpb", "hellaswag", "piqa", "arc_easy", "arc_challenge",
+    "paper":      ["ppl", "bpb", "wikitext_ppl", "wikitext_bpb",
+                   "hellaswag", "piqa", "arc_easy", "arc_challenge",
                    "winogrande", "lambada", "boolq", "token_accuracy",
                    "positional_accuracy", "attention_analysis"],
 }

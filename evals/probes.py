@@ -7,7 +7,7 @@ information from context — directly relevant to the combo attention mechanism.
 import random
 import torch
 from tqdm import tqdm
-from evals.utils import generate_text
+from evals.utils import generate_text, _sample_pretrain_blocks
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -183,7 +183,7 @@ def eval_copy_retrieval(model, tokenizer, device, is_enc_dec,
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                                       enabled=device.type == "cuda"):
                 if is_enc_dec:
-                    blocks = torch.tensor([max_len // 2], device=device)
+                    blocks = _sample_pretrain_blocks(max_len, device, seed=max_len)
                     logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
                 else:
                     logits = model(input_ids=input_t)["logits"]

@@ -13,32 +13,63 @@ from datasets import load_dataset
 from evals.utils import get_sequence_log_probs_batch
 
 
+_SLIMPAJAMA_CANDIDATES = [
+    "data/Pretrain/slimpajama_eval_packed.jsonl",
+    "data/Pretrain/slimpajama_6b_eval_packed.jsonl",
+    "data/Pretrain/slimpajama_20b_eval_packed.jsonl",
+]
+
+
+def _find_slimpajama_eval_file(eval_file):
+    """Try the given path first, then common SlimPajama eval file variants."""
+    if os.path.exists(eval_file):
+        return eval_file
+    for candidate in _SLIMPAJAMA_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _load_packed_eval(eval_file, max_examples):
+    """Load pre-tokenized packed eval data from a JSONL file."""
+    id_lists = []
+    ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
+    for i, example in enumerate(ds):
+        if i >= max_examples:
+            break
+        id_lists.append(example["input_ids"])
+    return id_lists
+
+
+def _load_wikitext(tokenizer, max_examples):
+    """Load and tokenize Wikitext-103 raw text (for cross-model comparison)."""
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
+    id_lists = []
+    for example in ds:
+        if len(id_lists) >= max_examples:
+            break
+        text = example["text"]
+        if len(text.strip()) < 50:
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < 10:
+            continue
+        id_lists.append(ids)
+    return id_lists
+
+
 def _load_eval_dataset(eval_file, tokenizer, max_examples, fallback_name="Wikitext-103"):
     """Load packed eval data from local file, or fall back to Wikitext-103.
     Returns a list (not generator) so it can be batched.
     """
-    id_lists = []
-    if os.path.exists(eval_file):
-        ds = load_dataset("json", data_files=eval_file, split="train", streaming=True)
-        for i, example in enumerate(ds):
-            if i >= max_examples:
-                break
-            id_lists.append(example["input_ids"])
+    found = _find_slimpajama_eval_file(eval_file)
+    if found:
+        if found != eval_file:
+            print(f"  [INFO] {eval_file} not found — using {found}")
+        return _load_packed_eval(found, max_examples)
     else:
-        print(f"  [INFO] {eval_file} not found — falling back to {fallback_name}")
-        ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
-        for example in ds:
-            if len(id_lists) >= max_examples:
-                break
-            text = example["text"]
-            if len(text.strip()) < 50:
-                continue
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            if len(ids) < 10:
-                continue
-            id_lists.append(ids)
-
-    return id_lists
+        print(f"  [INFO] No SlimPajama eval file found — falling back to {fallback_name}")
+        return _load_wikitext(tokenizer, max_examples)
 
 
 # ── Held-Out Perplexity ───────────────────────────────────────────────────
@@ -167,3 +198,63 @@ def eval_positional_accuracy(model, tokenizer, device, is_enc_dec,
         "overall_accuracy": overall_acc,
         "bins": bins,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Wikitext-103 variants (always use Wikitext, for cross-model comparison)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def eval_wikitext_ppl(model, tokenizer, device, is_enc_dec,
+                      max_examples=500, batch_size=64):
+    """Perplexity on Wikitext-103 raw (always, regardless of SlimPajama availability)."""
+    all_ids = _load_wikitext(tokenizer, max_examples)
+
+    results = get_sequence_log_probs_batch(
+        model, tokenizer, all_ids, device, is_enc_dec,
+        batch_size=batch_size, desc="Wikitext-103 PPL"
+    )
+    total_nll = 0.0
+    total_tokens = 0
+    for log_probs, _ in results:
+        total_nll += -log_probs.sum().item()
+        total_tokens += log_probs.shape[0]
+
+    avg_loss = total_nll / max(total_tokens, 1)
+    ppl = math.exp(avg_loss)
+    return {"name": "Wikitext-103 PPL", "perplexity": ppl, "avg_loss": avg_loss,
+            "total_tokens": total_tokens}
+
+
+def eval_wikitext_bpb(model, tokenizer, device, is_enc_dec,
+                      max_examples=200, batch_size=64):
+    """Bits-per-byte on Wikitext-103 raw (always, for cross-model comparison)."""
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
+
+    texts = []
+    id_lists = []
+    for example in ds:
+        if len(id_lists) >= max_examples:
+            break
+        text = example["text"]
+        if len(text.strip()) < 20:
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < 4:
+            continue
+        texts.append(text)
+        id_lists.append(ids)
+
+    results = get_sequence_log_probs_batch(
+        model, tokenizer, id_lists, device, is_enc_dec,
+        batch_size=batch_size, desc="Wikitext-103 BPB"
+    )
+
+    total_nll = 0.0
+    total_bytes = 0
+    for i, (log_probs, _) in enumerate(results):
+        total_nll += -log_probs.sum().item()
+        total_bytes += len(texts[i].encode("utf-8"))
+
+    bpb = total_nll / (math.log(2) * max(total_bytes, 1))
+    return {"name": "Wikitext-103 BPB", "bpb": bpb, "total_bytes": total_bytes,
+            "num_passages": len(id_lists)}

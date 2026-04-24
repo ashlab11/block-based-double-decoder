@@ -408,7 +408,10 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     save_steps = cfg.save_steps // cfg.grad_accum_steps
 
     max_steps = cfg.max_steps if cfg.max_steps > 0 else float('inf')
-    effective_max = min(max_steps, num_accumulations)
+    # display_max is the actual number of steps we'll train for:
+    # - If max_steps is set: use max_steps (early stopping / micro runs)
+    # - Otherwise: use num_accumulations (token budget determines stop)
+    display_max = max_steps if max_steps != float('inf') else num_accumulations
     tokens_per_step = cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size
     step_start_time = time.time()
     training_start_time = time.time()
@@ -422,11 +425,9 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     skip_batches = start_step * steps_per_accum_per_gpu
 
     if rank == 0:
-        print(f"Training for {effective_max:,} accumulation steps ({tokens_per_step:,} tokens/step)")
-        total_tok = effective_max * tokens_per_step
+        print(f"Training for {display_max:,} steps ({tokens_per_step:,} tokens/step)")
+        total_tok = display_max * tokens_per_step
         print(f"Total tokens to process: {total_tok:,} ({total_tok / 1e9:.2f}B)")
-        if cfg.max_steps > 0:
-            print(f"Early stopping after {cfg.max_steps} steps")
 
     # Accumulate micro-batch losses within an accumulation step
     accum_loss_sum = 0.0
@@ -494,7 +495,7 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                     # Progress
                     "progress/tokens_seen": tokens_seen,
                     "progress/tokens_seen_B": tokens_seen / 1e9,
-                    "progress/pct_complete": 100 * step / effective_max,
+                    "progress/pct_complete": 100 * step / display_max,
                     "progress/step": step,
                 }, step=step)
 
@@ -543,8 +544,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                 elapsed_total = time.time() - training_start_time
                 steps_done = step - start_step
                 avg_toks_per_sec = tokens_per_step * steps_done / max(elapsed_total, 1e-6)
-                pct = 100 * step / effective_max
-                steps_remaining = effective_max - step
+                pct = 100 * step / display_max
+                steps_remaining = display_max - step
                 eta_sec = steps_remaining * (elapsed_total / max(steps_done, 1))
 
                 def _fmt(s):
@@ -552,7 +553,7 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                     elif s < 3600: return f"{s/60:.1f}m"
                     else: return f"{s/3600:.1f}h"
 
-                print(f"  [{pct:5.1f}%] Step {step:>6,}/{effective_max:,} | "
+                print(f"  [{pct:5.1f}%] Step {step:>6,}/{display_max:,} | "
                       f"loss {avg_step_loss:.4f} (ema {loss_ema:.4f}) | grad {grad.item():.4f} | "
                       f"lr {current_lr:.2e} | {avg_toks_per_sec:,.0f} tok/s | "
                       f"elapsed {_fmt(elapsed_total)} | ETA {_fmt(eta_sec)}")
@@ -588,10 +589,10 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
 
-            # Early stopping for micro runs
-            if step >= max_steps:
+            # Stop when we've hit the target step count
+            if step >= display_max:
                 if rank == 0:
-                    print(f"Reached max_steps={cfg.max_steps}, stopping.")
+                    print(f"Reached {display_max:,} steps, stopping.")
                 break
 
     # ── End of training ──────────────────────────────────────────────────

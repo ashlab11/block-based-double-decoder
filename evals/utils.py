@@ -232,6 +232,94 @@ def _log_probs_batch_enc_dec(model, pairs, device, bos_id, pad_id, model_seq_len
     return scores
 
 
+def get_enc_dec_predictions_batch(model, tokenizer, pairs, device, batch_size=64, desc=None):
+    """Score (context_ids, continuation_ids) pairs via the SFT enc-dec path.
+
+    Returns: list of (log_probs [n], predicted_ids [n]) per pair,
+    where n = len(continuation_ids).
+    """
+    if not pairs:
+        return []
+
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+    model_seq_len = getattr(model, "seq_len", 2048)
+
+    # Sort by total length for efficient padding
+    indexed = sorted(enumerate(pairs), key=lambda x: len(x[1][0]) + len(x[1][1]))
+    sorted_pairs = [p for _, p in indexed]
+    orig_indices = [i for i, _ in indexed]
+
+    pbar = tqdm(total=len(sorted_pairs), desc=desc, leave=False) if desc else None
+
+    sorted_results = []
+    i = 0
+    bs = batch_size
+    while i < len(sorted_pairs):
+        batch = sorted_pairs[i:i + bs]
+        try:
+            enc_seqs = [[bos_id] + ctx for ctx, _ in batch]
+            dec_seqs = [[bos_id] + cont for _, cont in batch]
+            enc_lens = [len(s) for s in enc_seqs]
+            cont_lens = [len(cont) for _, cont in batch]
+
+            max_enc = max(enc_lens)
+            max_dec = max(len(s) for s in dec_seqs)
+
+            padded_enc = [s + [pad_id] * (max_enc - len(s)) for s in enc_seqs]
+            padded_dec = [s + [pad_id] * (max_dec - len(s)) for s in dec_seqs]
+
+            enc_t = torch.tensor(padded_enc, device=device)
+            dec_t = torch.tensor(padded_dec, device=device)
+            blocks = torch.tensor(enc_lens, device=device)
+
+            dec_pos = []
+            for el in enc_lens:
+                positions = [min(el + j, model_seq_len - 1) for j in range(max_dec)]
+                dec_pos.append(positions)
+            dec_pos_t = torch.tensor(dec_pos, device=device)
+
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                                       enabled=device.type == "cuda"):
+                logits = model(
+                    encoder_input_ids=enc_t,
+                    decoder_input_ids=dec_t,
+                    decoder_input_positions=dec_pos_t,
+                    blocks=blocks,
+                    sft=True,
+                )["logits"]
+
+            logits = logits.float()
+            log_probs_all = F.log_softmax(logits, dim=-1)
+
+            for j in range(len(batch)):
+                n = cont_lens[j]
+                cont_t = torch.tensor(batch[j][1], device=device)
+                # logits[j, 0] predicts first continuation token (after decoder BOS)
+                token_lps = log_probs_all[j, :n].gather(1, cont_t.unsqueeze(1)).squeeze(1)
+                predicted = logits[j, :n].argmax(dim=-1)
+                sorted_results.append((token_lps, predicted))
+
+            i += bs
+            if pbar:
+                pbar.update(len(batch))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if bs <= 1:
+                raise
+            bs = max(1, bs // 2)
+            print(f"  [OOM] Reducing batch size to {bs}")
+
+    if pbar:
+        pbar.close()
+
+    # Restore original order
+    results = [None] * len(pairs)
+    for sorted_idx, orig_idx in enumerate(orig_indices):
+        results[orig_idx] = sorted_results[sorted_idx]
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  BATCHED SEQUENCE LOG-PROBS (for intrinsic evals + LAMBADA)
 # ═══════════════════════════════════════════════════════════════════════════

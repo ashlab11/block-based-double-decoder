@@ -57,6 +57,7 @@ _register("boolq",               "evals.benchmarks",          "eval_boolq",     
 _register("mmlu",                "evals.benchmarks",          "eval_mmlu",                "benchmark")
 _register("truthfulqa",          "evals.benchmarks",          "eval_truthfulqa",          "benchmark")
 _register("lambada",             "evals.benchmarks",          "eval_lambada",             "benchmark")
+_register("lambada_enc_dec",     "evals.benchmarks",          "eval_lambada_enc_dec",     "benchmark")
 _register("glue",                "evals.benchmarks",          "eval_glue",                "benchmark")
 _register("superglue",           "evals.benchmarks",          "eval_superglue",           "benchmark")
 
@@ -84,7 +85,7 @@ GROUPS = {
     "quick":      ["ppl", "hellaswag", "piqa", "lambada", "token_accuracy"],
     "paper":      ["ppl", "bpb", "wikitext_ppl", "wikitext_bpb",
                    "hellaswag", "piqa", "arc_easy", "arc_challenge",
-                   "winogrande", "lambada", "boolq", "token_accuracy",
+                   "winogrande", "lambada", "lambada_enc_dec", "boolq", "token_accuracy",
                    "positional_accuracy", "attention_analysis"],
 }
 

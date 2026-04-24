@@ -8,7 +8,7 @@ All MC benchmarks use batched GPU scoring for maximum throughput.
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from evals.utils import get_log_probs_batch, get_sequence_log_probs_batch
+from evals.utils import get_log_probs_batch, get_sequence_log_probs_batch, get_enc_dec_predictions_batch
 
 
 # ── Generic batched MC evaluator ─────────────────────────────────────────
@@ -221,6 +221,53 @@ def eval_lambada(model, tokenizer, device, is_enc_dec, max_examples=None, batch_
 
     total = len(examples)
     return {"name": "LAMBADA", "accuracy": correct / max(total, 1),
+            "correct": correct, "total": total}
+
+
+def eval_lambada_enc_dec(model, tokenizer, device, is_enc_dec, max_examples=None, batch_size=64):
+    """LAMBADA via enc-dec SFT path: context→encoder, last word→decoder.
+
+    This evaluates the model the way it's designed to be used — the full
+    context passage goes to the encoder, and the target word is scored
+    from the decoder with cross-attention to the encoder output.
+
+    Falls back to the pretrain path for decoder-only models.
+    """
+    if not is_enc_dec:
+        return eval_lambada(model, tokenizer, device, is_enc_dec, max_examples, batch_size)
+
+    ds = load_dataset("EleutherAI/lambada_openai", split="test")
+    if max_examples:
+        ds = ds.select(range(min(max_examples, len(ds))))
+
+    # Collect (context_ids, target_ids) pairs
+    pairs = []
+    for ex in ds:
+        text = ex["text"]
+        idx = text.rfind(" ")
+        if idx < 0:
+            continue
+        context_ids = tokenizer.encode(text[:idx], add_special_tokens=False)
+        target_ids = tokenizer.encode(text[idx:], add_special_tokens=False)
+        if target_ids:
+            pairs.append((context_ids, target_ids))
+
+    # Score via SFT enc-dec path (context→encoder, target→decoder)
+    all_results = get_enc_dec_predictions_batch(
+        model, tokenizer, pairs, device,
+        batch_size=batch_size, desc="LAMBADA (enc-dec)"
+    )
+
+    correct = 0
+    for i, (ctx_ids, tgt_ids) in enumerate(pairs):
+        _, predicted = all_results[i]
+        tgt_t = torch.tensor(tgt_ids, device=predicted.device)
+        n = min(len(tgt_ids), len(predicted))
+        if n == len(tgt_ids) and (predicted[:n] == tgt_t[:n]).all():
+            correct += 1
+
+    total = len(pairs)
+    return {"name": "LAMBADA (enc-dec)", "accuracy": correct / max(total, 1),
             "correct": correct, "total": total}
 
 

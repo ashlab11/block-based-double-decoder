@@ -60,7 +60,7 @@ def _fmt_piqa(ex):
 
 def eval_piqa(model, tokenizer, device, is_enc_dec, max_examples=None):
     return _eval_mc("PIQA", model, tokenizer, device, is_enc_dec,
-                    {"path": "piqa", "split": "validation"},
+                    {"path": "MillerLab/piqa", "split": "validation"},
                     _fmt_piqa, max_examples)
 
 

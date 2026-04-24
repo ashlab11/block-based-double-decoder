@@ -88,6 +88,9 @@ def build_config_from_dict(cfg_dict) -> TrainingConfig:
     elif model_cls_name == "DecoderOnlyModel":
         from models.decoder import DecoderOnlyModel
         model_cls = DecoderOnlyModel
+    elif model_cls_name == "StandardEncDec":
+        from models.standard_enc_dec import StandardEncDec
+        model_cls = StandardEncDec
     else:
         raise ValueError(f"Unknown model_cls: {model_cls_name}")
 

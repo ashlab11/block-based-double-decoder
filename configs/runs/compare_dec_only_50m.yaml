@@ -1,0 +1,33 @@
+# Decoder-Only baseline — 12 CausalLayers, ~54.1M params
+# Matched to DD 50M for fair comparison (same dim, total depth, token budget)
+
+model_cls: "DecoderOnlyModel"
+dim: 512
+num_encoder_layers: 8   # summed with num_decoder_layers → num_layers=12
+num_decoder_layers: 4
+seq_len: 2048
+init_strategy: "xavier_uniform"
+gradient_checkpointing: false
+
+collator_cls: "DecoderPretrainCollator"
+train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
+eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+auto_batch_size: true
+target_effective_batch: 256
+batch_size: 64
+grad_accum_steps: 4
+lr: 6e-4
+end_lr_ratio: 0.1
+total_tokens: 1000000000
+
+logging_steps: 10
+eval_steps: 500
+save_steps: 500
+output_dir: "checkpoints"
+output_file_name: "compare_dec_only_50m"
+
+wandb_project: "block-based-double-decoder"
+wandb_run_name: "compare_dec_only_50m"
+wandb_entity: "block-based-double-decoders"

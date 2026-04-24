@@ -1,0 +1,35 @@
+# Standard Enc-Dec — 8 encoder + 3 decoder (separate self+cross attn), ~54.2M params
+# Baseline enc-dec without combo attention (standard transformer decoder)
+# 3 decoder layers (vs DD's 4) to match param count, since each standard
+# decoder layer has separate self-attn + cross-attn projections (more params per layer)
+
+model_cls: "StandardEncDec"
+dim: 512
+num_encoder_layers: 8
+num_decoder_layers: 3
+seq_len: 2048
+init_strategy: "xavier_uniform"
+gradient_checkpointing: false
+
+collator_cls: "BasicPretrainCollator"
+train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
+eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+auto_batch_size: true
+target_effective_batch: 256
+batch_size: 64
+grad_accum_steps: 4
+lr: 6e-4
+end_lr_ratio: 0.1
+total_tokens: 1000000000
+
+logging_steps: 10
+eval_steps: 500
+save_steps: 500
+output_dir: "checkpoints"
+output_file_name: "compare_enc_dec_50m"
+
+wandb_project: "block-based-double-decoder"
+wandb_run_name: "compare_enc_dec_50m"
+wandb_entity: "block-based-double-decoders"

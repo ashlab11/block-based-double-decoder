@@ -13,6 +13,50 @@ try:
 except ImportError:
     HAS_FLASH_ATTN = False
 
+class CrossAttention(nn.Module):
+    """Standard cross-attention: Q from decoder, K/V from encoder output."""
+    def __init__(self, dim, num_heads, seq_len=1024):
+        super(CrossAttention, self).__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+        self.query_rotary = RotaryPositionalEmbeddings(dim=self.head_dim, max_seq_len=seq_len)
+        self.key_rotary = RotaryPositionalEmbeddings(dim=self.head_dim, max_seq_len=seq_len)
+
+    def forward(self, x, encoder_output, block_masks=None, decoder_input_positions=None):
+        B, L, D = x.size()
+        _, L_enc, _ = encoder_output.size()
+
+        query = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        kv = self.kv_proj(encoder_output)
+        key, value = torch.split(kv, [self.dim, self.dim], dim=-1)
+        key = key.reshape(B, L_enc, self.num_heads, self.head_dim)
+        value = value.reshape(B, L_enc, self.num_heads, self.head_dim)
+
+        query = self.query_rotary(query, input_pos=decoder_input_positions)
+        key = self.key_rotary(key)
+
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        cross_mask = None if block_masks is None else block_masks.get('cross_mask')
+        if cross_mask is not None:
+            output = flex_attention(query, key, value, block_mask=cross_mask)
+        else:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, is_causal=False)
+
+        output = output.transpose(1, 2).reshape(B, L, D)
+        return self.out_proj(output)
+
+
 class SelfAttention(nn.Module):
     def __init__(self, dim, num_heads, seq_len = 1024, gating = False):
         super(SelfAttention, self).__init__()
@@ -30,18 +74,18 @@ class SelfAttention(nn.Module):
         
         self.rotary_emb = RotaryPositionalEmbeddings(dim=self.head_dim, max_seq_len=seq_len)
 
-    def forward(self, x, block_masks=None, **kwargs):
+    def forward(self, x, block_masks=None, input_pos=None, **kwargs):
         B, L, D = x.size()  # [batch_size, seq_length, embed_dim]
-        
+
         qkv = self.qkv(x) # [B, L, 3 * dim]
         query, key, value = torch.split(qkv, [self.dim, self.dim, self.dim], dim=-1)
         query = query.reshape(B, L, self.num_heads, self.head_dim)
         key = key.reshape(B, L, self.num_heads, self.head_dim)
         value = value.reshape(B, L, self.num_heads, self.head_dim)
-        
-        # Apply RoPE, transposing comes after
-        query = self.rotary_emb(query)
-        key = self.rotary_emb(key)
+
+        # Apply RoPE (input_pos used by decoder layers to continue from encoder positions)
+        query = self.rotary_emb(query, input_pos=input_pos)
+        key = self.rotary_emb(key, input_pos=input_pos)
                     
         query = query.transpose(1, 2) # [B, num_heads, L, head_dim]
         key = key.transpose(1, 2) # [B, num_heads, L, head_dim]

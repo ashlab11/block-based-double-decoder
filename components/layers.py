@@ -5,7 +5,7 @@ Layers for causal and combo-attn
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
-from .attention import SelfAttention, ComboAttention
+from .attention import SelfAttention, ComboAttention, CrossAttention
 
 class CausalLayer(nn.Module):
     def __init__(self, dim, num_heads, seq_len, mlp_dim=None, scale = 1, attn_gating = False, use_checkpoint = False):
@@ -45,6 +45,54 @@ class CausalLayer(nn.Module):
         if self.use_checkpoint and self.training:
             return grad_checkpoint(self._forward, x, use_reentrant=False)
         return self._forward(x)
+
+class StandardDecoderLayer(nn.Module):
+    """Standard transformer decoder layer: self-attn → cross-attn → MLP (sequential)."""
+    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, use_checkpoint=False):
+        super(StandardDecoderLayer, self).__init__()
+        self.use_checkpoint = use_checkpoint
+        mlp_dim = mlp_dim or 4 * dim
+
+        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len)
+        self.cross_attn = CrossAttention(dim=dim, num_heads=num_heads, seq_len=seq_len)
+
+        self.norm1 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
+        self.norm3 = nn.RMSNorm(dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim, bias=False),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_dim, dim, bias=False))
+
+    def _forward(self, x, encoder_output, block_masks, decoder_input_positions=None):
+        # Self-attention (within-block causal)
+        residual = x
+        x = self.norm1(x)
+        x = self.self_attn(x, block_masks=block_masks, input_pos=decoder_input_positions)
+        x = residual + x
+
+        # Cross-attention (to encoder output)
+        residual = x
+        x = self.norm2(x)
+        x = self.cross_attn(x, encoder_output, block_masks=block_masks,
+                            decoder_input_positions=decoder_input_positions)
+        x = residual + x
+
+        # MLP
+        residual = x
+        x = self.norm3(x)
+        x = self.mlp(x)
+        x = residual + x
+
+        return x
+
+    def forward(self, x, encoder_output, block_masks, decoder_input_positions=None):
+        if self.use_checkpoint and self.training:
+            return grad_checkpoint(self._forward, x, encoder_output, block_masks,
+                                   decoder_input_positions, use_reentrant=False)
+        return self._forward(x, encoder_output, block_masks, decoder_input_positions)
+
 
 class ComboDecoderLayer(nn.Module):
     def __init__(self, dim, num_heads, seq_len, shared = True, mlp_dim=None, logit_biases = False, use_checkpoint = False):

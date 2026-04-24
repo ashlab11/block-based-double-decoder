@@ -397,3 +397,136 @@ def _gen_enc_dec(model, tokenizer, prompt, max_new_tokens, device, temperature, 
     if eos_id in gen_ids:
         gen_ids = gen_ids[:gen_ids.index(eos_id)]
     return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BATCHED GREEDY GENERATION (for generation evals)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def generate_text_batch(model, tokenizer, prompts, max_new_tokens, device, is_enc_dec,
+                        batch_size=16):
+    """Greedy-generate for a list of prompts in batches. Returns list of strings."""
+    all_results = []
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start:start + batch_size]
+        try:
+            if is_enc_dec:
+                results = _gen_batch_enc_dec(model, tokenizer, batch_prompts,
+                                            max_new_tokens, device)
+            else:
+                results = _gen_batch_decoder_only(model, tokenizer, batch_prompts,
+                                                  max_new_tokens, device)
+            all_results.extend(results)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            # Fallback: generate one at a time for this batch
+            for p in batch_prompts:
+                all_results.append(generate_text(model, tokenizer, p, max_new_tokens,
+                                                 device, is_enc_dec, temperature=0.0))
+    return all_results
+
+
+def _gen_batch_decoder_only(model, tokenizer, prompts, max_new_tokens, device):
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+    eos_id = tokenizer.convert_tokens_to_ids("</s>")
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+
+    # Tokenize and left-pad so generation starts at the same position
+    all_ids = [[bos_id] + tokenizer.encode(p, add_special_tokens=False) for p in prompts]
+    max_prompt_len = max(len(ids) for ids in all_ids)
+    prompt_lens = [len(ids) for ids in all_ids]
+
+    # Left-pad: [pad pad pad bos tok tok tok]
+    padded = [[pad_id] * (max_prompt_len - len(ids)) + ids for ids in all_ids]
+    input_t = torch.tensor(padded, device=device)
+    B = input_t.shape[0]
+
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for _ in range(max_new_tokens):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = model(input_ids=input_t)["logits"][:, -1, :]  # [B, vocab]
+
+        next_tok = logits.argmax(dim=-1, keepdim=True)  # [B, 1] greedy
+        next_tok[finished] = pad_id
+        input_t = torch.cat([input_t, next_tok], dim=-1)
+
+        finished = finished | (next_tok.squeeze(-1) == eos_id)
+        if finished.all():
+            break
+
+    # Extract generated tokens per sequence
+    results = []
+    for i in range(B):
+        gen_start = max_prompt_len  # all prompts left-padded to same length
+        gen_ids = input_t[i, gen_start:].tolist()
+        # Truncate at EOS or pad
+        clean = []
+        for t in gen_ids:
+            if t == eos_id or t == pad_id:
+                break
+            clean.append(t)
+        results.append(tokenizer.decode(clean, skip_special_tokens=True))
+
+    return results
+
+
+def _gen_batch_enc_dec(model, tokenizer, prompts, max_new_tokens, device):
+    from components.block_masks import create_inference_masks
+
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+    assistant_id = tokenizer.convert_tokens_to_ids("<assistant>")
+    eos_id = tokenizer.convert_tokens_to_ids("</s>")
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+
+    # Tokenize encoder inputs and right-pad
+    all_enc_ids = [[bos_id] + tokenizer.encode(p, add_special_tokens=False) for p in prompts]
+    enc_lens = [len(ids) for ids in all_enc_ids]
+    max_enc_len = max(enc_lens)
+    padded_enc = [ids + [pad_id] * (max_enc_len - len(ids)) for ids in all_enc_ids]
+    enc_input = torch.tensor(padded_enc, device=device)
+    B = enc_input.shape[0]
+
+    # Encode all prompts at once
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        enc_out = model.encode(enc_input)  # [B, max_enc_len, dim]
+
+    # Initialize decoder: all start with assistant token
+    dec_ids = torch.full((B, 1), assistant_id, device=device, dtype=torch.long)
+    # Decoder positions: each starts at its own enc_len
+    dec_pos = torch.tensor([[el] for el in enc_lens], device=device, dtype=torch.long)
+
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for step in range(max_new_tokens):
+        num_dec = dec_ids.shape[1]
+        try:
+            masks = create_inference_masks(device=device, enc_len=max_enc_len, dec_len=num_dec)
+        except Exception:
+            masks = None
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = model.decode(dec_ids, enc_out, masks, dec_pos)
+
+        next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [B, 1] greedy
+        next_tok[finished] = pad_id
+        dec_ids = torch.cat([dec_ids, next_tok], dim=-1)
+        dec_pos = torch.cat([dec_pos, dec_pos[:, -1:] + 1], dim=1)
+
+        finished = finished | (next_tok.squeeze(-1) == eos_id)
+        if finished.all():
+            break
+
+    # Extract per-sequence
+    results = []
+    for i in range(B):
+        gen_ids = dec_ids[i, 1:].tolist()  # skip assistant token
+        clean = []
+        for t in gen_ids:
+            if t == eos_id or t == pad_id:
+                break
+            clean.append(t)
+        results.append(tokenizer.decode(clean, skip_special_tokens=True))
+
+    return results

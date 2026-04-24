@@ -1,23 +1,23 @@
 """
 Generation-based evaluations: XSum (ROUGE), SQuAD (F1/EM),
 TriviaQA (EM), and HumanEval (pass@k via code execution).
+
+XSum, SQuAD, and TriviaQA use batched greedy generation for throughput.
+HumanEval stays sequential (each output needs individual execution).
 """
 
 import re
 import string
 import subprocess
-import tempfile
-import textwrap
 from collections import Counter
 from datasets import load_dataset
 from tqdm import tqdm
-from evals.utils import generate_text
+from evals.utils import generate_text, generate_text_batch
 
 
 # ── Text normalization for QA ─────────────────────────────────────────────
 
 def _normalize(text):
-    """Normalize for QA matching: lowercase, strip articles/punctuation/whitespace."""
     text = text.lower()
     text = re.sub(r"\b(a|an|the)\b", " ", text)
     text = "".join(c for c in text if c not in string.punctuation)
@@ -48,11 +48,10 @@ def _max_f1(prediction, ground_truths):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  XSum — Abstractive Summarization
+#  ROUGE helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _rouge_n(prediction, reference, n=1):
-    """Simple ROUGE-N (unigram/bigram recall) without external dependencies."""
     def ngrams(tokens, n):
         return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
 
@@ -70,7 +69,6 @@ def _rouge_n(prediction, reference, n=1):
 
 
 def _rouge_l(prediction, reference):
-    """ROUGE-L via longest common subsequence."""
     pred_tokens = prediction.lower().split()
     ref_tokens = reference.lower().split()
     if not ref_tokens or not pred_tokens:
@@ -93,24 +91,36 @@ def _rouge_l(prediction, reference):
     return 2 * prec * rec / (prec + rec)
 
 
-def eval_xsum(model, tokenizer, device, is_enc_dec, max_examples=200, max_gen_tokens=64):
+# ═══════════════════════════════════════════════════════════════════════════
+#  XSum — Abstractive Summarization (batched)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def eval_xsum(model, tokenizer, device, is_enc_dec, max_examples=200,
+              max_gen_tokens=64, batch_size=16):
     """XSum abstractive summarization. Reports ROUGE-1, ROUGE-2, ROUGE-L."""
     ds = load_dataset("EdinburghNLP/xsum", split="test")
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 
+    # Collect all prompts and references
+    prompts = []
+    references = []
+    for ex in ds:
+        prompts.append("Summarize the following article in one sentence.\n\nArticle: "
+                       + ex["document"][:1500] + "\n\nSummary:")
+        references.append(ex["summary"])
+
+    # Batch generate
+    print(f"  Generating {len(prompts)} summaries (batch_size={batch_size})...")
+    generated = generate_text_batch(model, tokenizer, prompts, max_gen_tokens,
+                                    device, is_enc_dec, batch_size=batch_size)
+
+    # Score
     r1_scores, r2_scores, rl_scores = [], [], []
-
-    for ex in tqdm(ds, desc="XSum"):
-        prompt = "Summarize the following article in one sentence.\n\nArticle: " \
-                 + ex["document"][:1500] + "\n\nSummary:"
-        generated = generate_text(model, tokenizer, prompt, max_gen_tokens,
-                                  device, is_enc_dec, temperature=0.0)
-        reference = ex["summary"]
-
-        r1_scores.append(_rouge_n(generated, reference, 1))
-        r2_scores.append(_rouge_n(generated, reference, 2))
-        rl_scores.append(_rouge_l(generated, reference))
+    for gen, ref in zip(generated, references):
+        r1_scores.append(_rouge_n(gen, ref, 1))
+        r2_scores.append(_rouge_n(gen, ref, 2))
+        rl_scores.append(_rouge_l(gen, ref))
 
     return {
         "name": "XSum",
@@ -122,32 +132,35 @@ def eval_xsum(model, tokenizer, device, is_enc_dec, max_examples=200, max_gen_to
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SQuAD — Extractive Question Answering
+#  SQuAD — Extractive Question Answering (batched)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def eval_squad(model, tokenizer, device, is_enc_dec, max_examples=500, max_gen_tokens=32):
+def eval_squad(model, tokenizer, device, is_enc_dec, max_examples=500,
+               max_gen_tokens=32, batch_size=32):
     """SQuAD v1.1 extractive QA. Reports EM and F1."""
     ds = load_dataset("rajpurkar/squad", split="validation")
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 
-    em_total = f1_total = 0.0
-    count = 0
-
-    for ex in tqdm(ds, desc="SQuAD"):
+    prompts = []
+    gold_answers_list = []
+    for ex in ds:
         context = ex["context"][:1200]
         question = ex["question"]
-        gold_answers = ex["answers"]["text"]
+        prompts.append(f"Context: {context}\nQuestion: {question}\nAnswer:")
+        gold_answers_list.append(ex["answers"]["text"])
 
-        prompt = f"Context: {context}\nQuestion: {question}\nAnswer:"
-        generated = generate_text(model, tokenizer, prompt, max_gen_tokens,
-                                  device, is_enc_dec, temperature=0.0)
-        generated = generated.strip().split("\n")[0]  # take first line
+    print(f"  Generating {len(prompts)} answers (batch_size={batch_size})...")
+    generated = generate_text_batch(model, tokenizer, prompts, max_gen_tokens,
+                                    device, is_enc_dec, batch_size=batch_size)
 
-        em_total += _exact_match(generated, gold_answers)
-        f1_total += _max_f1(generated, gold_answers)
-        count += 1
+    em_total = f1_total = 0.0
+    for gen, gold_answers in zip(generated, gold_answers_list):
+        gen_clean = gen.strip().split("\n")[0]
+        em_total += _exact_match(gen_clean, gold_answers)
+        f1_total += _max_f1(gen_clean, gold_answers)
 
+    count = len(prompts)
     return {
         "name": "SQuAD",
         "exact_match": em_total / max(count, 1),
@@ -157,31 +170,33 @@ def eval_squad(model, tokenizer, device, is_enc_dec, max_examples=500, max_gen_t
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TriviaQA — Factual Knowledge Recall
+#  TriviaQA — Factual Knowledge Recall (batched)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def eval_triviaqa(model, tokenizer, device, is_enc_dec, max_examples=500, max_gen_tokens=32):
+def eval_triviaqa(model, tokenizer, device, is_enc_dec, max_examples=500,
+                  max_gen_tokens=32, batch_size=32):
     """TriviaQA (unfiltered, no context). Reports EM and F1."""
     ds = load_dataset("mandarjoshi/trivia_qa", "unfiltered.nocontext", split="validation")
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 
+    prompts = []
+    gold_answers_list = []
+    for ex in ds:
+        prompts.append(f"Question: {ex['question']}\nAnswer:")
+        gold_answers_list.append(ex["answer"]["aliases"] + [ex["answer"]["value"]])
+
+    print(f"  Generating {len(prompts)} answers (batch_size={batch_size})...")
+    generated = generate_text_batch(model, tokenizer, prompts, max_gen_tokens,
+                                    device, is_enc_dec, batch_size=batch_size)
+
     em_total = f1_total = 0.0
-    count = 0
+    for gen, gold_answers in zip(generated, gold_answers_list):
+        gen_clean = gen.strip().split("\n")[0]
+        em_total += _exact_match(gen_clean, gold_answers)
+        f1_total += _max_f1(gen_clean, gold_answers)
 
-    for ex in tqdm(ds, desc="TriviaQA"):
-        question = ex["question"]
-        gold_answers = ex["answer"]["aliases"] + [ex["answer"]["value"]]
-
-        prompt = f"Question: {question}\nAnswer:"
-        generated = generate_text(model, tokenizer, prompt, max_gen_tokens,
-                                  device, is_enc_dec, temperature=0.0)
-        generated = generated.strip().split("\n")[0]
-
-        em_total += _exact_match(generated, gold_answers)
-        f1_total += _max_f1(generated, gold_answers)
-        count += 1
-
+    count = len(prompts)
     return {
         "name": "TriviaQA",
         "exact_match": em_total / max(count, 1),
@@ -191,11 +206,10 @@ def eval_triviaqa(model, tokenizer, device, is_enc_dec, max_examples=500, max_ge
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  HumanEval — Code Generation (pass@1 via execution)
+#  HumanEval — Code Generation (sequential, needs per-example execution)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _run_code_safely(code, timeout=5):
-    """Execute Python code in a subprocess, return True if it passes."""
     try:
         result = subprocess.run(
             ["python", "-c", code],
@@ -221,8 +235,6 @@ def eval_humaneval(model, tokenizer, device, is_enc_dec, max_examples=None, max_
         generated = generate_text(model, tokenizer, prompt, max_gen_tokens,
                                   device, is_enc_dec, temperature=0.0)
 
-        # Build complete program: prompt + generated body + tests
-        # Stop at the next function definition or class
         lines = generated.split("\n")
         body_lines = []
         for line in lines:

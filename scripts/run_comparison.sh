@@ -24,6 +24,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 
 SKIP_SETUP=false
 SKIP_DATA=false

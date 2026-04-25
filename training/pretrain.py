@@ -140,9 +140,16 @@ def _try_batch_size(model, bs, seq_len, vocab_size, device):
     try:
         input_ids = torch.randint(0, vocab_size, (bs, seq_len), device=device)
         labels = input_ids.clone()
-        blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:5] + 1)[0]
+        # DecoderOnlyModel doesn't accept blocks/sft kwargs
+        import inspect
+        sig = inspect.signature(model.forward)
+        if 'blocks' in sig.parameters:
+            blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:5] + 1)[0]
+            kwargs = {"blocks": blocks, "sft": False}
+        else:
+            kwargs = {}
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            out = model(input_ids=input_ids, labels=labels, blocks=blocks, sft=False)
+            out = model(input_ids=input_ids, labels=labels, **kwargs)
         out["loss"].backward()
         peak = torch.cuda.max_memory_allocated(device)
     except RuntimeError:

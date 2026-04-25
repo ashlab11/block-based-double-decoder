@@ -521,24 +521,35 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                 # Per-component gradient norms
                 eager = _get_eager_model(model)
                 component_grads = {}
-                for comp_name, module in [
-                    ("embedding", eager.embedding),
-                    ("encoder", eager.encoder_layers),
-                    ("decoder", eager.decoder_layers),
-                    ("encoder_norm", eager.encoder_norm),
-                    ("output_norm", eager.output_norm),
-                ]:
+                # Build component list dynamically — DecoderOnlyModel has
+                # 'layers' instead of 'encoder_layers'/'decoder_layers'
+                grad_components = [("embedding", eager.embedding)]
+                if hasattr(eager, "encoder_layers"):
+                    grad_components.append(("encoder", eager.encoder_layers))
+                if hasattr(eager, "decoder_layers"):
+                    grad_components.append(("decoder", eager.decoder_layers))
+                if hasattr(eager, "layers"):
+                    grad_components.append(("layers", eager.layers))
+                if hasattr(eager, "encoder_norm"):
+                    grad_components.append(("encoder_norm", eager.encoder_norm))
+                grad_components.append(("output_norm", eager.output_norm))
+
+                for comp_name, module in grad_components:
                     params_with_grad = [p for p in module.parameters() if p.grad is not None]
                     if params_with_grad:
                         total_norm = torch.norm(torch.stack([p.grad.detach().float().norm() for p in params_with_grad]))
                         heavy_metrics[f"grad_norm/{comp_name}"] = total_norm.item()
 
                 # Per-component parameter norms (tracks weight growth/decay)
-                for comp_name, module in [
-                    ("embedding", eager.embedding),
-                    ("encoder", eager.encoder_layers),
-                    ("decoder", eager.decoder_layers),
-                ]:
+                weight_components = [("embedding", eager.embedding)]
+                if hasattr(eager, "encoder_layers"):
+                    weight_components.append(("encoder", eager.encoder_layers))
+                if hasattr(eager, "decoder_layers"):
+                    weight_components.append(("decoder", eager.decoder_layers))
+                if hasattr(eager, "layers"):
+                    weight_components.append(("layers", eager.layers))
+
+                for comp_name, module in weight_components:
                     params = [p for p in module.parameters()]
                     if params:
                         total_norm = torch.norm(torch.stack([p.detach().float().norm() for p in params]))

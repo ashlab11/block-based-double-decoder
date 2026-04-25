@@ -45,6 +45,7 @@ def load_model(checkpoint_path, tokenizer_path=None, device="cuda"):
     """
     from models.double_decoder import Double_Decoder
     from models.decoder import DecoderOnlyModel
+    from models.standard_enc_dec import StandardEncDec
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt["state_dict"]
@@ -53,12 +54,23 @@ def load_model(checkpoint_path, tokenizer_path=None, device="cuda"):
     # Handle torch.compile wrapper keys
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
-    # Determine model type from hparams
-    is_enc_dec = "num_encoder_layers" in hparams and "num_decoder_layers" in hparams
+    # Determine model type from state_dict keys (hparams can be ambiguous
+    # because DecoderOnlyModel checkpoints still contain num_encoder_layers)
+    has_encoder_layers = any(k.startswith("encoder_layers.") for k in state_dict)
+    has_combo_attn = any("combo_attn" in k for k in state_dict)
+    has_cross_attn = any("cross_attn" in k for k in state_dict)
 
-    if is_enc_dec:
+    if has_encoder_layers and has_combo_attn:
+        is_enc_dec = True
+        model = Double_Decoder(**hparams)
+    elif has_encoder_layers and has_cross_attn:
+        is_enc_dec = True
+        model = StandardEncDec(**hparams)
+    elif has_encoder_layers:
+        is_enc_dec = True
         model = Double_Decoder(**hparams)
     else:
+        is_enc_dec = False
         model = DecoderOnlyModel(**hparams)
 
     model.load_state_dict(state_dict)

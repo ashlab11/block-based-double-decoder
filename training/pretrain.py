@@ -17,32 +17,11 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
-from omegaconf import DictConfig
 import time
 
-from models.double_decoder import Double_Decoder
 from models.decoder import DecoderOnlyModel
 from configs import TrainingConfig, build_config_from_dict
-
-def _init_distributed() -> bool:
-    if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend='nccl')
-        return True
-    return dist.is_available() and dist.is_initialized()
-
-
-def _get_world_size() -> int:
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-
-
-def _get_rank() -> int:
-    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-
-
-def _all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor
+from training.dist_utils import init_distributed, get_world_size, get_rank, all_reduce_sum
 
 
 def _get_eager_model(model):
@@ -70,8 +49,8 @@ def eval(model, eval_dataloader, device):
             local_loss_times_tokens += eval_outputs["loss"].detach().to(dtype=torch.float64) * ntoks
             local_tokens += ntoks
 
-        loss_times_tokens = _all_reduce_sum(local_loss_times_tokens).item()
-        total_tokens = int(_all_reduce_sum(local_tokens).item())
+        loss_times_tokens = all_reduce_sum(local_loss_times_tokens).item()
+        total_tokens = int(all_reduce_sum(local_tokens).item())
         avg_loss = loss_times_tokens / max(1, total_tokens)
         eval_ppl = float(torch.exp(torch.tensor(avg_loss)))
 
@@ -214,9 +193,9 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    _init_distributed()
-    world_size = _get_world_size()
-    rank = _get_rank()
+    init_distributed()
+    world_size = get_world_size()
+    rank = get_rank()
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_file)
     bos_token_id = tokenizer.convert_tokens_to_ids("<s>")

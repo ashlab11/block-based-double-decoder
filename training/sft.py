@@ -2,7 +2,7 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
-from transformers import get_cosine_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup, PreTrainedTokenizerFast
+from transformers import get_polynomial_decay_schedule_with_warmup, PreTrainedTokenizerFast
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -11,27 +11,8 @@ import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from training.pretrain import build_model
+from training.dist_utils import init_distributed, get_world_size, get_rank, all_reduce_sum
 from configs import TrainingConfig, build_config_from_dict
-
-def _init_distributed() -> bool:
-    if dist.is_available() and not dist.is_initialized() and "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend='nccl')
-        return True
-    return dist.is_available() and dist.is_initialized()
-
-
-def _get_world_size() -> int:
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-
-
-def _get_rank() -> int:
-    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-
-
-def _all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor
 
 def eval(model, eval_dataloader, device):
     model.eval()
@@ -49,11 +30,11 @@ def eval(model, eval_dataloader, device):
             local_loss_times_tokens += eval_outputs["loss"].detach().to(dtype=torch.float64) * ntoks
             local_tokens += ntoks
 
-        loss_times_tokens = _all_reduce_sum(local_loss_times_tokens).item()
-        total_tokens = int(_all_reduce_sum(local_tokens).item())
+        loss_times_tokens = all_reduce_sum(local_loss_times_tokens).item()
+        total_tokens = int(all_reduce_sum(local_tokens).item())
         avg_loss = loss_times_tokens / max(1, total_tokens)
         eval_ppl = float(torch.exp(torch.tensor(avg_loss)))
-        
+
     model.train()
     return avg_loss, eval_ppl
 
@@ -62,12 +43,12 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    _init_distributed()
-    world_size = _get_world_size()
-    rank = _get_rank()
-    
+    init_distributed()
+    world_size = get_world_size()
+    rank = get_rank()
+
     assert (cfg.grad_accum_steps % world_size == 0) and (cfg.grad_accum_steps >= world_size), "grad_accum_steps must be divisible by and geq than world_size"
-    
+
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_file)
     bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
@@ -80,7 +61,7 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
         sd = ckpt["state_dict"]
         sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
         hparams = ckpt["hparams"]
-        
+
         model = cfg.model_cls(**hparams)
         model.load_state_dict(sd)
     else:
@@ -97,7 +78,7 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
 
     train_sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if world_size > 1 else None
     eval_sampler = DistributedSampler(eval_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if world_size > 1 else None
-    
+
     num_workers = min(6, max(24 // world_size, 1))
     dataloader = DataLoader(
         ds,
@@ -128,12 +109,12 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.enable_flash_sdp(True)
-    
+
     #Base learning rate refers to 64 batch, 2 accum = 128
     #We need to scale by number of accumations
     scale = cfg.grad_accum_steps * cfg.batch_size / 128
     lr = cfg.lr * scale
-    
+
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -169,7 +150,7 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
     step = 0
     train_steps_arr = []
     train_losses = []
-    
+
     eval_steps_arr = []
     eval_losses = []
 
@@ -190,7 +171,7 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
 
         loss_value = loss.detach().item()
         (loss / accumulation_steps).backward()
-        
+
         if (batch_idx + 1) % accumulation_steps == 0:
             clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()

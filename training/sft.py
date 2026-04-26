@@ -126,7 +126,7 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
 
     torch.backends.cudnn.benchmark = True
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.enable_flash_sdp(True)
     
     #Base learning rate refers to 64 batch, 2 accum = 128

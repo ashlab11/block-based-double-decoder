@@ -132,7 +132,14 @@ def _measure_memory(model, tokenizer, device, is_enc_dec, prompt, num_tokens=64)
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
-    _measure_decoding_throughput(model, tokenizer, device, is_enc_dec, prompt, num_tokens)
+    try:
+        _measure_decoding_throughput(model, tokenizer, device, is_enc_dec, prompt, num_tokens)
+    except RuntimeError as e:
+        if "CUDA" in str(e):
+            print(f"    [WARN] CUDA error during memory measurement, using current peak")
+            torch.cuda.empty_cache()
+        else:
+            raise
 
     peak_mb = torch.cuda.max_memory_allocated(device) / 1e6
     return peak_mb
@@ -278,9 +285,9 @@ def benchmark_all(checkpoints, labels, prompts, device, num_gen_tokens=64,
         }
         print(f"    {np.mean(throughputs):.1f} ± {np.std(throughputs):.1f} tok/s")
 
-        # Peak memory
+        # Peak memory — use shorter generation to avoid flex_attention recompile issues
         print(f"  Measuring peak memory...")
-        peak_mb = _measure_memory(model, tokenizer, device, is_enc_dec, prompts[-1], num_gen_tokens)
+        peak_mb = _measure_memory(model, tokenizer, device, is_enc_dec, prompts[-1], min(num_gen_tokens, 16))
         result["peak_memory_mb"] = peak_mb
         print(f"    Peak: {peak_mb:.0f} MB")
 

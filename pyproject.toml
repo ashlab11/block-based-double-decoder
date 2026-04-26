@@ -1,0 +1,109 @@
+[project]
+name = "block-based-double-decoder"
+version = "0.1.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "accelerate==1.8.1",
+    "aiohappyeyeballs==2.6.1",
+    "aiohttp==3.12.14",
+    "aiosignal==1.4.0",
+    "antlr4-python3-runtime==4.9.3",
+    "attrs==25.3.0",
+    "blobfile==3.0.0",
+    "certifi==2025.7.9",
+    "charset-normalizer==3.4.2",
+    "datasets==4.0.0",
+    "dill==0.3.8",
+    "filelock==3.18.0",
+    "frozenlist==1.7.0",
+    "fsspec==2025.3.0",
+    "hf-transfer==0.1.9",
+    "hf-xet==1.1.5",
+    "huggingface-hub==0.33.4",
+    "idna==3.10",
+    "jinja2==3.1.6",
+    "kagglehub==0.3.12",
+    "lxml==6.0.0",
+    "markupsafe==3.0.2",
+    "matplotlib==3.10.1",
+    "mpmath==1.3.0",
+    "multidict==6.6.3",
+    "multiprocess==0.70.16",
+    "networkx==3.5",
+    "numpy==2.3.1",
+    "omegaconf==2.3.0",
+    "packaging==25.0",
+    "pandas==2.3.1",
+    "pillow==11.3.0",
+    "propcache==0.3.2",
+    "psutil==7.0.0",
+    "pyarrow==20.0.0",
+    "pycryptodomex==3.23.0",
+    "python-dateutil==2.9.0.post0",
+    "pytz==2025.2",
+    "pyyaml==6.0.2",
+    "regex==2024.11.6",
+    "requests==2.32.4",
+    "safetensors==0.5.3",
+    "scipy==1.16.0",
+    "sentencepiece==0.2.0",
+    "setuptools==80.9.0",
+    "six==1.17.0",
+    "sympy==1.14.0",
+    "tiktoken==0.9.0",
+    "tokenizers==0.21.2",
+    "torchao==0.11.0",
+    "torchdata==0.11.0",
+    "torchtune==0.6.1",
+    "tqdm==4.67.1",
+    "transformer-engine>=2.8.0 ; platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "transformers==4.53.2",
+    "typing-extensions==4.14.1",
+    "tzdata==2025.2",
+    "urllib3==2.5.0",
+    "xxhash==3.5.0",
+    "yarl==1.20.1",
+    "zstd==1.5.7.2",
+]
+
+[tool.uv]
+# Require wheels for the three runtimes you care about
+required-environments = [
+  # 2. Standard x86-64 Linux (H100/A100, CPU boxes, etc.)
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+conflicts = [[{ extra = "cu118" }, { extra = "cu126" }],
+             [{ extra = "cu118" }, { extra = "cu128" }],
+             [{ extra = "cu126" }, { extra = "cu128" }]]
+
+[project.optional-dependencies]
+cu118 = ["torch<=2.7.1", "torchvision>=0.22.0"]
+cu126 = ["torch>=2.9.0", "torchvision>=0.22.0"]
+cu128 = ["torch>=2.9.0", "torchvision>=0.22.0"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu118", extra = "cu118" },
+  { index = "pytorch-cu126", extra = "cu126" },
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+torchvision = [
+  { index = "pytorch-cu118", extra = "cu118" },
+  { index = "pytorch-cu126", extra = "cu126" },
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url  = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url  = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url  = "https://download.pytorch.org/whl/cu128"
+explicit = true

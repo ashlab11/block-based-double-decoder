@@ -176,10 +176,23 @@ class ComboAttention(nn.Module):
             enc_output, enc_lse, _ = flash_attn_func(query, enc_key, enc_value, causal=False, return_attn_probs = True)
 
         elif block_masks is None:
-            raise RuntimeError(
-                "Inference without block_masks requires flash-attn, which failed to import. "
-                "Install a compatible flash-attn or provide block_masks for flex_attention."
-            )
+            # SDPA fallback: no flash-attn, no block masks (inference mode).
+            # We need LSE for the sigmoid gate, so compute attention manually.
+            scale = 1.0 / (self.head_dim ** 0.5)
+
+            # Decoder self-attention (causal)
+            dec_scores = torch.matmul(query, dec_key.transpose(-2, -1)) * scale
+            causal_mask = torch.triu(torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
+            dec_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            dec_lse = torch.logsumexp(dec_scores, dim=-1)  # [B, H, L]
+            dec_attn = torch.softmax(dec_scores, dim=-1)
+            dec_output = torch.matmul(dec_attn, dec_value)
+
+            # Encoder cross-attention (full, non-causal)
+            enc_scores = torch.matmul(query, enc_key.transpose(-2, -1)) * scale
+            enc_lse = torch.logsumexp(enc_scores, dim=-1)  # [B, H, L]
+            enc_attn = torch.softmax(enc_scores, dim=-1)
+            enc_output = torch.matmul(enc_attn, enc_value)
         else:
             self_mask = block_masks.get('self_mask')
             cross_mask = block_masks.get('cross_mask')

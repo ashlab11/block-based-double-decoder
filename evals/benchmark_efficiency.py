@@ -25,7 +25,6 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evals.utils import load_model
-from components.block_masks import create_inference_masks
 
 # Workaround for PyTorch inductor bug
 import torch._inductor.config as _inductor_config
@@ -59,9 +58,8 @@ def _measure_first_token(model, tokenizer, device, is_enc_dec, prompt, warmup=Fa
         enc_len = len(ids) + 1
         dec_pos = torch.tensor([[enc_len]], device=device)
 
-        masks = create_inference_masks(device=device, enc_len=enc_len, dec_len=dec_ids.shape[1])
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            logits = model.decode(dec_ids, enc_out, masks, dec_pos)
+            logits = model.decode(dec_ids, enc_out, None, dec_pos)
         first_token = logits[0, -1].argmax().item()
     else:
         input_t = torch.tensor([[bos_id] + ids], device=device)
@@ -101,9 +99,8 @@ def _measure_decoding_throughput(model, tokenizer, device, is_enc_dec, prompt,
         dec_pos = torch.tensor([[enc_len]], device=device)
 
         for _ in range(num_tokens):
-            masks = create_inference_masks(device=device, enc_len=enc_len, dec_len=dec_ids.shape[1])
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = model.decode(dec_ids, enc_out, masks, dec_pos)
+                logits = model.decode(dec_ids, enc_out, None, dec_pos)
             next_tok = logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
             dec_ids = torch.cat([dec_ids, next_tok], dim=-1)
             dec_pos = torch.cat([dec_pos, dec_pos[:, -1:] + 1], dim=1)

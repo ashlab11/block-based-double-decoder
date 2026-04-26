@@ -1,0 +1,28 @@
+# SFT: Standard Enc-Dec 50M on UltraChat
+model_cls: "StandardEncDec"
+collator_cls: "BasicSFTCollator"
+
+dim: 512
+num_encoder_layers: 8
+num_decoder_layers: 3
+seq_len: 2048
+init_strategy: "xavier_uniform"
+
+input_model_name: "checkpoints/compare_enc_dec_50m.pt"
+train_file: "data/SFT/ultrachat.jsonl"
+eval_file: "data/SFT/ultrachat_eval.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+batch_size: 32
+grad_accum_steps: 4
+lr: 2e-5
+end_lr_ratio: 0.1
+logging_steps: 10
+eval_steps: 200
+save_steps: 500
+output_dir: "checkpoints"
+output_file_name: "sft_enc_dec_50m"
+
+wandb_project: "block-based-double-decoder"
+wandb_run_name: "sft_enc_dec_50m"
+wandb_entity: "block-based-double-decoders"

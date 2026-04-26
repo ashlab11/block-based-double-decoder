@@ -9,10 +9,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 import os
 from tqdm import tqdm
-from accelerate import Accelerator
 import matplotlib.pyplot as plt
-import hydra
-from omegaconf import DictConfig
 from training.pretrain import build_model
 from configs import TrainingConfig, build_config_from_dict
 
@@ -229,7 +226,6 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
                     )
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
-    breakpoint()
     avg_loss, eval_ppl = eval(model, eval_dataloader, device)
     if verbose > 0 and rank == 0:
         tqdm.write(f"End of training - eval perplexity: {eval_ppl:.4f}")
@@ -253,8 +249,24 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
         dist.destroy_process_group()
     return eval_ppl,f"{cfg.output_dir}/{cfg.output_file_name}.pt"
 
-@hydra.main(version_base=None, config_path="../configs", config_name="runs/sft")
-def main(cfg: DictConfig):
+def main():
+    import argparse
+    from omegaconf import OmegaConf
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config-name", type=str, default="runs/sft",
+                        help="Config file name relative to configs/ (without .yaml)")
+    args, overrides = parser.parse_known_args()
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "..", "configs", f"{args.config_name}.yaml")
+    cfg = OmegaConf.load(config_path)
+
+    for override in overrides:
+        if "=" in override:
+            key, value = override.split("=", 1)
+            OmegaConf.update(cfg, key, value)
+
     training_cfg = build_config_from_dict(cfg)
     sft(training_cfg, verbose=3)
 

@@ -44,6 +44,10 @@ EVAL_META = {
     # Probes
     "niah":            {"display": "Needle in Haystack", "metric": "accuracy",  "higher": True,  "random": 0.00,  "category": "LAMBADA & Probes"},
     "copy_retrieval":  {"display": "Copy Retrieval",     "metric": "accuracy",  "higher": True,  "random": 0.00,  "category": "LAMBADA & Probes"},
+    # Generation (asymmetric tasks — Elfeki's encoder-advantaging category)
+    "xsum":            {"display": "XSum (ROUGE-1)",     "metric": "rouge1",    "higher": True,  "random": 0.00,  "category": "Generation (Asymmetric Tasks)"},
+    "squad":           {"display": "SQuAD (F1)",         "metric": "f1",        "higher": True,  "random": 0.00,  "category": "Generation (Asymmetric Tasks)"},
+    "triviaqa":        {"display": "TriviaQA (F1)",      "metric": "f1",        "higher": True,  "random": 0.00,  "category": "Generation (Asymmetric Tasks)"},
 }
 
 # wikitext_bpb intentionally excluded — identical to bpb (both use Wikitext-103)
@@ -237,6 +241,58 @@ def plot_comparison(result_files, labels, output_dir="evals"):
             print()
 
 
+def plot_efficiency(efficiency_path, output_dir="evals"):
+    """Plot efficiency metrics as grouped bars from benchmark_efficiency.py output."""
+    with open(efficiency_path) as f:
+        data = json.load(f)
+
+    labels = list(data.keys())
+    n = len(labels)
+
+    metrics = [
+        ("Throughput (tok/s)", [data[l]["throughput"]["mean_tok_per_sec"] for l in labels],
+         True, "tok/s"),
+        ("First-Token Latency (ms)", [data[l]["first_token_latency"][
+            str(max(int(k) for k in data[l]["first_token_latency"]))]["mean_ms"] for l in labels],
+         False, "ms"),
+        ("Peak Memory (MB)", [data[l]["peak_memory_mb"] for l in labels],
+         False, "MB"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+    for ax, (title, values, higher_better, unit) in zip(axes, metrics):
+        x = np.arange(n)
+        bars = ax.bar(x, values, color=COLORS[:n], edgecolor="white", linewidth=0.5, width=0.6)
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.02,
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=10)
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.set_ylabel(unit, fontsize=10)
+        ax.grid(axis="y", alpha=0.2)
+
+        direction = "Higher is better" if higher_better else "Lower is better"
+        ax.text(0.98, 0.97, direction, transform=ax.transAxes, fontsize=7,
+                ha="right", va="top", style="italic", color="gray")
+
+        # Highlight the best
+        best_idx = values.index(max(values)) if higher_better else values.index(min(values))
+        bars[best_idx].set_edgecolor("gold")
+        bars[best_idx].set_linewidth(2.5)
+
+    fig.suptitle("Inference Efficiency Comparison (54.5M params, H200 GPU)",
+                 fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "efficiency_comparison.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", nargs="+",
@@ -248,6 +304,8 @@ def main():
     parser.add_argument("--labels", nargs="+",
                         default=["Decoder-Only", "Double Decoder", "Std Enc-Dec"])
     parser.add_argument("--output-dir", default="evals")
+    parser.add_argument("--efficiency", default=None,
+                        help="Path to efficiency_results.json (generates efficiency plot)")
     args = parser.parse_args()
 
     assert len(args.results) == len(args.labels), "Must have same number of results and labels"
@@ -259,6 +317,14 @@ def main():
         return
 
     plot_comparison(args.results, args.labels, args.output_dir)
+
+    # Efficiency plot
+    eff_path = args.efficiency
+    if eff_path is None:
+        eff_path = os.path.join(args.output_dir, "efficiency_results.json")
+    if os.path.exists(eff_path):
+        print("\n── Efficiency Plot ──")
+        plot_efficiency(eff_path, args.output_dir)
 
 
 if __name__ == "__main__":

@@ -244,7 +244,10 @@ def cmd_run(args):
         print(f"[{i+1}/{total}] {name}")
         print(f"{'='*60}")
 
-        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT) + ":" + env.get("PYTHONPATH", "")
+
+        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
 
         if result.returncode != 0:
             print(f"FAILED: {name} (exit code {result.returncode})")

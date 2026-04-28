@@ -1,0 +1,36 @@
+# Auto-generated scaling law config: 5M params, 10M tokens
+# Non-embedding params: 5,308,416  |  FLOPs: 3.19e+14
+# Estimated optimizer steps: 76
+
+model_cls: "Double_Decoder"
+dim: 192
+num_encoder_layers: 8
+num_decoder_layers: 4
+seq_len: 2048
+shared: true
+logit_biases: false
+init_strategy: "xavier_uniform"
+gradient_checkpointing: false
+
+collator_cls: "BasicPretrainCollator"
+train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
+eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
+tokenizer_file: "tokenizer/tokenizer_32k.json"
+
+auto_batch_size: true
+target_effective_batch: 64
+batch_size: 64
+grad_accum_steps: 1
+lr: 0.001155
+end_lr_ratio: 0.1
+total_tokens: 10000000
+
+logging_steps: 4
+eval_steps: 4
+save_steps: 15
+output_dir: "checkpoints/scaling"
+output_file_name: "dd_5M_10Mtok"
+
+wandb_project: "dd-scaling-laws"
+wandb_run_name: "dd_5M_10Mtok"
+wandb_entity: "block-based-double-decoders"

@@ -621,6 +621,24 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
         fname = _save_checkpoint(model, hparams, optimizer, scheduler, step, cfg)
         print(f"Final checkpoint: {fname}")
 
+        # Save results JSON (used by scaling law analysis)
+        import json as _json
+        _results = {
+            "final_eval_loss": float(avg_loss),
+            "final_eval_ppl": float(eval_ppl),
+            "total_steps": step,
+            "tokens_seen": int(tokens_seen),
+            "total_params": int(sum(p.numel() for p in _get_eager_model(model).parameters())),
+            "training_time_sec": time.time() - training_start_time,
+            "hparams": {k: v for k, v in hparams.items() if isinstance(v, (int, float, str, bool))},
+            "train_curve": list(zip(train_steps_arr, [float(l) for l in train_losses])),
+            "eval_curve": list(zip(eval_steps_arr, [float(l) for l in eval_losses])),
+        }
+        _results_path = f"{cfg.output_dir}/{cfg.output_file_name}_results.json"
+        with open(_results_path, "w") as _rf:
+            _json.dump(_results, _rf, indent=2)
+        print(f"Results JSON: {_results_path}")
+
         if use_wandb:
             wandb.log({
                 "eval/final_loss": avg_loss,

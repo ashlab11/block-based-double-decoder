@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=dd-micro
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=00:15:00
+#SBATCH --output=logs/%x-%j.out
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4: Micro-scale dry run (50M model, 50 steps)
 #
@@ -13,11 +19,20 @@
 #   Entity:  block-based-double-decoders
 #   Project: block-based-double-decoder
 #   Run:     dd_50m_micro_dryrun
+#
+# RunPod usage:   bash scripts/4_micro_run.sh
+# SLURM usage:    sbatch scripts/4_micro_run.sh
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+mkdir -p logs
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 
-NUM_GPUS=${NUM_GPUS:-1}
+# Auto-detect GPU count from SLURM env, falling back to NUM_GPUS or 1.
+if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
+    NUM_GPUS=${NUM_GPUS:-$SLURM_GPUS_ON_NODE}
+else
+    NUM_GPUS=${NUM_GPUS:-1}
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Step 4: Micro Dry Run (50M model, 50 steps, ${NUM_GPUS} GPUs)"
@@ -25,7 +40,13 @@ echo "════════════════════════�
 
 mkdir -p checkpoints
 
-torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    LAUNCHER=(srun torchrun --nproc_per_node=${NUM_GPUS})
+else
+    LAUNCHER=(torchrun --nproc_per_node=${NUM_GPUS})
+fi
+
+"${LAUNCHER[@]}" training/pretrain.py \
     --config-name=runs/pretrain_50m_micro
 
 echo ""

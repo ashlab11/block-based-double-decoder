@@ -1,11 +1,22 @@
 #!/bin/bash
+#SBATCH --job-name=dd-eval
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=02:00:00
+#SBATCH --output=logs/%x-%j.out
 # Run all 22 evals on a trained model checkpoint.
 #
-# Usage:
+# RunPod usage:
 #   bash scripts/6_eval.sh checkpoints/model.pt
 #   bash scripts/6_eval.sh checkpoints/model.pt 50   # cap at 50 examples per eval (fast debug)
+#
+# SLURM usage:
+#   sbatch scripts/6_eval.sh checkpoints/model.pt
+#   sbatch scripts/6_eval.sh checkpoints/model.pt 50
 
 set -euo pipefail
+mkdir -p logs
 
 CHECKPOINT="${1:?Usage: bash scripts/6_eval.sh <checkpoint.pt> [max_examples]}"
 MAX_EXAMPLES="${2:-}"

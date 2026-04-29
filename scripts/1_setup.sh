@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=dd-setup
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=00:45:00
+#SBATCH --output=logs/%x-%j.out
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1: Install dependencies and verify environment
 #
@@ -8,11 +14,57 @@
 # Wall clock: ~10-20 minutes (flash-attn compilation dominates)
 # Devices:    GPU needed for verification steps
 # Cost:       ~$0.10-0.50 (minimal RunPod time)
+#
+# RunPod usage:   bash scripts/1_setup.sh
+# SLURM usage:    sbatch scripts/1_setup.sh   (after activating conda env)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+mkdir -p logs
+
+# ── Environment detection ────────────────────────────────────────────────────
+IN_ALLOCATION=0; [ -n "${SLURM_JOB_ID:-}" ] && IN_ALLOCATION=1
+ON_SLURM_CLUSTER=0; command -v sbatch >/dev/null 2>&1 && ON_SLURM_CLUSTER=1
+HAS_GPU=0
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q GPU; then
+    HAS_GPU=1
+fi
+
+# ── SLURM-only preconditions (no-op on RunPod) ──────────────────────────────
+if [ "$HAS_GPU" = 0 ]; then
+    if [ "$ON_SLURM_CLUSTER" = 1 ]; then
+        echo "✗ No GPU visible. You're likely on a SLURM login node."
+        echo "  Submit setup as a job:"
+        echo "    sbatch scripts/1_setup.sh"
+        echo "  or grab an interactive GPU shell:"
+        echo "    srun --gres=gpu:1 --pty bash scripts/1_setup.sh"
+    else
+        echo "✗ No GPU detected. Setup requires CUDA for verification."
+    fi
+    exit 1
+fi
+
+if [ "$ON_SLURM_CLUSTER" = 1 ] && [ -z "${CONDA_DEFAULT_ENV:-}" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
+    echo "✗ No active Python env. On SLURM, activate one before running:"
+    echo "    conda create -n dd python=3.11 -y && conda activate dd"
+    echo "    sbatch scripts/1_setup.sh"
+    exit 1
+fi
+
+if command -v module >/dev/null 2>&1; then
+    module load cuda/12.4 2>/dev/null || true
+fi
+
+if [ "$ON_SLURM_CLUSTER" = 1 ] && [ -z "${WANDB_API_KEY:-}" ] && [ "${WANDB_MODE:-}" != "offline" ]; then
+    echo "✗ WANDB_API_KEY not set. Either:"
+    echo "    export WANDB_API_KEY=...    (preferably in ~/.bashrc)"
+    echo "  or skip wandb entirely:"
+    echo "    export WANDB_MODE=offline"
+    exit 1
+fi
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Step 1: Setup & Dependencies"
+[ "$IN_ALLOCATION" = 1 ] && echo "  Running under SLURM job ${SLURM_JOB_ID}"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── (1/4) Install PyTorch (pinned to cu124 for CUDA 12.4 pods) ──────────────
@@ -106,13 +158,28 @@ print('    ✓ torch.compile works (inductor backend)')
 
 echo ""
 echo "  wandb login:"
-if ! python -c "import wandb; wandb.login(verify=True)" 2>/dev/null; then
-    echo "  ✗ wandb not logged in. Run: wandb login"
-    echo "  Make sure you have access to project 'block-based-double-decoder'"
-    echo "  under entity 'block-based-double-decoders'"
+if [ "${WANDB_MODE:-}" = "offline" ]; then
+    echo "    ✓ WANDB_MODE=offline — skipping login check"
+elif [ -n "${WANDB_API_KEY:-}" ]; then
+    if python -c "import wandb; wandb.login(verify=True)" 2>/dev/null; then
+        echo "    ✓ wandb login verified via WANDB_API_KEY"
+    else
+        echo "    ✗ WANDB_API_KEY set but verification failed. Check the key."
+        exit 1
+    fi
+elif [ "$ON_SLURM_CLUSTER" = 0 ]; then
+    # Interactive RunPod path: prompt the user once.
+    if ! python -c "import wandb; wandb.login(verify=True)" 2>/dev/null; then
+        echo "  ✗ wandb not logged in. Run: wandb login"
+        echo "  Make sure you have access to project 'block-based-double-decoder'"
+        echo "  under entity 'block-based-double-decoders'"
+        exit 1
+    fi
+    echo "    ✓ wandb login verified"
+else
+    echo "    ✗ Unreachable: SLURM path without WANDB_API_KEY should have exited above."
     exit 1
 fi
-echo "    ✓ wandb login verified"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

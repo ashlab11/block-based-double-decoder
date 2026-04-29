@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=dd-data
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=03:00:00
+#SBATCH --output=logs/%x-%j.out
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2: Download pre-packed data (fast) or build from scratch (slow)
 #
@@ -9,9 +14,33 @@
 # fails, falls back to the slow path automatically.
 #
 # Devices:    CPU + network (no GPU needed)
+#
+# RunPod usage:   bash scripts/2_data.sh
+# SLURM usage:    sbatch scripts/2_data.sh   (after sourcing slurm.env to point
+#                                             DATA_DIR at scratch storage)
+#
+# Storage location: defaults to repo-relative ./data/Pretrain. Override with:
+#   export DATA_DIR=$SCRATCH/dd/data/Pretrain
+#   export TOKENIZER_DIR=$SCRATCH/dd/tokenizer
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+mkdir -p logs
 export HF_HUB_ENABLE_HF_TRANSFER=1
+
+: "${DATA_DIR:=data/Pretrain}"
+: "${TOKENIZER_DIR:=tokenizer}"
+mkdir -p "$DATA_DIR" "$TOKENIZER_DIR"
+
+# Symlink scratch dirs back into the repo-relative paths so the rest of
+# the pipeline (Hydra configs, pretrain.py) keeps using relative paths
+# unchanged. No-op when DATA_DIR is already the default.
+if [ "$DATA_DIR" != "data/Pretrain" ] && [ ! -e "data/Pretrain" ]; then
+    mkdir -p data
+    ln -s "$DATA_DIR" "data/Pretrain"
+fi
+if [ "$TOKENIZER_DIR" != "tokenizer" ] && [ ! -e "tokenizer" ]; then
+    ln -s "$TOKENIZER_DIR" "tokenizer"
+fi
 
 # HuggingFace dataset repo for pre-packed data
 HF_DATASET_REPO="bpbradle/slimpajama-6b-packed"

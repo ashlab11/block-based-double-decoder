@@ -14,8 +14,8 @@ Usage:
 """
 
 from datasets import load_dataset
-import json
 import argparse
+import os
 import time
 from transformers import PreTrainedTokenizerFast
 
@@ -29,7 +29,12 @@ def _fmt_time(seconds):
         return f"{seconds / 3600:.1f}h"
 
 
-def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
+def _serialize_ids(ids):
+    """Fast JSON serialization for a list of ints (avoids json.dumps overhead)."""
+    return '{"input_ids":[' + ','.join(map(str, ids)) + ']}\n'
+
+
+def pack(ds, tokenizer, ctx_len, writer, buffer_size=10000):
     """Pack tokenized documents into fixed-length sequences."""
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
@@ -46,7 +51,7 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
             if len(ids) + len(current) > ctx_len:
                 take = ctx_len - len(current)
                 current += ids[:take]
-                buf.append(json.dumps({"input_ids": current}) + "\n")
+                buf.append(_serialize_ids(current))
                 num_sequences += 1
                 if len(buf) >= buffer_size:
                     writer.writelines(buf)
@@ -60,14 +65,14 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
                     current.extend([eos_id, bos_id])
                 if space == 1:
                     current.append(eos_id)
-                    buf.append(json.dumps({"input_ids": current}) + "\n")
+                    buf.append(_serialize_ids(current))
                     num_sequences += 1
                     if len(buf) >= buffer_size:
                         writer.writelines(buf)
                         buf.clear()
                     current = [bos_id]
                 if space == 0:
-                    buf.append(json.dumps({"input_ids": current}) + "\n")
+                    buf.append(_serialize_ids(current))
                     num_sequences += 1
                     if len(buf) >= buffer_size:
                         writer.writelines(buf)
@@ -94,8 +99,22 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=1000):
 
 def build_packed_dataset(in_path, out_path, tokenizer, ctx_len):
     print(f"Packing {in_path} -> {out_path} (seq_len={ctx_len})")
-    ds = load_dataset("json", data_files=in_path, split="train", streaming=True)
-    ds = ds.map(lambda x: tokenizer(x["text"]), batched=True, batch_size=1000, remove_columns=['text'])
+
+    num_cpus = os.cpu_count() or 1
+    num_proc = max(1, min(num_cpus, 16))  # cap at 16 to avoid memory issues
+
+    # Load into memory for parallel tokenization (much faster than streaming)
+    print(f"  Loading and tokenizing with {num_proc} workers...")
+    tok_start = time.time()
+    ds = load_dataset("json", data_files=in_path, split="train")
+    ds = ds.map(
+        lambda x: tokenizer(x["text"]),
+        batched=True,
+        batch_size=5000,
+        num_proc=num_proc,
+        remove_columns=['text'],
+    )
+    print(f"  Tokenized {len(ds):,} documents in {_fmt_time(time.time() - tok_start)}")
 
     with open(out_path, "w") as f:
         return pack(ds, tokenizer, ctx_len, f)

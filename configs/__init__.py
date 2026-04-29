@@ -30,6 +30,7 @@ class TrainingConfig:
     init_strategy: str = "xavier_uniform"
     label_pad_token_id: int = -100
     gradient_checkpointing: bool = False
+    use_compile: bool = True
 
     # ── Training loop ────────────────────────────────────────────────────
     batch_size: int = 64

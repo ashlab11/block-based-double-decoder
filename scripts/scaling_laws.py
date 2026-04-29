@@ -83,8 +83,9 @@ def _lr_for_dim(dim):
 # ── Generate configs ────────────────────────────────────────────────────────
 
 SEQ_LEN = 2048
-TARGET_EFFECTIVE_BATCH = 64
-TOKENS_PER_STEP = TARGET_EFFECTIVE_BATCH * SEQ_LEN  # 131,072
+# Large batch to saturate GPU — small models waste cycles on kernel launch overhead
+TARGET_EFFECTIVE_BATCH = 512
+TOKENS_PER_STEP = TARGET_EFFECTIVE_BATCH * SEQ_LEN  # 1,048,576
 
 
 def _eval_steps_for_tokens(total_tokens):
@@ -113,6 +114,7 @@ shared: true
 logit_biases: false
 init_strategy: "xavier_uniform"
 gradient_checkpointing: {grad_ckpt}
+use_compile: false
 
 collator_cls: "BasicPretrainCollator"
 train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"

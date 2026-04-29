@@ -1,6 +1,6 @@
 # Auto-generated scaling law config: 0.5M params, 100M tokens
 # Non-embedding params: 491,520  |  FLOPs: 2.95e+14
-# Estimated optimizer steps: 762
+# Estimated optimizer steps: 95
 
 model_cls: "Double_Decoder"
 dim: 64
@@ -11,6 +11,7 @@ shared: true
 logit_biases: false
 init_strategy: "xavier_uniform"
 gradient_checkpointing: false
+use_compile: false
 
 collator_cls: "BasicPretrainCollator"
 train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
@@ -18,7 +19,7 @@ eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
 tokenizer_file: "tokenizer/tokenizer_32k.json"
 
 auto_batch_size: true
-target_effective_batch: 64
+target_effective_batch: 512
 batch_size: 64
 grad_accum_steps: 1
 lr: 0.002
@@ -26,8 +27,8 @@ end_lr_ratio: 0.1
 total_tokens: 100000000
 
 logging_steps: 4
-eval_steps: 38
-save_steps: 152
+eval_steps: 4
+save_steps: 19
 output_dir: "checkpoints/scaling"
 output_file_name: "dd_0.5M_100Mtok"
 

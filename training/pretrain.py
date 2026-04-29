@@ -232,7 +232,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     assert (cfg.grad_accum_steps % world_size == 0) and (cfg.grad_accum_steps >= world_size), \
         "grad_accum_steps must be divisible by and geq than world_size"
 
-    model = torch.compile(model, fullgraph=False, dynamic=False)
+    if cfg.use_compile:
+        model = torch.compile(model, fullgraph=False, dynamic=False)
 
     # ── Data loading ─────────────────────────────────────────────────────
     use_streaming = cfg.total_tokens > 0

@@ -45,8 +45,13 @@ git checkout ben
 conda create -n dd python=3.11 -y
 conda activate dd
 
-# Copy the env-var template and edit DATA_DIR / CKPT_DIR / WANDB_API_KEY to match your cluster.
-cp slurm.env.example slurm.env ${EDITOR:-nano} slurm.env
+# Copy the env-var template, then drop your real wandb key into it (no editor needed).
+cp slurm.env.example slurm.env
+sed -i 's|WANDB_API_KEY="REPLACE_ME"|WANDB_API_KEY="paste-your-key-here"|' slurm.env
+
+# Optional: override storage paths if the defaults ($SCRATCH/dd/...) aren't right.
+# sed -i 's|^export DATA_DIR=.*|export DATA_DIR="/your/scratch/dd/data/Pretrain"|' slurm.env
+# sed -i 's|^export CKPT_DIR=.*|export CKPT_DIR="/your/scratch/dd/checkpoints"|' slurm.env
 ```
 
 Every subsequent shell session, before submitting jobs:

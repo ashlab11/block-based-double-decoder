@@ -31,6 +31,9 @@ from training.api import train
 CONFIG_DIR = PROJECT_ROOT / "configs" / "runs" / "scaling"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "scaling"
 
+# μP base width: HPs tuned at this width transfer to all larger widths
+MUP_BASE_DIM = 64
+
 
 # ── Generate configs ────────────────────────────────────────────────────────
 
@@ -49,6 +52,7 @@ logit_biases: false
 init_strategy: "xavier_uniform"
 gradient_checkpointing: {grad_ckpt}
 use_compile: false
+mup_base_dim: {mup_base_dim}
 
 collator_cls: "BasicPretrainCollator"
 train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
@@ -78,12 +82,13 @@ wandb_entity: "block-based-double-decoders"
 def cmd_generate(args):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     count = 0
+    # μP: use a fixed base LR tuned at the smallest width
+    mup_base_lr = lr_for_dim(MUP_BASE_DIM)
 
     for plabel in PARAM_LABELS:
         arch = ARCHITECTURES[plabel]
         dim, enc, dec = arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"]
         ne = non_emb_params(dim, enc, dec)
-        lr = lr_for_dim(dim)
         # Enable gradient checkpointing for larger models to save memory
         grad_ckpt = "true" if dim >= 256 else "false"
 
@@ -100,7 +105,8 @@ def cmd_generate(args):
                 seq_len=SEQ_LEN,
                 grad_ckpt=grad_ckpt,
                 target_eff_batch=TARGET_EFFECTIVE_BATCH,
-                lr=lr, tokens=tokens,
+                lr=mup_base_lr, tokens=tokens,
+                mup_base_dim=MUP_BASE_DIM,
                 eval_steps=eval_steps_for_tokens(tokens),
                 save_steps=save_steps_for_tokens(tokens),
                 name=name,
@@ -126,13 +132,16 @@ def cmd_generate(args):
             row += f"{steps:>10,}"
         print(row)
 
-    print(f"\nArchitectures:")
+    print(f"\nμP: base_dim={MUP_BASE_DIM}, base_lr={mup_base_lr}")
+    print(f"  Hidden LR is auto-scaled by base_dim/dim in the optimizer.\n")
+    print(f"Architectures:")
     for plabel in PARAM_LABELS:
         arch = ARCHITECTURES[plabel]
         ne = non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
+        hidden_lr = mup_base_lr * MUP_BASE_DIM / arch["dim"]
         print(f"  {plabel:>5}: dim={arch['dim']:>3}, enc={arch['num_encoder_layers']:>2}, "
               f"dec={arch['num_decoder_layers']:>2}, "
-              f"non_emb={ne:>10,}, lr={lr_for_dim(arch['dim']):.1e}")
+              f"non_emb={ne:>10,}, hidden_lr={hidden_lr:.1e}")
 
 
 # ── Run experiments ─────────────────────────────────────────────────────────
@@ -164,15 +173,15 @@ def cmd_run(args):
         tokens = TOKEN_VALUES[tlabel]
 
         if args.dry_run:
-            print(f"[{i+1}/{total}] DRY RUN: train(params={params}, tokens={tokens})")
+            print(f"[{i+1}/{total}] DRY RUN: train(params={params}, tokens={tokens}, mup_base_dim={MUP_BASE_DIM})")
             continue
 
         print(f"\n{'='*60}")
-        print(f"[{i+1}/{total}] {name}")
+        print(f"[{i+1}/{total}] {name} (μP base_dim={MUP_BASE_DIM})")
         print(f"{'='*60}")
 
         try:
-            train(params=params, tokens=tokens)
+            train(params=params, tokens=tokens, mup_base_dim=MUP_BASE_DIM)
         except RuntimeError as e:
             print(f"FAILED: {name} ({e})")
             failed.append(name)

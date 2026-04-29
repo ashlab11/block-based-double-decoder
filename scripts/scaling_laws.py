@@ -14,91 +14,25 @@ Usage:
 
 import argparse
 import json
-import math
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from configs.scaling import (
+    ARCHITECTURES, PARAM_LABELS, PARAM_VALUES, TOKEN_LABELS, TOKEN_VALUES,
+    SEQ_LEN, TARGET_EFFECTIVE_BATCH, TOKENS_PER_STEP,
+    non_emb_params, compute_flops, lr_for_dim,
+    run_name_from_labels, eval_steps_for_tokens, save_steps_for_tokens,
+)
+from training.api import train
+
 CONFIG_DIR = PROJECT_ROOT / "configs" / "runs" / "scaling"
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "scaling"
 
-# ── Experiment grid ─────────────────────────────────────────────────────────
-
-PARAM_LABELS = ["0.5M", "2.5M", "5M", "15M", "30M"]
-TOKEN_LABELS = ["10M", "50M", "100M", "300M", "600M"]
-
-PARAM_VALUES = {
-    "0.5M":  500_000,
-    "2.5M":  2_500_000,
-    "5M":    5_000_000,
-    "15M":   15_000_000,
-    "30M":   30_000_000,
-}
-
-TOKEN_VALUES = {
-    "10M":   10_000_000,
-    "50M":   50_000_000,
-    "100M":  100_000_000,
-    "300M":  300_000_000,
-    "600M":  600_000_000,
-}
-
-# ── Architecture configs ────────────────────────────────────────────────────
-# Non-embedding params ≈ (enc + dec) * 12 * dim²
-# dim must be a multiple of 64 (num_heads = dim // 64)
-# Encoder:decoder layer ratio ≈ 2:1
-
-ARCHITECTURES = {
-    #             dim   enc  dec   actual_non_emb_params
-    "0.5M":  dict(dim=64,  num_encoder_layers=7,  num_decoder_layers=3),   # 491,520
-    "2.5M":  dict(dim=128, num_encoder_layers=9,  num_decoder_layers=4),   # 2,555,904
-    "5M":    dict(dim=192, num_encoder_layers=8,  num_decoder_layers=4),   # 5,308,416
-    "15M":   dict(dim=256, num_encoder_layers=13, num_decoder_layers=6),   # 14,942,208
-    "30M":   dict(dim=384, num_encoder_layers=12, num_decoder_layers=5),   # 30,081,024
-}
-
-
-def _non_emb_params(dim, enc, dec):
-    """Compute non-embedding parameter count (approximate, ignoring norms)."""
-    return (enc + dec) * 12 * dim * dim
-
-
-def _compute_flops(non_emb_params, tokens):
-    """Training FLOPs ≈ 6 * N * T (forward + backward)."""
-    return 6 * non_emb_params * tokens
-
-
-def _run_name(plabel, tlabel):
-    return f"dd_{plabel}_{tlabel}tok"
-
-
-def _lr_for_dim(dim):
-    """Scale LR with model width: lr = 2e-3 * sqrt(64/dim).
-    Matches existing 50M config (dim=512, lr=6e-4) roughly."""
-    return round(0.002 * (64 / dim) ** 0.5, 6)
-
 
 # ── Generate configs ────────────────────────────────────────────────────────
-
-SEQ_LEN = 2048
-# Large batch to saturate GPU — small models waste cycles on kernel launch overhead
-TARGET_EFFECTIVE_BATCH = 512
-TOKENS_PER_STEP = TARGET_EFFECTIVE_BATCH * SEQ_LEN  # 1,048,576
-
-
-def _eval_steps_for_tokens(total_tokens):
-    """~20 eval points per run."""
-    est_steps = total_tokens // TOKENS_PER_STEP
-    return max(4, est_steps // 20)
-
-
-def _save_steps_for_tokens(total_tokens):
-    """~5 checkpoints per run."""
-    est_steps = total_tokens // TOKENS_PER_STEP
-    return max(4, est_steps // 5)
-
 
 CONFIG_TEMPLATE = """\
 # Auto-generated scaling law config: {plabel} params, {tlabel} tokens
@@ -148,27 +82,27 @@ def cmd_generate(args):
     for plabel in PARAM_LABELS:
         arch = ARCHITECTURES[plabel]
         dim, enc, dec = arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"]
-        non_emb = _non_emb_params(dim, enc, dec)
-        lr = _lr_for_dim(dim)
+        ne = non_emb_params(dim, enc, dec)
+        lr = lr_for_dim(dim)
         # Enable gradient checkpointing for larger models to save memory
         grad_ckpt = "true" if dim >= 256 else "false"
 
         for tlabel in TOKEN_LABELS:
             tokens = TOKEN_VALUES[tlabel]
-            name = _run_name(plabel, tlabel)
+            name = run_name_from_labels(plabel, tlabel)
             est_steps = tokens // TOKENS_PER_STEP
-            flops = _compute_flops(non_emb, tokens)
+            flops = compute_flops(ne, tokens)
 
             config_text = CONFIG_TEMPLATE.format(
                 plabel=plabel, tlabel=tlabel,
-                non_emb=non_emb, flops=flops, est_steps=est_steps,
+                non_emb=ne, flops=flops, est_steps=est_steps,
                 dim=dim, enc=enc, dec=dec,
                 seq_len=SEQ_LEN,
                 grad_ckpt=grad_ckpt,
                 target_eff_batch=TARGET_EFFECTIVE_BATCH,
                 lr=lr, tokens=tokens,
-                eval_steps=_eval_steps_for_tokens(tokens),
-                save_steps=_save_steps_for_tokens(tokens),
+                eval_steps=eval_steps_for_tokens(tokens),
+                save_steps=save_steps_for_tokens(tokens),
                 name=name,
             )
 
@@ -184,7 +118,7 @@ def cmd_generate(args):
     print("-" * len(header))
     for plabel in PARAM_LABELS:
         arch = ARCHITECTURES[plabel]
-        non_emb = _non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
+        ne = non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
         row = f"{plabel:<10}"
         for tlabel in TOKEN_LABELS:
             tokens = TOKEN_VALUES[tlabel]
@@ -195,32 +129,30 @@ def cmd_generate(args):
     print(f"\nArchitectures:")
     for plabel in PARAM_LABELS:
         arch = ARCHITECTURES[plabel]
-        non_emb = _non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
+        ne = non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
         print(f"  {plabel:>5}: dim={arch['dim']:>3}, enc={arch['num_encoder_layers']:>2}, "
               f"dec={arch['num_decoder_layers']:>2}, "
-              f"non_emb={non_emb:>10,}, lr={_lr_for_dim(arch['dim']):.1e}")
+              f"non_emb={ne:>10,}, lr={lr_for_dim(arch['dim']):.1e}")
 
 
 # ── Run experiments ─────────────────────────────────────────────────────────
 
 def cmd_run(args):
-    configs = sorted(CONFIG_DIR.glob("dd_*.yaml"))
-    if not configs:
-        print("No configs found. Run 'python scripts/scaling_laws.py generate' first.")
-        sys.exit(1)
+    pairs = []
+    for plabel in PARAM_LABELS:
+        if args.only_params and plabel not in args.only_params:
+            continue
+        for tlabel in TOKEN_LABELS:
+            if args.only_tokens and tlabel not in args.only_tokens:
+                continue
+            pairs.append((plabel, tlabel))
 
-    # Filter to specific runs if requested
-    if args.only_params:
-        configs = [c for c in configs if any(f"dd_{p}_" in c.name for p in args.only_params)]
-    if args.only_tokens:
-        configs = [c for c in configs if any(f"_{t}tok" in c.name for t in args.only_tokens)]
-
-    total = len(configs)
+    total = len(pairs)
     skipped = 0
     failed = []
 
-    for i, cfg_path in enumerate(configs):
-        name = cfg_path.stem
+    for i, (plabel, tlabel) in enumerate(pairs):
+        name = run_name_from_labels(plabel, tlabel)
         results_file = CHECKPOINT_DIR / f"{name}_results.json"
 
         if results_file.exists() and not args.force:
@@ -228,31 +160,21 @@ def cmd_run(args):
             skipped += 1
             continue
 
-        # Config path relative to configs/ dir (without .yaml)
-        rel = cfg_path.relative_to(PROJECT_ROOT / "configs")
-        config_name = str(rel).replace(".yaml", "")
-
-        cmd = [
-            "torchrun", "--nproc_per_node=1",
-            "training/pretrain.py",
-            f"--config-name={config_name}",
-        ]
+        params = PARAM_VALUES[plabel]
+        tokens = TOKEN_VALUES[tlabel]
 
         if args.dry_run:
-            print(f"[{i+1}/{total}] DRY RUN: {' '.join(cmd)}")
+            print(f"[{i+1}/{total}] DRY RUN: train(params={params}, tokens={tokens})")
             continue
 
         print(f"\n{'='*60}")
         print(f"[{i+1}/{total}] {name}")
         print(f"{'='*60}")
 
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(PROJECT_ROOT) + ":" + env.get("PYTHONPATH", "")
-
-        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
-
-        if result.returncode != 0:
-            print(f"FAILED: {name} (exit code {result.returncode})")
+        try:
+            train(params=params, tokens=tokens)
+        except RuntimeError as e:
+            print(f"FAILED: {name} ({e})")
             failed.append(name)
 
     # Summary
@@ -276,19 +198,24 @@ def cmd_collect(args):
         dim = arch["dim"]
         enc = arch["num_encoder_layers"]
         dec = arch["num_decoder_layers"]
-        non_emb = _non_emb_params(dim, enc, dec)
+        ne = non_emb_params(dim, enc, dec)
 
         for tlabel in TOKEN_LABELS:
             tokens = TOKEN_VALUES[tlabel]
-            name = _run_name(plabel, tlabel)
-            flops = _compute_flops(non_emb, tokens)
+            name = run_name_from_labels(plabel, tlabel)
+            flops = compute_flops(ne, tokens)
+
+            # Check both grid-style and raw-value-style result filenames
             results_file = CHECKPOINT_DIR / f"{name}_results.json"
+            if not results_file.exists():
+                raw_name = f"dd_{PARAM_VALUES[plabel]}p_{tokens}tok"
+                results_file = CHECKPOINT_DIR / f"{raw_name}_results.json"
 
             if not results_file.exists():
                 missing.append(name)
                 rows.append(dict(
                     name=name, plabel=plabel, tlabel=tlabel,
-                    non_emb_params=non_emb, tokens=tokens, flops=flops,
+                    non_emb_params=ne, tokens=tokens, flops=flops,
                     dim=dim, enc=enc, dec=dec,
                     loss=None, ppl=None, steps=None,
                     total_params=None, time_sec=None,
@@ -300,7 +227,7 @@ def cmd_collect(args):
 
             rows.append(dict(
                 name=name, plabel=plabel, tlabel=tlabel,
-                non_emb_params=non_emb, tokens=tokens, flops=flops,
+                non_emb_params=ne, tokens=tokens, flops=flops,
                 dim=dim, enc=enc, dec=dec,
                 loss=data["final_eval_loss"],
                 ppl=data["final_eval_ppl"],
@@ -312,12 +239,12 @@ def cmd_collect(args):
             if args.curves:
                 for step, loss in data.get("train_curve", []):
                     curves.append(dict(
-                        name=name, non_emb_params=non_emb,
+                        name=name, non_emb_params=ne,
                         tokens=tokens, step=step, train_loss=loss,
                     ))
                 for step, loss in data.get("eval_curve", []):
                     curves.append(dict(
-                        name=name, non_emb_params=non_emb,
+                        name=name, non_emb_params=ne,
                         tokens=tokens, step=step, eval_loss=loss,
                     ))
 
@@ -363,7 +290,7 @@ def cmd_collect(args):
     for plabel in PARAM_LABELS:
         row_str = f"{plabel:<10}"
         for tlabel in TOKEN_LABELS:
-            name = _run_name(plabel, tlabel)
+            name = run_name_from_labels(plabel, tlabel)
             match = [r for r in rows if r["name"] == name]
             if match and match[0]["loss"] is not None:
                 row_str += f"{match[0]['loss']:>12.4f}"
@@ -380,11 +307,11 @@ def cmd_collect(args):
 
     for plabel in PARAM_LABELS:
         arch = ARCHITECTURES[plabel]
-        non_emb = _non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
+        ne = non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
         row_str = f"{plabel:<10}"
         for tlabel in TOKEN_LABELS:
             tokens = TOKEN_VALUES[tlabel]
-            flops = _compute_flops(non_emb, tokens)
+            flops = compute_flops(ne, tokens)
             row_str += f"{flops:>12.2e}"
         print(row_str)
 
@@ -398,7 +325,6 @@ def cmd_collect(args):
         by_run = defaultdict(list)
         for c in curves:
             key = c["name"]
-            loss_type = "train" if "train_loss" in c and c.get("train_loss") is not None else "eval"
             by_run[key].append(c)
 
         for name_key in by_run:

@@ -1,6 +1,6 @@
 # block-based-double-decoder
 
-Every script under `scripts/` is able to be ran as `bash <script>` for RunPod and as `sbatch <script>` for SLURM. 
+Every script under `scripts/` is able to be ran as `bash <script>` for RunPod and as `sbatch <script>` for SLURM.
 
 ---
 
@@ -39,10 +39,7 @@ One-time setup on the cluster (login node):
 ```bash
 git clone https://github.com/ashlab11/block-based-double-decoder.git
 cd block-based-double-decoder
-git checkout ben
 
-# Find and load your cluster's conda module (name varies by cluster — list
-# candidates first, then load whichever matches yours).
 module avail 2>&1 | grep -iE "conda|anaconda|miniconda|python"
 module load anaconda3/2023.09-0-aqbc
 conda create -n dd python=3.11 -y
@@ -50,19 +47,11 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate dd
 cp slurm.env.example slurm.env
 
-# Stash your wandb key in ~/.bashrc — keeps the secret out of the repo and out
-# of slurm.env, and sbatch's default --export=ALL propagates it to compute
-# nodes. (scripts/1_setup.sh:59 explicitly recommends this path.) Then strip
-# the placeholder from slurm.env so sourcing it later won't override the real
-# key with REPLACE_ME.
-echo 'export WANDB_API_KEY=paste-your-key-here' >> ~/.bashrc
+
+echo 'export WANDB_API_KEY=paste-your-key-here' >> ~/.bashrc # <-- replace paste-your-key-here
 chmod 600 ~/.bashrc
 source ~/.bashrc
 sed -i '/^export WANDB_API_KEY=/d' slurm.env
-
-# Optional: override storage paths if the defaults ($SCRATCH/dd/...) aren't right.
-# sed -i 's|^export DATA_DIR=.*|export DATA_DIR="/your/scratch/dd/data/Pretrain"|' slurm.env
-# sed -i 's|^export CKPT_DIR=.*|export CKPT_DIR="/your/scratch/dd/checkpoints"|' slurm.env
 ```
 
 Every subsequent shell session, before submitting jobs:
@@ -94,7 +83,7 @@ sbatch scripts/5_train.sh --resume checkpoints/dd_50m_1btok_<step>.pt
 
 ---
 
-## Training the model in code: `train()` at arbitrary (params, tokens) 
+## Training the model in code: `train()` at arbitrary (params, tokens)
 
 The Python entry point for one-off training runs is `training.api.train`:
 
@@ -121,7 +110,7 @@ Maximal Update Parameterization (μP) lets you **tune learning rate and other hy
 
 - **Embedding output and unembedding (logit projection) are scaled by `base_dim/dim`** at every forward pass (`models/double_decoder.py:67-93`). This keeps the magnitude of activations entering the residual stream invariant in the width.
 - **Attention and MLP hidden weights get a separate, smaller learning rate of `base_lr * (base_dim/dim)`** via a dedicated AdamW param group (`training/pretrain.py:331-354`). Embedding/unembedding/scalar params stay at the base LR.
-- **`base_lr` itself is set by `lr_for_dim(base_dim)`** (`configs/scaling.py:lr_for_dim`)
+- **`base_lr` itself is set by `lr_for_dim(base_dim)`** (`configs/scaling.py:lr_for_dim`) this is not tuned yet.
 
 If you set `mup_base_dim=0` (the default), μP is disabled and the script falls back to a width-aware heuristic `lr = 2e-3 * sqrt(64/dim)`
 

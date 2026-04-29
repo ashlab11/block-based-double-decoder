@@ -57,6 +57,7 @@ def train(params, tokens, mup_base_dim=0, lr=None, run_name=None):
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT) + ":" + env.get("PYTHONPATH", "")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     result = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env)
     if result.returncode != 0:

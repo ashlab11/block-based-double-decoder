@@ -1,4 +1,6 @@
 import os
+# Must be set before any CUDA allocation to avoid fragmentation OOMs
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import math
 from datasets import load_dataset
 from datasets.distributed import split_dataset_by_node
@@ -311,7 +313,6 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     )
 
     torch.backends.cudnn.benchmark = True
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.backends.cuda.enable_flash_sdp(True)
 
     # ── Optimizer & scheduler ────────────────────────────────────────────

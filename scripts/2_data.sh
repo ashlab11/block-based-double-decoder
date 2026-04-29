@@ -14,7 +14,7 @@ set -euo pipefail
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # HuggingFace dataset repo for pre-packed data
-HF_DATASET_REPO="ashlab11/dd-packed-data"
+HF_DATASET_REPO="bpbradle/slimpajama-6b-packed"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Step 2: Data Pipeline"
@@ -35,21 +35,13 @@ else
 
     mkdir -p data/Pretrain tokenizer
 
-    if huggingface-cli download "${HF_DATASET_REPO}" \
-        slimpajama_6b_packed.jsonl \
-        slimpajama_6b_eval_packed.jsonl \
-        tokenizer_32k.json \
+    if hf download "${HF_DATASET_REPO}" \
+        data/Pretrain/slimpajama_6b_packed.jsonl \
+        data/Pretrain/slimpajama_6b_eval_packed.jsonl \
+        tokenizer/tokenizer_32k.json \
         --repo-type dataset \
-        --local-dir /tmp/dd-packed-download \
-        --quiet 2>/dev/null; then
+        --local-dir . 2>/dev/null; then
 
-        # Move files to their expected locations
-        mv -n /tmp/dd-packed-download/slimpajama_6b_packed.jsonl data/Pretrain/ 2>/dev/null || true
-        mv -n /tmp/dd-packed-download/slimpajama_6b_eval_packed.jsonl data/Pretrain/ 2>/dev/null || true
-        mv -n /tmp/dd-packed-download/tokenizer_32k.json tokenizer/ 2>/dev/null || true
-        rm -rf /tmp/dd-packed-download
-
-        # Verify all files arrived
         if [ -f "data/Pretrain/slimpajama_6b_packed.jsonl" ] && \
            [ -f "data/Pretrain/slimpajama_6b_eval_packed.jsonl" ] && \
            [ -f "tokenizer/tokenizer_32k.json" ]; then

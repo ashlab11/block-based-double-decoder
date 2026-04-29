@@ -41,13 +41,24 @@ git clone https://github.com/ashlab11/block-based-double-decoder.git
 cd block-based-double-decoder
 git checkout ben
 
-# Create and activate a Python env
+# Find and load your cluster's conda module (name varies by cluster — list
+# candidates first, then load whichever matches yours).
+module avail 2>&1 | grep -iE "conda|anaconda|miniconda|python"
+module load anaconda3/2023.09-0-aqbc
 conda create -n dd python=3.11 -y
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate dd
-
-# Copy the env-var template, then drop your real wandb key into it (no editor needed).
 cp slurm.env.example slurm.env
-sed -i 's|WANDB_API_KEY="REPLACE_ME"|WANDB_API_KEY="paste-your-key-here"|' slurm.env
+
+# Stash your wandb key in ~/.bashrc — keeps the secret out of the repo and out
+# of slurm.env, and sbatch's default --export=ALL propagates it to compute
+# nodes. (scripts/1_setup.sh:59 explicitly recommends this path.) Then strip
+# the placeholder from slurm.env so sourcing it later won't override the real
+# key with REPLACE_ME.
+echo 'export WANDB_API_KEY=paste-your-key-here' >> ~/.bashrc
+chmod 600 ~/.bashrc
+source ~/.bashrc
+sed -i '/^export WANDB_API_KEY=/d' slurm.env
 
 # Optional: override storage paths if the defaults ($SCRATCH/dd/...) aren't right.
 # sed -i 's|^export DATA_DIR=.*|export DATA_DIR="/your/scratch/dd/data/Pretrain"|' slurm.env
@@ -57,6 +68,7 @@ sed -i 's|WANDB_API_KEY="REPLACE_ME"|WANDB_API_KEY="paste-your-key-here"|' slurm
 Every subsequent shell session, before submitting jobs:
 
 ```bash
+module load anaconda3/2023.09-0-aqbc
 conda activate dd
 source slurm.env
 ```

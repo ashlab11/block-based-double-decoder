@@ -97,24 +97,29 @@ def pack(ds, tokenizer, ctx_len, writer, buffer_size=10000):
     return num_sequences
 
 
+def _streaming_tokenize(in_path, tokenizer, batch_size=5000):
+    """Stream raw JSONL, tokenize in large batches (uses fast tokenizer parallelism)."""
+    import json as _json
+    batch_texts = []
+    with open(in_path) as f:
+        for line in f:
+            batch_texts.append(_json.loads(line)["text"])
+            if len(batch_texts) >= batch_size:
+                encoded = tokenizer(batch_texts)
+                for ids in encoded["input_ids"]:
+                    yield {"input_ids": ids}
+                batch_texts.clear()
+    if batch_texts:
+        encoded = tokenizer(batch_texts)
+        for ids in encoded["input_ids"]:
+            yield {"input_ids": ids}
+
+
 def build_packed_dataset(in_path, out_path, tokenizer, ctx_len):
     print(f"Packing {in_path} -> {out_path} (seq_len={ctx_len})")
+    print(f"  Streaming tokenization (batch_size=5000, no disk cache)...")
 
-    num_cpus = os.cpu_count() or 1
-    num_proc = max(1, min(num_cpus, 16))  # cap at 16 to avoid memory issues
-
-    # Load into memory for parallel tokenization (much faster than streaming)
-    print(f"  Loading and tokenizing with {num_proc} workers...")
-    tok_start = time.time()
-    ds = load_dataset("json", data_files=in_path, split="train")
-    ds = ds.map(
-        lambda x: tokenizer(x["text"]),
-        batched=True,
-        batch_size=5000,
-        num_proc=num_proc,
-        remove_columns=['text'],
-    )
-    print(f"  Tokenized {len(ds):,} documents in {_fmt_time(time.time() - tok_start)}")
+    ds = _streaming_tokenize(in_path, tokenizer, batch_size=5000)
 
     with open(out_path, "w") as f:
         return pack(ds, tokenizer, ctx_len, f)

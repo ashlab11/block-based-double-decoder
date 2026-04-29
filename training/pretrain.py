@@ -207,7 +207,33 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
 
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
-        print(f"Model parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
+        emb_params = model.embedding.weight.numel()
+        non_emb_params = total_params - emb_params
+        print(f"Model parameters: {total_params:,} ({total_params / 1e6:.1f}M), "
+              f"non-embedding: {non_emb_params:,} ({non_emb_params / 1e6:.1f}M)")
+
+    # Compute GPU peak FLOPS for MFU calculation
+    _gpu_peak_flops = None
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        # BF16 peak FLOPS: SM count × clock × FMA ops per SM per cycle × 2
+        # Use a lookup for known GPUs, fallback to conservative estimate
+        gpu_name = props.name.lower()
+        if 'h200' in gpu_name or 'h100' in gpu_name:
+            _gpu_peak_flops = 1979e12  # H100/H200 BF16 peak
+        elif 'a100' in gpu_name:
+            _gpu_peak_flops = 624e12 if props.total_memory > 50e9 else 312e12
+        elif 'l40' in gpu_name:
+            _gpu_peak_flops = 362e12
+        elif 'a6000' in gpu_name or '3090' in gpu_name:
+            _gpu_peak_flops = 142e12
+        elif 'b200' in gpu_name:
+            _gpu_peak_flops = 4500e12
+        else:
+            # Conservative fallback: assume 200 TFLOPS BF16
+            _gpu_peak_flops = 200e12
+        if rank == 0:
+            print(f"GPU: {props.name}, assumed BF16 peak: {_gpu_peak_flops/1e12:.0f} TFLOPS")
 
     # ── Auto batch size ─────────────────────────────────────────────────
     if cfg.auto_batch_size:
@@ -400,6 +426,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     # - Otherwise: use num_accumulations (token budget determines stop)
     display_max = max_steps if max_steps != float('inf') else num_accumulations
     tokens_per_step = cfg.batch_size * cfg.grad_accum_steps * cfg.seq_len * world_size
+    # Non-embedding params for MFU (need this on all ranks)
+    _non_emb = sum(p.numel() for p in _get_eager_model(model).parameters()) - _get_eager_model(model).embedding.weight.numel()
     step_start_time = time.time()
     training_start_time = time.time()
     tokens_seen = start_step * tokens_per_step
@@ -479,6 +507,7 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                     "throughput/tokens_per_sec_avg": avg_toks_per_sec,
                     "throughput/step_time_ms": step_elapsed * 1000,
                     "throughput/samples_per_sec": cfg.batch_size * cfg.grad_accum_steps / max(step_elapsed, 1e-6),
+                    "throughput/mfu_pct": (6 * _non_emb * tokens_per_step) / (max(step_elapsed, 1e-6) * _gpu_peak_flops) * 100 if _gpu_peak_flops else 0,
                     # Progress
                     "progress/tokens_seen": tokens_seen,
                     "progress/tokens_seen_B": tokens_seen / 1e9,
@@ -551,9 +580,17 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
                     elif s < 3600: return f"{s/60:.1f}m"
                     else: return f"{s/3600:.1f}h"
 
+                # MFU: fraction of theoretical GPU peak achieved
+                # FLOPs per token ≈ 6 * non_emb_params (fwd + bwd)
+                mfu = 0.0
+                if _gpu_peak_flops and step_elapsed > 0:
+                    flops_per_step = 6 * _non_emb * tokens_per_step
+                    mfu = flops_per_step / (step_elapsed * _gpu_peak_flops) * 100
+
                 print(f"  [{pct:5.1f}%] Step {step:>6,}/{display_max:,} | "
                       f"loss {avg_step_loss:.4f} (ema {loss_ema:.4f}) | grad {grad.item():.4f} | "
                       f"lr {current_lr:.2e} | {avg_toks_per_sec:,.0f} tok/s | "
+                      f"MFU {mfu:.1f}% | "
                       f"elapsed {_fmt(elapsed_total)} | ETA {_fmt(eta_sec)}")
 
             step_start_time = time.time()

@@ -27,12 +27,16 @@ class StandardEncDec(nn.Module):
         label_pad_token_id: int = -100,
         init_strategy: str = "xavier_uniform",
         gradient_checkpointing: bool = False,
+        mup_base_dim: int = 0,
         **kwargs  # absorb DD-specific args like shared, logit_biases
     ):
         super(StandardEncDec, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
         self.seq_len = seq_len
+        self.mup_base_dim = mup_base_dim
+        mup = mup_base_dim > 0
+        self.mup_mult = mup_base_dim / dim if mup else 1.0
 
         # Shared token embeddings
         self.embedding = nn.Embedding(vocab_size, dim)
@@ -40,14 +44,14 @@ class StandardEncDec(nn.Module):
         # Encoder (standard causal self-attention)
         self.encoder_layers = nn.ModuleList([
             CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
-                        use_checkpoint=gradient_checkpointing)
+                        use_checkpoint=gradient_checkpointing, mup=mup)
             for _ in range(num_encoder_layers)
         ])
 
         # Decoder (standard self-attn + cross-attn + MLP)
         self.decoder_layers = nn.ModuleList([
             StandardDecoderLayer(dim=dim, num_heads=num_heads, seq_len=seq_len,
-                                mlp_dim=mlp_dim, use_checkpoint=gradient_checkpointing)
+                                mlp_dim=mlp_dim, use_checkpoint=gradient_checkpointing, mup=mup)
             for _ in range(num_decoder_layers)
         ])
 
@@ -62,19 +66,19 @@ class StandardEncDec(nn.Module):
         initialize_model(self, init_strategy)
 
     def encode(self, input_ids):
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids) * self.mup_mult
         for layer in self.encoder_layers:
             x = layer(x)
         x = self.encoder_norm(x)
         return x
 
     def decode(self, input_ids, encoder_output, block_masks=None, decoder_input_positions=None):
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids) * self.mup_mult
         for layer in self.decoder_layers:
             x = layer(x, encoder_output, block_masks,
                       decoder_input_positions=decoder_input_positions)
         x = self.output_norm(x)
-        logits = self.output_projection(x)
+        logits = self.output_projection(x) * self.mup_mult
         return logits
 
     def forward(

@@ -65,6 +65,9 @@ class TrainingConfig:
     auto_batch_size: bool = False
     target_effective_batch: int = 256  # target sequences per optimizer step
 
+    # ── μP (Maximal Update Parameterization) ──────────────────────────────
+    mup_base_dim: int = 0  # 0 = disabled; >0 = base width for μP scaling
+
     # ── Sink tokens (unused for now, but referenced in build_model) ──────
     self_sinks: int = 0
     cross_sinks: int = 0

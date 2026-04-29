@@ -14,18 +14,22 @@ class DecoderOnlyModel(nn.Module):
         seq_len: int = 1536,
         mlp_dim: int = None,
         label_pad_token_id: int = -100,
-        init_strategy = "xavier_uniform", 
+        init_strategy = "xavier_uniform",
+        mup_base_dim: int = 0,
         **kwargs
     ):
         super(DecoderOnlyModel, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
-        # Token embeddings  
+        self.mup_base_dim = mup_base_dim
+        mup = mup_base_dim > 0
+        self.mup_mult = mup_base_dim / dim if mup else 1.0
+        # Token embeddings
         self.embedding = nn.Embedding(vocab_size, dim)
-        
+
         # Encoder
         self.layers = nn.ModuleList([
-            CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len)
+            CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len, mup=mup)
             for _ in range(num_layers)
         ])
         
@@ -43,14 +47,15 @@ class DecoderOnlyModel(nn.Module):
         self,
         input_ids,
         labels = None):
-        # Encode
-        x = self.embedding(input_ids)
-    
+        # Encode (μP: scale embedding output by base_dim/dim)
+        x = self.embedding(input_ids) * self.mup_mult
+
         for layer in self.layers:
             x = layer(x)
-                
+
+        # Project to vocabulary (μP: scale logits by base_dim/dim)
         x = self.output_norm(x)
-        logits = self.output_projection(x)
+        logits = self.output_projection(x) * self.mup_mult
         
         # Computing loss here
         if labels is not None:

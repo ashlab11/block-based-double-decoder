@@ -20,11 +20,15 @@ class Double_Decoder(nn.Module):
         logit_biases = False,
         init_strategy = "xavier_uniform",
         gradient_checkpointing = False,
+        mup_base_dim: int = 0,
         **kwargs
     ):
         super(Double_Decoder, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
+        self.mup_base_dim = mup_base_dim
+        mup = mup_base_dim > 0
+        self.mup_mult = mup_base_dim / dim if mup else 1.0
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, dim)
         self.seq_len = seq_len
@@ -32,7 +36,7 @@ class Double_Decoder(nn.Module):
         # Encoder
         self.encoder_layers = nn.ModuleList([
             CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
-                        use_checkpoint=gradient_checkpointing)
+                        use_checkpoint=gradient_checkpointing, mup=mup)
             for _ in range(num_encoder_layers)
         ])
 
@@ -40,7 +44,7 @@ class Double_Decoder(nn.Module):
         self.decoder_layers = nn.ModuleList([
             ComboDecoderLayer(dim=dim, num_heads=num_heads, seq_len=seq_len, mlp_dim=mlp_dim,
                               shared=shared, logit_biases=logit_biases,
-                              use_checkpoint=gradient_checkpointing)
+                              use_checkpoint=gradient_checkpointing, mup=mup)
             for _ in range(num_decoder_layers)
         ])
         
@@ -58,9 +62,9 @@ class Double_Decoder(nn.Module):
         initialize_model(self, init_strategy)
     
     #Simple causal attention over the encoder
-    def encode(self, input_ids):            
+    def encode(self, input_ids):
         # Embed input tokens
-        x = self.embedding(input_ids)
+        x = self.embedding(input_ids) * self.mup_mult
         
         # Apply encoder layers
         for layer in self.encoder_layers:
@@ -71,10 +75,10 @@ class Double_Decoder(nn.Module):
     
     #More complicated, uses combo attention in combination with the results of encode
     def decode(self, input_ids, encoder_output, block_masks = None, decoder_input_positions=None):
-            
-        # Embed input tokens
-        x = self.embedding(input_ids)
-        
+
+        # Embed input tokens (μP: scale embedding output by base_dim/dim)
+        x = self.embedding(input_ids) * self.mup_mult
+
         # Apply decoder layers
         for layer in self.decoder_layers:
             x = layer(
@@ -83,11 +87,11 @@ class Double_Decoder(nn.Module):
                 block_masks,
                 decoder_input_positions=decoder_input_positions
             )
-            
-        # Project to vocabulary
+
+        # Project to vocabulary (μP: scale logits by base_dim/dim)
         x = self.output_norm(x)
-        logits = self.output_projection(x)
-        
+        logits = self.output_projection(x) * self.mup_mult
+
         return logits
     
     #Forward combines encode with decode, but also works for when we are SFTing

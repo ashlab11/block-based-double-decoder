@@ -18,7 +18,7 @@ from configs.scaling import build_scaling_config, run_name_from_values
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def train(params, tokens, mup_base_dim=0, lr=None, run_name=None):
+def train(params, tokens, mup_base_dim=0, lr=None, run_name=None, no_wandb=False):
     """Train a model and return the results dict.
 
     Builds a config for the given (params, tokens) pair via architecture
@@ -31,6 +31,7 @@ def train(params, tokens, mup_base_dim=0, lr=None, run_name=None):
         mup_base_dim: base width for μP scaling (0 = disabled)
         lr: override learning rate (None = auto)
         run_name: override run/output name (None = auto from params/tokens)
+        no_wandb: disable wandb logging for faster runs
 
     Returns:
         dict with final_eval_loss, final_eval_ppl, total_steps, tokens_seen,
@@ -54,6 +55,8 @@ def train(params, tokens, mup_base_dim=0, lr=None, run_name=None):
         cmd.append(f"--lr={lr}")
     if run_name:
         cmd.append(f"--run-name={run_name}")
+    if no_wandb:
+        cmd.append("--no-wandb")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT) + ":" + env.get("PYTHONPATH", "")

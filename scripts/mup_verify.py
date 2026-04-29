@@ -63,6 +63,7 @@ def _run_one(params, lr, tokens, mup_base_dim, mode_tag):
         r = train(
             params=params, tokens=tokens,
             mup_base_dim=mup_base_dim, lr=lr, run_name=name,
+            no_wandb=True,
         )
         return {
             "params": params,

@@ -453,9 +453,9 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     loss_ema_alpha = 0.99
 
     steps_per_accum_per_gpu = cfg.grad_accum_steps // world_size
-    logging_steps = cfg.logging_steps // cfg.grad_accum_steps
-    eval_steps = cfg.eval_steps // cfg.grad_accum_steps
-    save_steps = cfg.save_steps // cfg.grad_accum_steps
+    logging_steps = max(1, cfg.logging_steps // cfg.grad_accum_steps)
+    eval_steps = max(1, cfg.eval_steps // cfg.grad_accum_steps)
+    save_steps = max(1, cfg.save_steps // cfg.grad_accum_steps)
 
     max_steps = cfg.max_steps if cfg.max_steps > 0 else float('inf')
     # display_max is the actual number of steps we'll train for:

@@ -74,16 +74,24 @@ def lr_for_dim(dim):
     return round(0.002 * (64 / dim) ** 0.5, 6)
 
 
-def eval_steps_for_tokens(total_tokens):
-    """~20 eval points per run."""
-    est_steps = total_tokens // TOKENS_PER_STEP
-    return max(4, est_steps // 20)
+def eval_steps_for_tokens(total_tokens, batch_size=64, seq_len=SEQ_LEN):
+    """~20 eval points per run.
+
+    Returns step count in raw-batch units (pretrain.py divides by
+    grad_accum_steps internally to convert to optimizer steps).
+    """
+    batches = total_tokens // (batch_size * seq_len)
+    return max(4, batches // 20)
 
 
-def save_steps_for_tokens(total_tokens):
-    """~5 checkpoints per run."""
-    est_steps = total_tokens // TOKENS_PER_STEP
-    return max(4, est_steps // 5)
+def save_steps_for_tokens(total_tokens, batch_size=64, seq_len=SEQ_LEN):
+    """~5 checkpoints per run.
+
+    Returns step count in raw-batch units (pretrain.py divides by
+    grad_accum_steps internally to convert to optimizer steps).
+    """
+    batches = total_tokens // (batch_size * seq_len)
+    return max(4, batches // 5)
 
 
 # ── Architecture interpolation ─────────────────────────────────────────────
@@ -189,9 +197,9 @@ def build_scaling_config(params, tokens, mup_base_dim=0, lr=None, run_name=None)
         "lr": effective_lr,
         "end_lr_ratio": 0.1,
         "total_tokens": tokens,
-        "logging_steps": 4,
-        "eval_steps": eval_steps_for_tokens(tokens),
-        "save_steps": save_steps_for_tokens(tokens),
+        "logging_steps": 10,
+        "eval_steps": eval_steps_for_tokens(tokens, batch_size=64),
+        "save_steps": save_steps_for_tokens(tokens, batch_size=64),
         "output_dir": "checkpoints/scaling",
         "output_file_name": name,
         "wandb_project": "dd-scaling-laws",

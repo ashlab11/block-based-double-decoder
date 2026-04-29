@@ -31,6 +31,8 @@ def main():
                         help="Override learning rate")
     parser.add_argument("--run-name", type=str, default=None,
                         help="Override run/output name")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Disable wandb logging")
     args = parser.parse_args()
 
     cfg_dict = build_scaling_config(
@@ -39,6 +41,8 @@ def main():
         lr=args.lr,
         run_name=args.run_name,
     )
+    if args.no_wandb:
+        cfg_dict["wandb_project"] = ""
     cfg = build_config_from_dict(cfg_dict)
     pretrain(cfg, verbose=1)
 

@@ -3,6 +3,9 @@
 Usage:
     from training.api import train
     results = train(params=1000000, tokens=40000000)
+
+    # With μP:
+    results = train(params=5000000, tokens=50000000, mup_base_dim=64)
 """
 
 import json
@@ -15,7 +18,7 @@ from configs.scaling import build_scaling_config, run_name_from_values
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def train(params, tokens):
+def train(params, tokens, mup_base_dim=0, lr=None, run_name=None):
     """Train a model and return the results dict.
 
     Builds a config for the given (params, tokens) pair via architecture
@@ -25,6 +28,9 @@ def train(params, tokens):
     Args:
         params: target non-embedding parameter count (int)
         tokens: total training tokens (int)
+        mup_base_dim: base width for μP scaling (0 = disabled)
+        lr: override learning rate (None = auto)
+        run_name: override run/output name (None = auto from params/tokens)
 
     Returns:
         dict with final_eval_loss, final_eval_ppl, total_steps, tokens_seen,
@@ -33,7 +39,7 @@ def train(params, tokens):
     Raises:
         RuntimeError: if the training subprocess exits with a non-zero code.
     """
-    name = run_name_from_values(params, tokens)
+    name = run_name or run_name_from_values(params, tokens)
     results_path = PROJECT_ROOT / "checkpoints" / "scaling" / f"{name}_results.json"
 
     cmd = [
@@ -42,6 +48,12 @@ def train(params, tokens):
         f"--params={params}",
         f"--tokens={tokens}",
     ]
+    if mup_base_dim > 0:
+        cmd.append(f"--mup-base-dim={mup_base_dim}")
+    if lr is not None:
+        cmd.append(f"--lr={lr}")
+    if run_name:
+        cmd.append(f"--run-name={run_name}")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT) + ":" + env.get("PYTHONPATH", "")

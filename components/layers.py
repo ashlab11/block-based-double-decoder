@@ -8,7 +8,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from .attention import SelfAttention, ComboAttention, CrossAttention
 
 class CausalLayer(nn.Module):
-    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, scale = 1, attn_gating = False, use_checkpoint = False):
+    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, scale = 1, attn_gating = False, use_checkpoint = False, mup = False):
         super(CausalLayer, self).__init__()
         self.dim = dim
         self.scale = scale
@@ -16,7 +16,7 @@ class CausalLayer(nn.Module):
         mlp_dim = mlp_dim or 4 * dim
 
         # Self-attention block
-        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, gating = attn_gating)
+        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, gating=attn_gating, mup=mup)
         self.norm1 = nn.RMSNorm(dim)
 
         # MLP block
@@ -48,13 +48,13 @@ class CausalLayer(nn.Module):
 
 class StandardDecoderLayer(nn.Module):
     """Standard transformer decoder layer: self-attn → cross-attn → MLP (sequential)."""
-    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, use_checkpoint=False):
+    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, use_checkpoint=False, mup=False):
         super(StandardDecoderLayer, self).__init__()
         self.use_checkpoint = use_checkpoint
         mlp_dim = mlp_dim or 4 * dim
 
-        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len)
-        self.cross_attn = CrossAttention(dim=dim, num_heads=num_heads, seq_len=seq_len)
+        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, mup=mup)
+        self.cross_attn = CrossAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, mup=mup)
 
         self.norm1 = nn.RMSNorm(dim)
         self.norm2 = nn.RMSNorm(dim)
@@ -95,14 +95,14 @@ class StandardDecoderLayer(nn.Module):
 
 
 class ComboDecoderLayer(nn.Module):
-    def __init__(self, dim, num_heads, seq_len, shared = True, mlp_dim=None, logit_biases = False, use_checkpoint = False):
+    def __init__(self, dim, num_heads, seq_len, shared = True, mlp_dim=None, logit_biases = False, use_checkpoint = False, mup = False):
         super(ComboDecoderLayer, self).__init__()
         self.dim = dim
         self.use_checkpoint = use_checkpoint
         mlp_dim = mlp_dim or 4 * dim
 
         # Self-attention block
-        self.combo_attn = ComboAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, shared=shared, logit_biases=logit_biases)
+        self.combo_attn = ComboAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, shared=shared, logit_biases=logit_biases, mup=mup)
         self.norm1 = nn.RMSNorm(dim)
 
         # MLP block

@@ -140,18 +140,31 @@ def interpolate_architecture(target_params):
     }
 
 
-def build_scaling_config(params, tokens):
+def build_scaling_config(params, tokens, mup_base_dim=0, lr=None, run_name=None):
     """Build a config dict for arbitrary params/tokens, ready for build_config_from_dict.
 
     Args:
         params: target non-embedding parameter count (int)
         tokens: total training tokens (int)
+        mup_base_dim: base width for μP scaling (0 = disabled)
+        lr: override learning rate (None = auto from dim or μP base)
+        run_name: override run name (None = auto from params/tokens)
 
     Returns:
         dict suitable for configs.build_config_from_dict()
     """
     arch = interpolate_architecture(params)
-    name = run_name_from_values(params, tokens)
+    name = run_name or run_name_from_values(params, tokens)
+
+    # LR selection: explicit override > μP base LR > dim-scaled heuristic
+    if lr is not None:
+        effective_lr = lr
+    elif mup_base_dim > 0:
+        # With μP, use a fixed base LR (tuned at base width).
+        # The optimizer handles per-param scaling internally.
+        effective_lr = lr_for_dim(mup_base_dim)
+    else:
+        effective_lr = lr_for_dim(arch["dim"])
 
     return {
         "model_cls": "Double_Decoder",
@@ -164,6 +177,7 @@ def build_scaling_config(params, tokens):
         "init_strategy": "xavier_uniform",
         "gradient_checkpointing": arch["dim"] >= 256,
         "use_compile": False,
+        "mup_base_dim": mup_base_dim,
         "collator_cls": "BasicPretrainCollator",
         "train_file": "data/Pretrain/slimpajama_6b_packed.jsonl",
         "eval_file": "data/Pretrain/slimpajama_6b_eval_packed.jsonl",
@@ -172,7 +186,7 @@ def build_scaling_config(params, tokens):
         "target_effective_batch": TARGET_EFFECTIVE_BATCH,
         "batch_size": 64,
         "grad_accum_steps": 1,
-        "lr": lr_for_dim(arch["dim"]),
+        "lr": effective_lr,
         "end_lr_ratio": 0.1,
         "total_tokens": tokens,
         "logging_steps": 4,

@@ -316,20 +316,53 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
 
     # ── Optimizer & scheduler ────────────────────────────────────────────
     lr = cfg.lr
+    use_mup = cfg.mup_base_dim > 0
+    mup_mult = cfg.mup_base_dim / cfg.dim if use_mup else 1.0
+
     if rank == 0:
-        print(f"Learning rate: {lr}")
+        if use_mup:
+            print(f"μP enabled: base_dim={cfg.mup_base_dim}, dim={cfg.dim}, "
+                  f"width_mult={mup_mult:.4f}")
+            print(f"  Base LR: {lr}, Hidden LR: {lr * mup_mult:.2e}")
+        else:
+            print(f"Learning rate: {lr}")
 
-    decay, no_decay = [], []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        (no_decay if any(k in n.lower() for k in ["bias","norm","ln","layernorm"]) else decay).append(p)
+    if use_mup:
+        # μP param groups: embedding/output at base LR, hidden at scaled LR,
+        # norms/scalars at base LR with no weight decay
+        eager = _get_eager_model(model)
+        embedding_ids = {id(eager.embedding.weight)}
 
-    optimizer = AdamW(
-        [{"params": decay, "weight_decay": 0.1},
-        {"params": no_decay, "weight_decay": 0.0}],
-        lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=True
-    )
+        embed_params, hidden_decay, base_no_decay = [], [], []
+        seen_ids = set()
+        for n, p in model.named_parameters():
+            if not p.requires_grad or id(p) in seen_ids:
+                continue
+            seen_ids.add(id(p))
+            if id(p) in embedding_ids:
+                embed_params.append(p)
+            elif p.dim() <= 1:
+                base_no_decay.append(p)
+            else:
+                hidden_decay.append(p)
+
+        optimizer = AdamW([
+            {"params": embed_params, "weight_decay": 0.1, "lr": lr},
+            {"params": hidden_decay, "weight_decay": 0.1, "lr": lr * mup_mult},
+            {"params": base_no_decay, "weight_decay": 0.0, "lr": lr},
+        ], betas=(0.9, 0.95), eps=1e-8, fused=True)
+    else:
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (no_decay if any(k in n.lower() for k in ["bias","norm","ln","layernorm"]) else decay).append(p)
+
+        optimizer = AdamW(
+            [{"params": decay, "weight_decay": 0.1},
+            {"params": no_decay, "weight_decay": 0.0}],
+            lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=True
+        )
 
     lr_end = lr * cfg.end_lr_ratio
     scheduler = get_polynomial_decay_schedule_with_warmup(
@@ -377,6 +410,9 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
             **hparams,
             "lr": lr,
             "lr_end": lr_end,
+            "mup_enabled": use_mup,
+            "mup_base_dim": cfg.mup_base_dim,
+            "mup_hidden_lr": lr * mup_mult if use_mup else lr,
             "batch_size": cfg.batch_size,
             "grad_accum_steps": cfg.grad_accum_steps,
             "total_tokens": cfg.total_tokens,

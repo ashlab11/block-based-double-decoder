@@ -15,12 +15,13 @@ except ImportError:
 
 class CrossAttention(nn.Module):
     """Standard cross-attention: Q from decoder, K/V from encoder output."""
-    def __init__(self, dim, num_heads, seq_len=1024):
+    def __init__(self, dim, num_heads, seq_len=1024, mup=False):
         super(CrossAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
+        self.attn_scale = 1.0 / self.head_dim if mup else None
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)
@@ -48,17 +49,17 @@ class CrossAttention(nn.Module):
 
         cross_mask = None if block_masks is None else block_masks.get('cross_mask')
         if cross_mask is not None:
-            output = flex_attention(query, key, value, block_mask=cross_mask)
+            output = flex_attention(query, key, value, block_mask=cross_mask, scale=self.attn_scale)
         else:
             output = torch.nn.functional.scaled_dot_product_attention(
-                query, key, value, is_causal=False)
+                query, key, value, is_causal=False, scale=self.attn_scale)
 
         output = output.transpose(1, 2).reshape(B, L, D)
         return self.out_proj(output)
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, seq_len = 1024, gating = False):
+    def __init__(self, dim, num_heads, seq_len = 1024, gating = False, mup = False):
         super(SelfAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -66,6 +67,7 @@ class SelfAttention(nn.Module):
         assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
         self.seq_len = seq_len
         self.gating = gating
+        self.attn_scale = 1.0 / self.head_dim if mup else None
         if self.gating:
             self.gater = nn.Sequential(nn.Linear(dim, dim), nn.Sigmoid()) 
         
@@ -97,9 +99,9 @@ class SelfAttention(nn.Module):
         if self_mask is None:
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value,
-                is_causal=True)
+                is_causal=True, scale=self.attn_scale)
         else:
-           output = flex_attention(query, key, value, block_mask=self_mask)
+           output = flex_attention(query, key, value, block_mask=self_mask, scale=self.attn_scale)
         
         if self.gating:
             gating_modulator = self.gater(x).reshape(B, self.num_heads, L, self.head_dim)
@@ -110,7 +112,7 @@ class SelfAttention(nn.Module):
         return output
         
 class ComboAttention(nn.Module):
-    def __init__(self, dim, num_heads, seq_len = 1024, shared = True, logit_biases = False):
+    def __init__(self, dim, num_heads, seq_len = 1024, shared = True, logit_biases = False, mup = False):
         super(ComboAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -119,6 +121,7 @@ class ComboAttention(nn.Module):
         self.seq_len = seq_len
         self.shared = shared
         self.logit_biases = logit_biases
+        self.attn_scale = 1.0 / self.head_dim if mup else None
         
         if shared:
             self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)
@@ -172,13 +175,13 @@ class ComboAttention(nn.Module):
             #Flash attention expects [B, L, N_h, D_h]
             query, enc_key, dec_key, enc_value, dec_value = query.transpose(1, 2), enc_key.transpose(1, 2), dec_key.transpose(1, 2), enc_value.transpose(1, 2), dec_value.transpose(1, 2)
 
-            dec_output, dec_lse, _ = flash_attn_func(query, dec_key, dec_value, causal=True, return_attn_probs = True)
-            enc_output, enc_lse, _ = flash_attn_func(query, enc_key, enc_value, causal=False, return_attn_probs = True)
+            dec_output, dec_lse, _ = flash_attn_func(query, dec_key, dec_value, causal=True, return_attn_probs=True, softmax_scale=self.attn_scale)
+            enc_output, enc_lse, _ = flash_attn_func(query, enc_key, enc_value, causal=False, return_attn_probs=True, softmax_scale=self.attn_scale)
 
         elif block_masks is None:
             # SDPA fallback: no flash-attn, no block masks (inference mode).
             # We need LSE for the sigmoid gate, so compute attention manually.
-            scale = 1.0 / (self.head_dim ** 0.5)
+            scale = self.attn_scale or 1.0 / (self.head_dim ** 0.5)
 
             # Decoder self-attention (causal)
             dec_scores = torch.matmul(query, dec_key.transpose(-2, -1)) * scale
@@ -199,8 +202,8 @@ class ComboAttention(nn.Module):
             
             assert self_mask is not None and cross_mask is not None, "Self and cross masks must both be not None"
 
-            dec_output, dec_lse = flex_attention(query, dec_key, dec_value, block_mask=self_mask, return_lse=True)
-            enc_output, enc_lse = flex_attention(query, enc_key, enc_value, block_mask=cross_mask, return_lse=True)
+            dec_output, dec_lse = flex_attention(query, dec_key, dec_value, block_mask=self_mask, return_lse=True, scale=self.attn_scale)
+            enc_output, enc_lse = flex_attention(query, enc_key, enc_value, block_mask=cross_mask, return_lse=True, scale=self.attn_scale)
             
         if self.logit_biases:
             #Temperatures and logit biases help to self-stabilize during training -- they will hopefully be close to 0/1 respectively by the end

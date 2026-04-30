@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch._dynamo
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -414,7 +415,6 @@ def main():
     install_fast_masks()
 
     # 15 models × multiple inner functions need >8 cached compiled graphs
-    import torch._dynamo
     torch._dynamo.config.cache_size_limit = 64
 
     gpu_tflops = detect_gpu_tflops()

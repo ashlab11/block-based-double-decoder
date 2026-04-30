@@ -93,4 +93,17 @@ def create_masks(batch_size, blocks, device, input_ids, encoder_input_ids, decod
         return create_pretrain_masks(blocks, input_ids.shape[1], device)
     
     
+#---- BLOCKS FOR ED ----
+@torch.compiler.disable()
+def create_masks_ED(batch_size, blocks, device, encoder_input_ids, decoder_input_ids):
+    def mask(b, h, q_idx, kv_idx):    # encoder cross: see everything
+        return kv_idx < blocks[b]
     
+    enc_mask_block = create_block_mask(mask,
+        B=batch_size, H=None, Q_LEN=encoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device, _compile=True
+    )
+    cross_mask_block = create_block_mask(mask,
+        B=batch_size, H=None, Q_LEN=decoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device, _compile=True
+    )
+    #Needs to create two masks, overloading self mask -- the self mask occurs on the ENCODER side
+    return {"self_mask": enc_mask_block}, {"cross_mask": cross_mask_block}

@@ -11,7 +11,7 @@ seq_len: 2048
 init_strategy: "xavier_uniform"
 gradient_checkpointing: false
 
-collator_cls: "BasicPretrainCollator"
+collator_cls: "EDPretrainCollator"
 train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
 eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
 tokenizer_file: "tokenizer/tokenizer_32k.json"

@@ -2,7 +2,7 @@ import random
 import torch
 import numpy as np
 
-class BasicSFTCollator:
+class DDSFTCollator:
     """
     Data collator for conversations.
     Takes in a batch of conversations and returns a batch of padded input and label sequences.

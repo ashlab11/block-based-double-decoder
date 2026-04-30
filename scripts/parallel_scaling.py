@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Full scaling-law grid: 5 model sizes × 5 token budgets on one GPU.
+Full scaling-law grid: 3 model types × 5 param sizes × 5 token budgets.
 
-Trains all 25 (param_size, token_budget) combinations. Models are compiled
-once and re-initialized for each token budget, so the torch.compile cost
-is paid only once.
+Trains Double_Decoder (dd), StandardEncDec (sed), and DecoderOnlyModel (dec)
+at all 25 (param, token) grid points. Models are compiled once and
+re-initialized for each token budget.
 
 Usage:
-    python scripts/parallel_scaling.py                          # full 5×5 grid
-    python scripts/parallel_scaling.py --token-budgets 10M,50M  # subset
-    python scripts/parallel_scaling.py --no-compile             # skip compile
+    python scripts/parallel_scaling.py                              # full grid
+    python scripts/parallel_scaling.py --token-budgets 10M,50M      # subset
+    python scripts/parallel_scaling.py --model-types dd,dec          # subset
+    python scripts/parallel_scaling.py --no-compile                  # skip compile
 """
 
 import sys
@@ -32,10 +33,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from transformers import PreTrainedTokenizerFast
 
 from models.double_decoder import Double_Decoder
+from models.standard_enc_dec import StandardEncDec
+from models.decoder import DecoderOnlyModel
 from collators.double_decoder.pretrain import BasicPretrainCollator
 from components.initialization import initialize_model
 
 # ── Constants ───────────────────────────────────────────────────────────────
+
+MODEL_TYPES = ["dd", "sed", "dec"]
+MODEL_TYPE_NAMES = {"dd": "Double_Decoder", "sed": "StandardEncDec", "dec": "DecoderOnly"}
 
 ARCHITECTURES = [
     ("0.5M",  dict(dim=64,  num_encoder_layers=7,  num_decoder_layers=3)),
@@ -70,7 +76,6 @@ _mask_cache_result = None
 
 def _cached_create_masks(batch_size, blocks, device, input_ids,
                          encoder_input_ids, decoder_input_ids, sft):
-    """Cache block masks per batch — all 5 models share the same blocks."""
     global _mask_cache_blocks_id, _mask_cache_result
     blocks_id = id(blocks)
     if blocks_id != _mask_cache_blocks_id:
@@ -87,9 +92,11 @@ def _cached_create_masks(batch_size, blocks, device, input_ids,
 
 
 def install_fast_masks():
-    """Monkey-patch create_masks with a cached version."""
+    """Monkey-patch create_masks with a cached version for DD and StandardEncDec."""
     import models.double_decoder as dd
+    import models.standard_enc_dec as sed
     dd.create_masks = _cached_create_masks
+    sed.create_masks = _cached_create_masks
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -110,16 +117,31 @@ def non_emb_param_count(model):
     return total - emb
 
 
-def build_model(arch, vocab_size, device, use_compile=False):
+def build_model(model_type, arch, vocab_size, device, use_compile=False):
     dim = arch["dim"]
-    model = Double_Decoder(
-        vocab_size=vocab_size, dim=dim, num_heads=dim // 64,
-        num_encoder_layers=arch["num_encoder_layers"],
-        num_decoder_layers=arch["num_decoder_layers"],
-        seq_len=SEQ_LEN, shared=True, logit_biases=False,
-        init_strategy="xavier_uniform", gradient_checkpointing=False,
-        mup_base_dim=MUP_BASE_DIM,
-    )
+    num_heads = dim // 64
+    enc = arch["num_encoder_layers"]
+    dec = arch["num_decoder_layers"]
+
+    if model_type == "dd":
+        model = Double_Decoder(
+            vocab_size=vocab_size, dim=dim, num_heads=num_heads,
+            num_encoder_layers=enc, num_decoder_layers=dec,
+            seq_len=SEQ_LEN, shared=True, logit_biases=False,
+            init_strategy="xavier_uniform", gradient_checkpointing=False,
+            mup_base_dim=MUP_BASE_DIM)
+    elif model_type == "sed":
+        model = StandardEncDec(
+            vocab_size=vocab_size, dim=dim, num_heads=num_heads,
+            num_encoder_layers=enc, num_decoder_layers=dec,
+            seq_len=SEQ_LEN, init_strategy="xavier_uniform",
+            gradient_checkpointing=False, mup_base_dim=MUP_BASE_DIM)
+    elif model_type == "dec":
+        model = DecoderOnlyModel(
+            vocab_size=vocab_size, dim=dim, num_heads=num_heads,
+            num_layers=enc + dec, seq_len=SEQ_LEN,
+            init_strategy="xavier_uniform", mup_base_dim=MUP_BASE_DIM)
+
     model = model.to(device)
     if use_compile:
         model = torch.compile(model)
@@ -158,8 +180,15 @@ def build_scheduler(optimizer, total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def eval_model(model, eval_loader, device, max_batches):
-    """Run eval on the eager (non-compiled) model."""
+def model_forward(model, batch, needs_blocks):
+    """Dispatch forward based on model type."""
+    if needs_blocks:
+        return model(**batch)
+    else:
+        return model(input_ids=batch["input_ids"], labels=batch["labels"])
+
+
+def eval_model(model, eval_loader, device, max_batches, needs_blocks):
     eager = getattr(model, "_orig_mod", model)
     eager.eval()
     total_loss, total_tok = 0.0, 0
@@ -171,7 +200,7 @@ def eval_model(model, eval_loader, device, max_batches):
                      if isinstance(v, torch.Tensor) else v
                      for k, v in raw_batch.items()}
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = eager(**batch)
+                out = model_forward(eager, batch, needs_blocks)
             ntok = (batch["labels"] != -100).sum().item()
             total_loss += out["loss"].item() * ntok
             total_tok += ntok
@@ -184,15 +213,13 @@ def eval_model(model, eval_loader, device, max_batches):
 # ── Training one token budget ───────────────────────────────────────────────
 
 def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accum,
-                     train_loader, eval_loader, device, gpu_tflops,
-                     eval_batches):
-    """Train all 5 models on one token budget. Returns results dict."""
+                     train_loader, eval_loader, device, gpu_tflops, eval_batches):
     tokens_per_step = batch_size * grad_accum * SEQ_LEN
     total_steps = max(1, total_tokens // tokens_per_step)
     total_micro = total_steps * grad_accum
     log_interval = max(1, total_steps // 20)
 
-    # Re-init weights, build fresh optimizer/scheduler for this budget
+    # Re-init weights, build fresh optimizer/scheduler
     trainers = []
     for m in models_info:
         eager = getattr(m["model"], "_orig_mod", m["model"])
@@ -200,8 +227,10 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         opt = build_optimizer(m["model"], m["arch"]["dim"])
         sched = build_scheduler(opt, total_steps)
         trainers.append({
-            "name": m["name"], "model": m["model"], "opt": opt,
-            "sched": sched, "ne": m["ne"],
+            "name": m["name"], "model_type": m["model_type"],
+            "display": f"{m['model_type']}_{m['name']}",
+            "model": m["model"], "opt": opt, "sched": sched, "ne": m["ne"],
+            "needs_blocks": m["needs_blocks"], "arch": m["arch"],
             "step": 0, "micro": 0, "loss_sum": 0.0, "loss_n": 0,
             "curve": [], "tokens_seen": 0,
         })
@@ -222,7 +251,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
 
         for t in trainers:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = t["model"](**batch)
+                out = model_forward(t["model"], batch, t["needs_blocks"])
                 loss = out["loss"]
             (loss / grad_accum).backward()
             t["loss_sum"] += loss.detach().item()
@@ -246,27 +275,33 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             elapsed = time.time() - t0
             total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
             mfu = total_flops / (elapsed * gpu_tflops * 1e12) * 100
-            losses = "  ".join(f'{t["name"]}={t["curve"][-1][1]:.3f}' for t in trainers)
+            # Log one line per model type
             print(f"    step {current_step:>5}/{total_steps}  "
-                  f"[{elapsed:6.1f}s]  MFU={mfu:.1f}%  {losses}")
+                  f"[{elapsed:6.1f}s]  MFU={mfu:.1f}%")
+            for mt in MODEL_TYPES:
+                mt_trainers = [t for t in trainers if t["model_type"] == mt]
+                if mt_trainers:
+                    losses = "  ".join(f'{t["name"]}={t["curve"][-1][1]:.3f}'
+                                       for t in mt_trainers)
+                    print(f"      {mt:>3}: {losses}")
 
     torch.cuda.synchronize()
     train_time = time.time() - t0
     total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
     agg_mfu = total_flops / (train_time * gpu_tflops * 1e12) * 100
-
     print(f"    Done in {train_time:.1f}s  MFU={agg_mfu:.1f}%")
 
-    # Eval + write per-run results compatible with `scaling_laws.py collect`
+    # Eval + write per-run results
     scaling_dir = PROJECT_ROOT / "checkpoints" / "scaling"
     scaling_dir.mkdir(parents=True, exist_ok=True)
 
     results = {}
     for t in trainers:
-        avg_loss, ppl = eval_model(t["model"], eval_loader, device, eval_batches)
-        print(f"      {t['name']:>5}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
+        avg_loss, ppl = eval_model(t["model"], eval_loader, device,
+                                   eval_batches, t["needs_blocks"])
+        print(f"      {t['display']:>12}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
 
-        arch = next(a for n, a in ARCHITECTURES if n == t["name"])
+        arch = t["arch"]
         total_params = sum(p.numel() for p in t["model"].parameters())
 
         run_result = {
@@ -276,7 +311,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "tokens_seen": t["tokens_seen"],
             "total_params": total_params,
             "training_time_sec": round(train_time, 2),
+            "model_type": t["model_type"],
             "hparams": {
+                "model_cls": MODEL_TYPE_NAMES[t["model_type"]],
                 "dim": arch["dim"],
                 "num_encoder_layers": arch["num_encoder_layers"],
                 "num_decoder_layers": arch["num_decoder_layers"],
@@ -292,14 +329,14 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "eval_curve": [(t["step"], round(avg_loss, 4))],
         }
 
-        # Write per-run file: checkpoints/scaling/dd_0.5M_10Mtok_results.json
-        run_name = f"dd_{t['name']}_{tok_label}tok"
+        # Write: checkpoints/scaling/{prefix}_{size}_{tokens}tok_results.json
+        run_name = f"{t['model_type']}_{t['name']}_{tok_label}tok"
         run_path = scaling_dir / f"{run_name}_results.json"
         with open(run_path, "w") as f:
             json.dump(run_result, f, indent=2)
 
-        results[t["name"]] = run_result
-        results[t["name"]]["aggregate_mfu_pct"] = round(agg_mfu, 2)
+        results[t["display"]] = run_result
+        results[t["display"]]["aggregate_mfu_pct"] = round(agg_mfu, 2)
 
     return results
 
@@ -309,11 +346,12 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
 def main():
     parser = argparse.ArgumentParser(description="Full scaling-law grid training")
     parser.add_argument("--token-budgets", type=str, default=None,
-                        help="Comma-separated token budgets (e.g. '10M,50M,100M'). "
-                             "Default: all 5 (10M,50M,100M,300M,600M)")
+                        help="Comma-separated token budgets (e.g. '10M,50M')")
+    parser.add_argument("--model-types", type=str, default=None,
+                        help="Comma-separated model types (e.g. 'dd,dec'). "
+                             "Default: all 3 (dd,sed,dec)")
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--grad-accum", type=int, default=32,
-                        help="Gradient accumulation (default: 32, eff_batch=512)")
+    parser.add_argument("--grad-accum", type=int, default=32)
     parser.add_argument("--eval-batches", type=int, default=10)
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
     parser.add_argument("--no-compile", action="store_true")
@@ -325,15 +363,17 @@ def main():
                         default="tokenizer/tokenizer_32k.json")
     args = parser.parse_args()
 
-    # Parse token budgets
+    # Parse subsets
     if args.token_budgets:
         requested = set(args.token_budgets.split(","))
         budgets = [(l, v) for l, v in TOKEN_BUDGETS if l in requested]
-        if not budgets:
-            print(f"No matching budgets. Available: {[l for l,_ in TOKEN_BUDGETS]}")
-            return
     else:
         budgets = TOKEN_BUDGETS
+
+    if args.model_types:
+        model_types = [mt.strip() for mt in args.model_types.split(",")]
+    else:
+        model_types = MODEL_TYPES
 
     device = torch.device("cuda")
     torch.backends.cuda.enable_flash_sdp(True)
@@ -352,6 +392,7 @@ def main():
     print(f"Effective batch: {args.batch_size} × {args.grad_accum} = "
           f"{args.batch_size * args.grad_accum} seqs = {tokens_per_step:,} tok/step")
     print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
+    print(f"Model types: {model_types}")
     print(f"Token budgets: {[l for l, _ in budgets]}")
 
     # ── Tokenizer + Data ────────────────────────────────────────────────────
@@ -360,9 +401,11 @@ def main():
     vocab_size = tokenizer.vocab_size
     bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
-    print(f"Tokenizer: vocab_size={vocab_size}  bos={bos_token_id}  eos={eos_token_id}")
+    print(f"Tokenizer: vocab_size={vocab_size}")
 
     print("Loading data...")
+    # BasicPretrainCollator produces blocks — works for all model types.
+    # DecoderOnly models just ignore blocks in their forward().
     collator = BasicPretrainCollator(
         bos_token_id=bos_token_id, eos_token_id=eos_token_id, max_seq_len=SEQ_LEN)
 
@@ -378,22 +421,28 @@ def main():
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
                              collate_fn=collator, drop_last=True)
 
-    # ── Build and compile models ONCE ───────────────────────────────────────
-    print(f"\nBuilding {len(ARCHITECTURES)} models:\n")
+    # ── Build and compile all models ONCE ───────────────────────────────────
+    n_models = len(model_types) * len(ARCHITECTURES)
+    print(f"\nBuilding {n_models} models ({len(model_types)} types × "
+          f"{len(ARCHITECTURES)} sizes):\n")
+
     models_info = []
-    for name, arch in ARCHITECTURES:
-        model = build_model(arch, vocab_size, device, use_compile=use_compile)
-        ne = non_emb_param_count(model)
-        mup_mult = MUP_BASE_DIM / arch["dim"]
-        print(f"  {name:>5}: dim={arch['dim']:>3}  "
-              f"layers={arch['num_encoder_layers']:>2}+{arch['num_decoder_layers']:<2}  "
-              f"non_emb={ne:>10,}  hidden_lr={BASE_LR * mup_mult:.1e}")
-        models_info.append({"name": name, "arch": arch, "model": model, "ne": ne})
+    for mt in model_types:
+        needs_blocks = mt in ("dd", "sed")
+        print(f"  {MODEL_TYPE_NAMES[mt]} ({mt}):")
+        for name, arch in ARCHITECTURES:
+            model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
+            ne = non_emb_param_count(model)
+            print(f"    {name:>5}: dim={arch['dim']:>3}  non_emb={ne:>10,}")
+            models_info.append({
+                "name": name, "model_type": mt, "arch": arch,
+                "model": model, "ne": ne, "needs_blocks": needs_blocks,
+            })
 
     total_ne = sum(m["ne"] for m in models_info)
-    print(f"\n  Total non-emb params: {total_ne:,}")
+    print(f"\n  Total non-emb params (all models): {total_ne:,}")
 
-    # Compile warmup (once for all budgets)
+    # Compile warmup
     if use_compile:
         print("\nCompiling models (one-time cost)...")
         compile_t0 = time.time()
@@ -403,14 +452,13 @@ def main():
                        "blocks": dummy_blocks, "sft": False}
         for m in models_info:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = m["model"](**dummy_batch)
+                out = model_forward(m["model"], dummy_batch, m["needs_blocks"])
             out["loss"].backward()
-            # Reset grads from warmup
             for p in m["model"].parameters():
                 if p.grad is not None:
                     p.grad = None
         torch.cuda.synchronize()
-        print(f"  Compiled in {time.time() - compile_t0:.1f}s")
+        print(f"  Compiled {n_models} models in {time.time() - compile_t0:.1f}s")
 
     # ── Run each token budget ───────────────────────────────────────────────
     out_dir = Path(args.output_dir)
@@ -424,7 +472,7 @@ def main():
 
         print(f"\n{'='*70}")
         print(f"  {tok_label} tokens  |  {total_steps} steps  |  "
-              f"{total_micro} micro-batches")
+              f"{total_micro} micro-batches  |  {n_models} models")
         print(f"{'='*70}\n")
 
         results = train_one_budget(
@@ -433,13 +481,11 @@ def main():
 
         all_results[tok_label] = results
 
-        # Save per-budget results
         out_path = out_dir / f"parallel_{tok_label}tok_results.json"
         with open(out_path, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"    Results → {out_path}")
 
-    # ── Save combined grid results ──────────────────────────────────────────
+    # ── Summary ─────────────────────────────────────────────────────────────
     sweep_time = time.time() - sweep_t0
     combined_path = out_dir / "scaling_grid_results.json"
     with open(combined_path, "w") as f:
@@ -447,23 +493,28 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"  Full grid complete in {sweep_time/60:.1f} min")
-    print(f"  Combined results → {combined_path}")
+    print(f"  Results → {combined_path}")
     print(f"{'='*70}")
 
-    # Print loss grid
-    print(f"\n  Eval loss grid (params × tokens):\n")
-    header = f"  {'params':<8}" + "".join(f"  {l:>8}" for l, _ in budgets)
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for name, _ in ARCHITECTURES:
-        row = f"  {name:<8}"
-        for tok_label, _ in budgets:
-            if tok_label in all_results and name in all_results[tok_label]:
-                loss = all_results[tok_label][name]["final_eval_loss"]
-                row += f"  {loss:>8.4f}"
-            else:
-                row += f"  {'—':>8}"
-        print(row)
+    # Print loss grids per model type
+    for mt in model_types:
+        print(f"\n  Eval loss grid — {MODEL_TYPE_NAMES[mt]} ({mt}):\n")
+        header = f"  {'params':<8}" + "".join(f"  {l:>8}" for l, _ in budgets)
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for name, _ in ARCHITECTURES:
+            row = f"  {name:<8}"
+            display = f"{mt}_{name}"
+            for tok_label, _ in budgets:
+                if tok_label in all_results and display in all_results[tok_label]:
+                    loss = all_results[tok_label][display]["final_eval_loss"]
+                    row += f"  {loss:>8.4f}"
+                else:
+                    row += f"  {'—':>8}"
+            print(row)
+
+    print(f"\nTo collect in scaling_laws.py format:")
+    print(f"  python scripts/scaling_laws.py collect")
 
 
 if __name__ == "__main__":

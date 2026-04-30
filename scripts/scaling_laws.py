@@ -195,6 +195,13 @@ def cmd_run(args):
 
 # ── Collect results ─────────────────────────────────────────────────────────
 
+MODEL_TYPE_PREFIXES = [
+    ("dd",  "Double_Decoder"),
+    ("sed", "StandardEncDec"),
+    ("dec", "DecoderOnly"),
+]
+
+
 def cmd_collect(args):
     """Read all results JSONs and output plain-text tables."""
 
@@ -202,79 +209,100 @@ def cmd_collect(args):
     curves = []
     missing = []
 
-    for plabel in PARAM_LABELS:
-        arch = ARCHITECTURES[plabel]
-        dim = arch["dim"]
-        enc = arch["num_encoder_layers"]
-        dec = arch["num_decoder_layers"]
-        ne = non_emb_params(dim, enc, dec)
+    for prefix, type_name in MODEL_TYPE_PREFIXES:
+        for plabel in PARAM_LABELS:
+            arch = ARCHITECTURES[plabel]
+            dim = arch["dim"]
+            enc = arch["num_encoder_layers"]
+            dec = arch["num_decoder_layers"]
+            ne = non_emb_params(dim, enc, dec)
 
-        for tlabel in TOKEN_LABELS:
-            tokens = TOKEN_VALUES[tlabel]
-            name = run_name_from_labels(plabel, tlabel)
-            flops = compute_flops(ne, tokens)
+            for tlabel in TOKEN_LABELS:
+                tokens = TOKEN_VALUES[tlabel]
+                name = f"{prefix}_{plabel}_{tlabel}tok"
+                flops = compute_flops(ne, tokens)
 
-            # Check both grid-style and raw-value-style result filenames
-            results_file = CHECKPOINT_DIR / f"{name}_results.json"
-            if not results_file.exists():
-                raw_name = f"dd_{PARAM_VALUES[plabel]}p_{tokens}tok"
-                results_file = CHECKPOINT_DIR / f"{raw_name}_results.json"
+                # Check for results file
+                results_file = CHECKPOINT_DIR / f"{name}_results.json"
+                if not results_file.exists():
+                    # Also check legacy dd_ format (run_name_from_labels)
+                    if prefix == "dd":
+                        legacy_name = run_name_from_labels(plabel, tlabel)
+                        legacy_file = CHECKPOINT_DIR / f"{legacy_name}_results.json"
+                        if legacy_file.exists():
+                            results_file = legacy_file
+                            name = legacy_name
+                        else:
+                            raw_name = f"dd_{PARAM_VALUES[plabel]}p_{tokens}tok"
+                            raw_file = CHECKPOINT_DIR / f"{raw_name}_results.json"
+                            if raw_file.exists():
+                                results_file = raw_file
+                                name = raw_name
 
-            if not results_file.exists():
-                missing.append(name)
+                if not results_file.exists():
+                    missing.append(name)
+                    rows.append(dict(
+                        name=name, prefix=prefix, type_name=type_name,
+                        plabel=plabel, tlabel=tlabel,
+                        non_emb_params=ne, tokens=tokens, flops=flops,
+                        dim=dim, enc=enc, dec=dec,
+                        loss=None, ppl=None, steps=None,
+                        total_params=None, time_sec=None,
+                    ))
+                    continue
+
+                with open(results_file) as f:
+                    data = json.load(f)
+
                 rows.append(dict(
-                    name=name, plabel=plabel, tlabel=tlabel,
+                    name=name, prefix=prefix, type_name=type_name,
+                    plabel=plabel, tlabel=tlabel,
                     non_emb_params=ne, tokens=tokens, flops=flops,
                     dim=dim, enc=enc, dec=dec,
-                    loss=None, ppl=None, steps=None,
-                    total_params=None, time_sec=None,
+                    loss=data["final_eval_loss"],
+                    ppl=data["final_eval_ppl"],
+                    steps=data["total_steps"],
+                    total_params=data.get("total_params"),
+                    time_sec=data.get("training_time_sec"),
                 ))
-                continue
 
-            with open(results_file) as f:
-                data = json.load(f)
-
-            rows.append(dict(
-                name=name, plabel=plabel, tlabel=tlabel,
-                non_emb_params=ne, tokens=tokens, flops=flops,
-                dim=dim, enc=enc, dec=dec,
-                loss=data["final_eval_loss"],
-                ppl=data["final_eval_ppl"],
-                steps=data["total_steps"],
-                total_params=data.get("total_params"),
-                time_sec=data.get("training_time_sec"),
-            ))
-
-            if args.curves:
-                for step, loss in data.get("train_curve", []):
-                    curves.append(dict(
-                        name=name, non_emb_params=ne,
-                        tokens=tokens, step=step, train_loss=loss,
-                    ))
-                for step, loss in data.get("eval_curve", []):
-                    curves.append(dict(
-                        name=name, non_emb_params=ne,
-                        tokens=tokens, step=step, eval_loss=loss,
-                    ))
+                if args.curves:
+                    for step, loss in data.get("train_curve", []):
+                        curves.append(dict(
+                            name=name, prefix=prefix, non_emb_params=ne,
+                            tokens=tokens, step=step, train_loss=loss,
+                        ))
+                    for step, loss in data.get("eval_curve", []):
+                        curves.append(dict(
+                            name=name, prefix=prefix, non_emb_params=ne,
+                            tokens=tokens, step=step, eval_loss=loss,
+                        ))
 
     # ── Output ──────────────────────────────────────────────────────────
 
+    found_prefixes = sorted(set(r["prefix"] for r in rows if r["loss"] is not None))
+    total_found = sum(1 for r in rows if r["loss"] is not None)
+    total_missing = len(missing)
+
     print("=== SCALING LAW RESULTS ===")
-    print(f"# Grid: {len(PARAM_LABELS)} param sizes x {len(TOKEN_LABELS)} token budgets "
-          f"= {len(PARAM_LABELS) * len(TOKEN_LABELS)} runs")
-    if missing:
-        print(f"# Missing: {len(missing)} runs ({', '.join(missing)})")
+    print(f"# Model types found: {', '.join(found_prefixes) or 'none'}")
+    print(f"# Runs: {total_found} found, {total_missing} missing")
+    if total_missing > 0 and total_missing <= 20:
+        print(f"# Missing: {', '.join(missing)}")
     print()
 
     # ── Summary table (one row per run) ─────────────────────────────────
     print("--- SUMMARY ---")
-    cols = ["name", "non_emb_params", "tokens", "flops", "loss", "ppl",
+    cols = ["name", "model_type", "non_emb_params", "tokens", "flops", "loss", "ppl",
             "dim", "enc_layers", "dec_layers", "steps", "total_params", "time_sec"]
     print("\t".join(cols))
 
     for r in rows:
+        if r["loss"] is None:
+            continue
         vals = [
             r["name"],
+            r["prefix"],
             str(r["non_emb_params"]),
             str(r["tokens"]),
             f"{r['flops']:.3e}",
@@ -289,25 +317,30 @@ def cmd_collect(args):
         ]
         print("\t".join(vals))
 
-    # ── Loss grid (for quick visual inspection) ────────────────────────
-    print()
-    print("--- LOSS GRID (params × tokens) ---")
-    header = f"{'params':<10}" + "".join(f"{t:>12}" for t in TOKEN_LABELS)
-    print(header)
-    print("-" * len(header))
+    # ── Loss grids per model type ─────────────────────────────────────
+    for prefix, type_name in MODEL_TYPE_PREFIXES:
+        prefix_rows = [r for r in rows if r["prefix"] == prefix and r["loss"] is not None]
+        if not prefix_rows:
+            continue
 
-    for plabel in PARAM_LABELS:
-        row_str = f"{plabel:<10}"
-        for tlabel in TOKEN_LABELS:
-            name = run_name_from_labels(plabel, tlabel)
-            match = [r for r in rows if r["name"] == name]
-            if match and match[0]["loss"] is not None:
-                row_str += f"{match[0]['loss']:>12.4f}"
-            else:
-                row_str += f"{'---':>12}"
-        print(row_str)
+        print()
+        print(f"--- LOSS GRID: {type_name} ({prefix}) ---")
+        header = f"{'params':<10}" + "".join(f"{t:>12}" for t in TOKEN_LABELS)
+        print(header)
+        print("-" * len(header))
 
-    # ── FLOPs grid ─────────────────────────────────────────────────────
+        for plabel in PARAM_LABELS:
+            row_str = f"{plabel:<10}"
+            for tlabel in TOKEN_LABELS:
+                match = [r for r in prefix_rows
+                         if r["plabel"] == plabel and r["tlabel"] == tlabel]
+                if match and match[0]["loss"] is not None:
+                    row_str += f"{match[0]['loss']:>12.4f}"
+                else:
+                    row_str += f"{'---':>12}"
+            print(row_str)
+
+    # ── FLOPs grid (shared across model types) ────────────────────────
     print()
     print("--- FLOPS GRID (params × tokens) ---")
     header = f"{'params':<10}" + "".join(f"{t:>12}" for t in TOKEN_LABELS)
@@ -328,19 +361,17 @@ def cmd_collect(args):
     if args.curves and curves:
         print()
         print("--- TRAINING CURVES ---")
-        print("name\tnon_emb_params\ttokens\tstep\ttrain_loss\teval_loss")
-        # Group by run, interleave train/eval
+        print("name\tmodel_type\tnon_emb_params\ttokens\tstep\ttrain_loss\teval_loss")
         from collections import defaultdict
         by_run = defaultdict(list)
         for c in curves:
-            key = c["name"]
-            by_run[key].append(c)
+            by_run[c["name"]].append(c)
 
         for name_key in by_run:
             for c in sorted(by_run[name_key], key=lambda x: x["step"]):
                 train_l = f"{c.get('train_loss', '')}" if c.get("train_loss") is not None else ""
                 eval_l = f"{c.get('eval_loss', '')}" if c.get("eval_loss") is not None else ""
-                print(f"{c['name']}\t{c['non_emb_params']}\t{c['tokens']}\t"
+                print(f"{c['name']}\t{c['prefix']}\t{c['non_emb_params']}\t{c['tokens']}\t"
                       f"{c['step']}\t{train_l}\t{eval_l}")
 
 

@@ -341,10 +341,10 @@ def main():
     parser = argparse.ArgumentParser(description="Parallel scaling-law training")
     parser.add_argument("--tokens", type=int, default=10_000_000,
                         help="Total training tokens per model (default: 10M)")
-    parser.add_argument("--batch-size", type=int, default=32,
-                        help="Micro-batch size in sequences (default: 32)")
-    parser.add_argument("--grad-accum", type=int, default=16,
-                        help="Gradient accumulation steps (default: 16, eff_batch=512)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Micro-batch size in sequences (default: 16)")
+    parser.add_argument("--grad-accum", type=int, default=32,
+                        help="Gradient accumulation steps (default: 32, eff_batch=512)")
     parser.add_argument("--eval-batches", type=int, default=10,
                         help="Number of eval batches per model (default: 10)")
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")

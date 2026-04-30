@@ -17,8 +17,16 @@ from evals.utils import _sample_pretrain_blocks
 
 
 def _has_combo_attention(model):
-    """Check if the model uses ComboAttention (encoder-decoder architecture)."""
-    return hasattr(model, "decoder_layers")
+    """Check if the model uses ComboAttention (DD/SED double-decoder layers).
+
+    StandardEncDec also exposes `decoder_layers`, but its layers are
+    StandardDecoderLayer with separate self_attn / cross_attn rather than the
+    fused combo_attn block — so we additionally probe the first layer.
+    """
+    layers = getattr(model, "decoder_layers", None)
+    if not layers or len(layers) == 0:
+        return False
+    return hasattr(layers[0], "combo_attn")
 
 
 def eval_attention_weights(model, tokenizer, device, is_enc_dec,
@@ -34,7 +42,7 @@ def eval_attention_weights(model, tokenizer, device, is_enc_dec,
     dec_w ≈ 0.0 → cross-attention dominates
     """
     if not is_enc_dec or not _has_combo_attention(model):
-        return {"name": "Attention Analysis", "error": "Not an encoder-decoder model"}
+        return {"name": "Attention Analysis", "skipped": "model does not use ComboAttention"}
 
     # Register hooks on ComboAttention layers
     blending_weights = {}

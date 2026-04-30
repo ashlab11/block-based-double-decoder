@@ -299,6 +299,9 @@ def main():
 
 def _print_result(name, result, elapsed):
     """Print the primary metric for an eval result."""
+    if "skipped" in result:
+        print(f"  ⊘ {name}: skipped — {result['skipped']} ({elapsed:.1f}s)")
+        return
     if "accuracy" in result:
         print(f"  ✓ {name}: {result['accuracy']:.4f} ({elapsed:.1f}s)")
     elif "perplexity" in result:

@@ -163,6 +163,28 @@ def _cached_create_masks(batch_size, blocks, device, input_ids,
     return _mask_cache_result
 
 
+def _reset_compile_caches():
+    """Flush all compile-/mask-related caches between distinct training phases.
+
+    Crossing a phase boundary (e.g. SFT → post-SFT eval) is the highest-risk
+    moment for stale-guard CUDA IMAs: the compiled-frame cache holds graphs
+    captured against tensors whose Python ids may have been GC'd and reused,
+    and our local _mask_cache_* still points at BlockMasks whose closures
+    captured device tensors that are no longer the current ones.
+
+    This wipes:
+      • our local cached BlockMasks (drops closure-captured block_ids)
+      • dynamo's compiled-frame cache (forces re-trace with fresh guards)
+      • CUDA's allocator cache (best-effort hygiene, not strictly required)
+    """
+    global _mask_cache_key, _mask_cache_result
+    _mask_cache_key = None
+    _mask_cache_result = None
+    torch._dynamo.reset()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def install_fast_masks():
     """Monkey-patch create_masks with a cached version for DD and StandardEncDec."""
     import models.double_decoder as dd
@@ -711,6 +733,11 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             if eval_names and "sft_error" not in run_result:
                 eager = getattr(t["model"], "_orig_mod", t["model"])
                 is_enc_dec = t["model_type"] in ("dd", "sed")
+                # Cross-phase boundary — flush every compile/mask cache before
+                # post-SFT eval. Without this, BlockMasks built during SFT (with
+                # SFT-shaped block_ids in their closure) leak into the eval path
+                # and cause IMAs when seq_len differs.
+                _reset_compile_caches()
                 eval_t0 = time.time()
                 print(f"      [sft-eval] running {len(eval_names)} evals on "
                       f"SFT'd {t['display']} (max_examples={eval_max_examples})...")
@@ -869,8 +896,12 @@ def main():
     use_compile = not args.no_compile
     install_fast_masks()
 
-    # 15 models × multiple inner functions need >8 cached compiled graphs
-    torch._dynamo.config.cache_size_limit = 64
+    # 15 models × multiple inner functions × varying eval seq_lens easily blow
+    # past the default 8. Empirically a 22-eval suite generates 400+ traced
+    # frames per model; 64 was tight enough that mid-eval evictions were
+    # leaving stale guards. Raise the ceiling so frames stick around for the
+    # full eval pass instead of churning.
+    torch._dynamo.config.cache_size_limit = 256
 
     gpu_tflops = detect_gpu_tflops()
     gpu_name = torch.cuda.get_device_name(0)

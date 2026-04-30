@@ -454,69 +454,78 @@ def main():
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
                              collate_fn=collator, drop_last=True)
 
-    # ── Build and compile all models ONCE ───────────────────────────────────
-    n_models = len(model_types) * len(ARCHITECTURES)
-    print(f"\nBuilding {n_models} models ({len(model_types)} types × "
-          f"{len(ARCHITECTURES)} sizes):\n")
-
-    models_info = []
-    for mt in model_types:
-        needs_blocks = mt in ("dd", "sed")
-        print(f"  {MODEL_TYPE_NAMES[mt]} ({mt}):")
-        for name, arch in ARCHITECTURES:
-            model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
-            ne = non_emb_param_count(model)
-            print(f"    {name:>5}: dim={arch['dim']:>3}  non_emb={ne:>10,}")
-            models_info.append({
-                "name": name, "model_type": mt, "arch": arch,
-                "model": model, "ne": ne, "needs_blocks": needs_blocks,
-            })
-
-    total_ne = sum(m["ne"] for m in models_info)
-    print(f"\n  Total non-emb params (all models): {total_ne:,}")
-
-    # Compile warmup
-    if use_compile:
-        print("\nCompiling models (one-time cost)...")
-        compile_t0 = time.time()
-        dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
-        dummy_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
-        dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
-                       "blocks": dummy_blocks, "sft": False}
-        for m in models_info:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model_forward(m["model"], dummy_batch, m["needs_blocks"])
-            out["loss"].backward()
-            for p in m["model"].parameters():
-                if p.grad is not None:
-                    p.grad = None
-        torch.cuda.synchronize()
-        print(f"  Compiled {n_models} models in {time.time() - compile_t0:.1f}s")
-
-    # ── Run each token budget ───────────────────────────────────────────────
+    # ── Run each model type sequentially ───────────────────────────────────
+    # Build/compile 5 models per type, train all budgets, then tear down.
+    # This keeps only 5 models in memory and in the compile cache at a time,
+    # avoiding the cache thrashing that kills MFU with 15 interleaved models.
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_results = {}
     sweep_t0 = time.time()
 
-    for tok_label, total_tokens in budgets:
-        total_steps = max(1, total_tokens // tokens_per_step)
-        total_micro = total_steps * args.grad_accum
+    for mt in model_types:
+        needs_blocks = mt in ("dd", "sed")
+        print(f"\n{'#'*70}")
+        print(f"  Model type: {MODEL_TYPE_NAMES[mt]} ({mt})")
+        print(f"{'#'*70}")
 
-        print(f"\n{'='*70}")
-        print(f"  {tok_label} tokens  |  {total_steps} steps  |  "
-              f"{total_micro} micro-batches  |  {n_models} models")
-        print(f"{'='*70}\n")
+        # Build and compile 5 models for this type
+        print(f"\n  Building 5 models:")
+        models_info = []
+        for name, arch in ARCHITECTURES:
+            model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
+            ne = non_emb_param_count(model)
+            print(f"    {name:>6}: dim={arch['dim']:>3}  non_emb={ne:>10,}")
+            models_info.append({
+                "name": name, "model_type": mt, "arch": arch,
+                "model": model, "ne": ne, "needs_blocks": needs_blocks,
+            })
 
-        results = train_one_budget(
-            models_info, tok_label, total_tokens, args.batch_size, args.grad_accum,
-            train_loader, eval_loader, device, gpu_tflops, args.eval_batches)
+        # Compile warmup for this type's 5 models
+        if use_compile:
+            print(f"  Compiling...")
+            compile_t0 = time.time()
+            dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
+            dummy_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
+            dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
+                           "blocks": dummy_blocks, "sft": False}
+            for m in models_info:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out = model_forward(m["model"], dummy_batch, m["needs_blocks"])
+                out["loss"].backward()
+                for p in m["model"].parameters():
+                    if p.grad is not None:
+                        p.grad = None
+            torch.cuda.synchronize()
+            print(f"  Compiled in {time.time() - compile_t0:.1f}s")
 
-        all_results[tok_label] = results
+        # Train all token budgets for this model type
+        for tok_label, total_tokens in budgets:
+            total_steps = max(1, total_tokens // tokens_per_step)
+            total_micro = total_steps * args.grad_accum
 
-        out_path = out_dir / f"parallel_{tok_label}tok_results.json"
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2)
+            print(f"\n  {'='*66}")
+            print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
+                  f"{total_micro} micro-batches")
+            print(f"  {'='*66}\n")
+
+            results = train_one_budget(
+                models_info, tok_label, total_tokens, args.batch_size, args.grad_accum,
+                train_loader, eval_loader, device, gpu_tflops, args.eval_batches)
+
+            # Merge into all_results[tok_label]
+            if tok_label not in all_results:
+                all_results[tok_label] = {}
+            all_results[tok_label].update(results)
+
+            # Save per-budget results (incrementally)
+            out_path = out_dir / f"parallel_{tok_label}tok_results.json"
+            with open(out_path, "w") as f:
+                json.dump(all_results[tok_label], f, indent=2)
+
+        # Free GPU memory before next model type
+        del models_info
+        torch.cuda.empty_cache()
 
     # ── Summary ─────────────────────────────────────────────────────────────
     sweep_time = time.time() - sweep_t0

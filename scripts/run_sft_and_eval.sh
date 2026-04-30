@@ -23,8 +23,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 SKIP_DATA=false
 EVAL_ONLY=false
@@ -91,7 +91,7 @@ if [ "$SKIP_DATA" = false ] && [ "$EVAL_ONLY" = false ]; then
     else
         # Update tokenizer path for 32k tokenizer
         sed -i 's|tokenizer/tokenizer.json|tokenizer/tokenizer_32k.json|g' data/retrieval_scripts/ultrachat.py 2>/dev/null || true
-        python data/retrieval_scripts/ultrachat.py
+        uv_run python data/retrieval_scripts/ultrachat.py
     fi
 else
     echo ""
@@ -118,7 +118,7 @@ if [ "$EVAL_ONLY" = false ]; then
         echo "────────────────────────────────────────────────────────────"
         echo "  SFT Training: ${label} (${config})"
         echo "────────────────────────────────────────────────────────────"
-        torchrun --nproc_per_node=1 training/sft.py \
+        uv_run torchrun --nproc_per_node=1 training/sft.py \
             --config-name="$config"
     done
 else
@@ -149,7 +149,7 @@ for i in "${!SFT_NAMES[@]}"; do
     echo "────────────────────────────────────────────────────────────"
     echo "  Evaluating: ${label} (SFT)"
     echo "────────────────────────────────────────────────────────────"
-    python evals/run_evals.py \
+    uv_run python evals/run_evals.py \
         --checkpoint "$checkpoint" \
         --evals "$EVAL_LIST" \
         --max-examples "$MAX_EVAL_EXAMPLES" \
@@ -177,7 +177,7 @@ for i in "${!SFT_NAMES[@]}"; do
 done
 
 if [ ${#BENCH_CKPTS[@]} -ge 2 ]; then
-    python evals/benchmark_efficiency.py \
+    uv_run python evals/benchmark_efficiency.py \
         --checkpoints "${BENCH_CKPTS[@]}" \
         --labels "${BENCH_LABELS[@]}" \
         --output evals/efficiency_results.json
@@ -200,7 +200,7 @@ for i in "${!SFT_NAMES[@]}"; do
 done
 
 if [ ${#SFT_RESULT_FILES[@]} -ge 2 ]; then
-    python evals/plot_comparison.py \
+    uv_run python evals/plot_comparison.py \
         --results "${SFT_RESULT_FILES[@]}" \
         --labels "${SFT_RESULT_LABELS[@]}" \
         --output-dir evals

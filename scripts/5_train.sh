@@ -11,7 +11,8 @@
 #   bash scripts/5_train.sh --resume checkpoints/dd_50m_1btok_<step>.pt
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 NUM_GPUS=${NUM_GPUS:-1}
 
@@ -33,7 +34,7 @@ echo ""
 
 mkdir -p checkpoints
 
-torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
+uv_run torchrun --nproc_per_node=${NUM_GPUS} training/pretrain.py \
     --config-name=runs/pretrain_50m \
     ${RESUME_ARGS}
 

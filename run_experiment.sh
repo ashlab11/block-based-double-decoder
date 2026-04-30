@@ -12,6 +12,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 export HYDRA_FULL_ERROR=1
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Block-Based Double Decoder — 15M params, 50M tokens"
@@ -19,12 +21,11 @@ echo "════════════════════════�
 
 # ── Step 1: Install dependencies ─────────────────────────────────────────────
 echo ""
-echo "── Step 1: Installing dependencies ──"
-pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets hydra-core omegaconf matplotlib tqdm flash-attn --no-build-isolation 2>/dev/null || true
-pip install -q torch==2.6.0 torchtune==0.6.0 torchao==0.6.1 transformers datasets hydra-core omegaconf matplotlib tqdm
+echo "── Step 1: Syncing uv environment ──"
+uv_sync_project
 
 # Verify GPU
-python -c "
+uv_run python -c "
 import torch
 print(f'PyTorch: {torch.__version__}')
 print(f'CUDA: {torch.cuda.is_available()}')
@@ -39,7 +40,7 @@ echo "── Step 2: Downloading 50M tokens from SlimPajama ──"
 if [ -f "data/Pretrain/slimpajama.jsonl" ]; then
     echo "  Data already downloaded, skipping."
 else
-    python data/retrieval_scripts/slimpajama.py --tokens 50000000
+    uv_run python data/retrieval_scripts/slimpajama.py --tokens 50000000
 fi
 
 # ── Step 3: Pack dataset into training-ready JSONL ───────────────────────────
@@ -48,7 +49,7 @@ echo "── Step 3: Packing dataset ──"
 if [ -f "data/Pretrain/slimpajama_packed.jsonl" ]; then
     echo "  Packed data already exists, skipping."
 else
-    python data/retrieval_scripts/pack_dataset.py
+    uv_run python data/retrieval_scripts/pack_dataset.py
 fi
 
 # Count lines to estimate training steps
@@ -64,8 +65,7 @@ echo ""
 
 mkdir -p checkpoints
 
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
-torchrun --nproc_per_node=1 training/pretrain.py
+uv_run torchrun --nproc_per_node=1 training/pretrain.py
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"

@@ -23,8 +23,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 SKIP_SETUP=false
 SKIP_DATA=false
@@ -103,7 +103,7 @@ if [ "$EVAL_ONLY" = false ]; then
         echo "────────────────────────────────────────────────────────────"
         echo "  Training: ${label} (${config})"
         echo "────────────────────────────────────────────────────────────"
-        torchrun --nproc_per_node=1 training/pretrain.py \
+        uv_run torchrun --nproc_per_node=1 training/pretrain.py \
             --config-name="$config"
     done
 else
@@ -134,7 +134,7 @@ for i in "${!NAMES[@]}"; do
     echo "────────────────────────────────────────────────────────────"
     echo "  Evaluating: ${label}"
     echo "────────────────────────────────────────────────────────────"
-    python evals/run_evals.py \
+    uv_run python evals/run_evals.py \
         --checkpoint "$checkpoint" \
         --evals "$EVAL_LIST" \
         --max-examples "$MAX_EVAL_EXAMPLES" \
@@ -157,7 +157,7 @@ for i in "${!NAMES[@]}"; do
 done
 
 if [ ${#RESULT_FILES[@]} -ge 2 ]; then
-    python evals/plot_comparison.py \
+    uv_run python evals/plot_comparison.py \
         --results "${RESULT_FILES[@]}" \
         --labels "${RESULT_LABELS[@]}"
 else

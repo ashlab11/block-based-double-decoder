@@ -12,6 +12,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 export HF_HUB_ENABLE_HF_TRANSFER=1
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Step 2: Data Pipeline (tokenizer + 6B tokens)"
@@ -27,10 +29,10 @@ else
         echo "  Tokenizer corpus already downloaded, skipping download."
     else
         echo "  Downloading tokenizer corpus (500M tokens)..."
-        python data/retrieval_scripts/tokenizer_corpus.py --tokens 500000000
+        uv_run python data/retrieval_scripts/tokenizer_corpus.py --tokens 500000000
     fi
     echo "  Training 32K BPE tokenizer..."
-    python tokenizer/hf_tokenizer.py \
+    uv_run python tokenizer/hf_tokenizer.py \
         --vocab-size 32768 \
         --corpus data/Pretrain/tokenizer_corpus.jsonl \
         --output tokenizer/tokenizer_32k.json
@@ -46,7 +48,7 @@ echo "── 2b: Downloading 6B tokens from DKYoon/SlimPajama-6B ──"
 if [ -f "data/Pretrain/slimpajama_6b.jsonl" ] || [ -f "data/Pretrain/slimpajama_6b_packed.jsonl" ]; then
     echo "  Data already downloaded (or already packed), skipping."
 else
-    python data/retrieval_scripts/slimpajama.py \
+    uv_run python data/retrieval_scripts/slimpajama.py \
         --tokens 6000000000 \
         --output-prefix slimpajama_6b
 fi
@@ -57,7 +59,7 @@ echo "── 2c: Packing dataset ──"
 if [ -f "data/Pretrain/slimpajama_6b_packed.jsonl" ]; then
     echo "  Packed data already exists, skipping."
 else
-    python data/retrieval_scripts/pack_dataset.py \
+    uv_run python data/retrieval_scripts/pack_dataset.py \
         --tokenizer tokenizer/tokenizer_32k.json \
         --input data/Pretrain/slimpajama_6b.jsonl \
         --output data/Pretrain/slimpajama_6b_packed.jsonl \

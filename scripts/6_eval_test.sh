@@ -5,10 +5,12 @@
 #   bash scripts/6_eval_test.sh checkpoints/model.pt
 
 set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 CHECKPOINT="${1:?Usage: bash scripts/6_eval_test.sh <checkpoint.pt>}"
 
-python evals/run_evals.py \
+uv_run python evals/run_evals.py \
     --checkpoint "$CHECKPOINT" \
     --evals all \
     --max-examples 1 \

@@ -11,8 +11,9 @@
 # Cost:       ~$0.50 (minimal GPU time)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export HYDRA_FULL_ERROR=1
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+source scripts/_uv.sh
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Step 3: Preflight Sanity Checks"

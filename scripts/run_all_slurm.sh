@@ -1,4 +1,13 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#SBATCH --job-name=test
+#SBATCH -o outputs/test.out
+#SBATCH --time=4:00:00
+#SBATCH --mem=64G
+#SBATCH -N 1
+#SBATCH --gres=gpu:1
+#SBATCH --partition=gpu-he
+#SBATCH --constraint=h100
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Full Pipeline: Pretrain → Eval → SFT → Eval → Efficiency → Plots
 #
@@ -22,8 +31,10 @@
 #   scp -P <port> -i ~/.ssh/id_ed25519 -r root@<host>:block-based-double-decoder/evals/ ~/Desktop/evals/
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
+echo "Current directory: $(pwd)"
 source scripts/_uv.sh
 
 SKIP_SETUP=false

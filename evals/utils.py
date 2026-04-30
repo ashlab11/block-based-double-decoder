@@ -527,8 +527,6 @@ def _gen_decoder_only(model, tokenizer, prompt, max_new_tokens, device, temperat
 
 
 def _gen_enc_dec(model, tokenizer, prompt, max_new_tokens, device, temperature, top_k):
-    from components.block_masks import create_inference_masks
-
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
     assistant_id = tokenizer.convert_tokens_to_ids("<assistant>")
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
@@ -543,15 +541,12 @@ def _gen_enc_dec(model, tokenizer, prompt, max_new_tokens, device, temperature, 
     enc_len = len(enc_ids)
     dec_pos = torch.tensor([[enc_len]], device=device)
 
+    # masks=None routes through the layer's flash-attn (or manual SDPA) inference
+    # branch, which natively computes causal-self + full-cross — same semantics as
+    # create_inference_masks but without rebuilding a BlockMask every decode step.
     for _ in range(max_new_tokens):
-        num_dec = dec_ids.shape[1]
-        try:
-            masks = create_inference_masks(device=device, enc_len=enc_len, dec_len=num_dec)
-        except Exception:
-            masks = None
-
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits = model.decode(dec_ids, enc_out, masks, dec_pos)
+            logits = model.decode(dec_ids, enc_out, None, dec_pos)
 
         next_tok = _sample_next(logits[:, -1, :], temperature, top_k)
         dec_ids = torch.cat([dec_ids, next_tok], dim=-1)
@@ -640,8 +635,6 @@ def _gen_batch_decoder_only(model, tokenizer, prompts, max_new_tokens, device):
 
 
 def _gen_batch_enc_dec(model, tokenizer, prompts, max_new_tokens, device):
-    from components.block_masks import create_inference_masks
-
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
     assistant_id = tokenizer.convert_tokens_to_ids("<assistant>")
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
@@ -666,15 +659,11 @@ def _gen_batch_enc_dec(model, tokenizer, prompts, max_new_tokens, device):
 
     finished = torch.zeros(B, dtype=torch.bool, device=device)
 
+    # masks=None routes through the layer's flash-attn (or manual SDPA) inference
+    # branch — see _gen_enc_dec for the rationale.
     for step in range(max_new_tokens):
-        num_dec = dec_ids.shape[1]
-        try:
-            masks = create_inference_masks(device=device, enc_len=max_enc_len, dec_len=num_dec)
-        except Exception:
-            masks = None
-
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits = model.decode(dec_ids, enc_out, masks, dec_pos)
+            logits = model.decode(dec_ids, enc_out, None, dec_pos)
 
         next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [B, 1] greedy
         next_tok[finished] = pad_id

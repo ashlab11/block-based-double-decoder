@@ -238,7 +238,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "model": m["model"], "opt": opt, "sched": sched, "ne": m["ne"],
             "needs_blocks": m["needs_blocks"], "arch": m["arch"],
             "step": 0, "micro": 0, "loss_sum": 0.0, "loss_n": 0,
-            "curve": [], "tokens_seen": 0,
+            "train_curve": [], "eval_curve": [], "tokens_seen": 0,
         })
 
     for t in trainers:
@@ -272,22 +272,32 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 t["step"] += 1
                 t["tokens_seen"] += tokens_per_step
                 avg_loss = t["loss_sum"] / t["loss_n"]
-                t["curve"].append((t["step"], round(avg_loss, 4)))
+                t["train_curve"].append((t["step"], t["tokens_seen"], round(avg_loss, 4)))
                 t["loss_sum"] = 0.0
                 t["loss_n"] = 0
 
         current_step = trainers[0]["step"]
-        if current_step > 0 and current_step % log_interval == 0 and trainers[0]["micro"] % grad_accum == 0:
+        is_step_boundary = trainers[0]["micro"] % grad_accum == 0
+
+        # Periodic eval (~5 eval points during training for loss curves)
+        eval_interval = max(1, total_steps // 5)
+        if current_step > 0 and is_step_boundary and current_step % eval_interval == 0:
+            for t in trainers:
+                eval_loss, _ = eval_model(t["model"], eval_loader, device,
+                                          eval_batches, t["needs_blocks"])
+                t["eval_curve"].append((t["step"], t["tokens_seen"], round(eval_loss, 4)))
+
+        # Log progress
+        if current_step > 0 and current_step % log_interval == 0 and is_step_boundary:
             elapsed = time.time() - t0
             total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
             mfu = total_flops / (elapsed * gpu_tflops * 1e12) * 100
-            # Log one line per model type
             print(f"    step {current_step:>5}/{total_steps}  "
                   f"[{elapsed:6.1f}s]  MFU={mfu:.1f}%")
             for mt in MODEL_TYPES:
                 mt_trainers = [t for t in trainers if t["model_type"] == mt]
                 if mt_trainers:
-                    losses = "  ".join(f'{t["name"]}={t["curve"][-1][1]:.3f}'
+                    losses = "  ".join(f'{t["name"]}={t["train_curve"][-1][2]:.3f}'
                                        for t in mt_trainers)
                     print(f"      {mt:>3}: {losses}")
 
@@ -310,12 +320,19 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         arch = t["arch"]
         total_params = sum(p.numel() for p in t["model"].parameters())
 
+        # Add final eval to eval_curve
+        final_eval = (t["step"], t["tokens_seen"], round(avg_loss, 4))
+        eval_curve = t["eval_curve"]
+        if not eval_curve or eval_curve[-1][0] != t["step"]:
+            eval_curve.append(final_eval)
+
         run_result = {
             "final_eval_loss": round(avg_loss, 4),
             "final_eval_ppl": round(ppl, 2),
             "total_steps": t["step"],
             "tokens_seen": t["tokens_seen"],
             "total_params": total_params,
+            "non_emb_params": t["ne"],
             "training_time_sec": round(train_time, 2),
             "model_type": t["model_type"],
             "hparams": {
@@ -331,8 +348,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 "grad_accum_steps": grad_accum,
                 "total_tokens": total_tokens,
             },
-            "train_curve": t["curve"],
-            "eval_curve": [(t["step"], round(avg_loss, 4))],
+            # Curves: each entry is [step, tokens_seen, loss]
+            "train_curve": t["train_curve"],
+            "eval_curve": eval_curve,
         }
 
         # Write: checkpoints/scaling/{prefix}_{size}_{tokens}tok_results.json

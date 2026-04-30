@@ -300,15 +300,28 @@ def cmd_collect(args):
         ))
 
         if args.curves:
-            for step, loss in data.get("train_curve", []):
+            for entry in data.get("train_curve", []):
+                # Support both (step, loss) and (step, tokens_seen, loss)
+                if len(entry) == 3:
+                    step, tokens_at_step, loss = entry
+                else:
+                    step, loss = entry
+                    tokens_at_step = None
                 curves.append(dict(
                     name=name, prefix=prefix, non_emb_params=ne,
-                    tokens=tokens, step=step, train_loss=loss,
+                    total_tokens=tokens, step=step,
+                    tokens_seen=tokens_at_step, train_loss=loss,
                 ))
-            for step, loss in data.get("eval_curve", []):
+            for entry in data.get("eval_curve", []):
+                if len(entry) == 3:
+                    step, tokens_at_step, loss = entry
+                else:
+                    step, loss = entry
+                    tokens_at_step = None
                 curves.append(dict(
                     name=name, prefix=prefix, non_emb_params=ne,
-                    tokens=tokens, step=step, eval_loss=loss,
+                    total_tokens=tokens, step=step,
+                    tokens_seen=tokens_at_step, eval_loss=loss,
                 ))
 
     # Sort labels for display
@@ -403,7 +416,7 @@ def cmd_collect(args):
     if args.curves and curves:
         print()
         print("--- TRAINING CURVES ---")
-        print("name\tmodel_type\tnon_emb_params\ttokens\tstep\ttrain_loss\teval_loss")
+        print("name\tmodel_type\tnon_emb_params\ttotal_tokens\tstep\ttokens_seen\ttrain_loss\teval_loss")
         from collections import defaultdict
         by_run = defaultdict(list)
         for c in curves:
@@ -413,8 +426,9 @@ def cmd_collect(args):
             for c in sorted(by_run[name_key], key=lambda x: x["step"]):
                 train_l = f"{c.get('train_loss', '')}" if c.get("train_loss") is not None else ""
                 eval_l = f"{c.get('eval_loss', '')}" if c.get("eval_loss") is not None else ""
-                print(f"{c['name']}\t{c['prefix']}\t{c['non_emb_params']}\t{c['tokens']}\t"
-                      f"{c['step']}\t{train_l}\t{eval_l}")
+                tok_seen = str(c["tokens_seen"]) if c.get("tokens_seen") is not None else ""
+                print(f"{c['name']}\t{c['prefix']}\t{c['non_emb_params']}\t{c['total_tokens']}\t"
+                      f"{c['step']}\t{tok_seen}\t{train_l}\t{eval_l}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────

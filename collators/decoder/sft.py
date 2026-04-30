@@ -35,8 +35,6 @@ class DecoderSFTCollator:
         for example in batch:
             #Tokenizer doesn't auto put <bos> into conversation, we need to do so ourselves
             #NOTE: The response BOS token MUST have decoder_input_pos of 0 (this fits how it works in pretraining
-            # Think I've solved this -- dec self DOESN'T look at <bos>, but it DOES have a sink token
-            # Then, during SFT, it doesn't need to look at a <bos> as long as it has a sink token?
             seqs.append([self.bos_token_id] + example["input_ids"] + example['output_ids'] + [self.eos_token_id])
             ctx_lens.append(len(example["input_ids"]) + 1) # +1 for the bos token
             

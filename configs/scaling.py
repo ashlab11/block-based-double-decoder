@@ -186,7 +186,7 @@ def build_scaling_config(params, tokens, mup_base_dim=0, lr=None, run_name=None)
         "gradient_checkpointing": arch["dim"] >= 256,
         "use_compile": False,
         "mup_base_dim": mup_base_dim,
-        "collator_cls": "BasicPretrainCollator",
+        "collator_cls": "DDPretrainCollator",
         "train_file": "data/Pretrain/slimpajama_6b_packed.jsonl",
         "eval_file": "data/Pretrain/slimpajama_6b_eval_packed.jsonl",
         "tokenizer_file": "tokenizer/tokenizer_32k.json",

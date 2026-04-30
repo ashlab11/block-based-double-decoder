@@ -44,11 +44,11 @@ class TrainingConfig:
     save_steps: int = 2000
 
     # ── Data & I/O ───────────────────────────────────────────────────────
-    train_file: str = "data/Pretrain/slimpajama_packed.jsonl"
-    eval_file: str = "data/Pretrain/slimpajama_eval_packed.jsonl"
+    train_file: str = "data/Pretrain/slimpajama_6b_packed.jsonl"
+    eval_file: str = "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
     output_dir: str = "checkpoints"
     output_file_name: str = "model"
-    tokenizer_file: str = "tokenizer/tokenizer.json"
+    tokenizer_file: str = "tokenizer/tokenizer_32k.json"
     input_model_name: str = ""
     resume_from: str = ""
 
@@ -99,16 +99,22 @@ def build_config_from_dict(cfg_dict) -> TrainingConfig:
         raise ValueError(f"Unknown model_cls: {model_cls_name}")
 
     # Resolve collator class
-    collator_cls_name = cfg_dict.pop("collator_cls", "BasicPretrainCollator")
-    if collator_cls_name == "BasicPretrainCollator":
-        from collators.double_decoder.pretrain import BasicPretrainCollator
-        collator_cls = BasicPretrainCollator
+    collator_cls_name = cfg_dict.pop("collator_cls", "DDPretrainCollator")
+    if collator_cls_name == "DDPretrainCollator":
+        from collators.double_decoder.pretrain import DDPretrainCollator
+        collator_cls = DDPretrainCollator
     elif collator_cls_name == "DecoderPretrainCollator":
         from collators.decoder.pretrain import DecoderPretrainCollator
         collator_cls = DecoderPretrainCollator
-    elif collator_cls_name == "BasicSFTCollator":
-        from collators.double_decoder.sft import BasicSFTCollator
-        collator_cls = BasicSFTCollator
+    elif collator_cls_name == "EDPretrainCollator":
+        from collators.encoder_decoder.pretrain import EDPretrainCollator
+        collator_cls = EDPretrainCollator
+    elif collator_cls_name == "DDSFTCollator":
+        from collators.double_decoder.sft import DDSFTCollator
+        collator_cls = DDSFTCollator
+    elif collator_cls_name == "EDSFTCollator":
+        from collators.encoder_decoder.sft import EDSFTCollator
+        collator_cls = EDSFTCollator
     elif collator_cls_name == "DecoderSFTCollator":
         from collators.decoder.sft import DecoderSFTCollator
         collator_cls = DecoderSFTCollator

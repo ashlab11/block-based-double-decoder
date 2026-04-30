@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from components.layers import CausalLayer
+from components.layers import BasicLayer
 import torch.nn.functional as F
 from components.initialization import initialize_model
 
@@ -29,7 +29,7 @@ class DecoderOnlyModel(nn.Module):
 
         # Encoder
         self.layers = nn.ModuleList([
-            CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len, mup=mup)
+            BasicLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len, mup=mup, causal=True)
             for _ in range(num_layers)
         ])
         

@@ -1,6 +1,6 @@
 # SFT: Double Decoder 50M on UltraChat
 model_cls: "Double_Decoder"
-collator_cls: "BasicSFTCollator"
+collator_cls: "DDSFTCollator"
 
 dim: 512
 num_encoder_layers: 8

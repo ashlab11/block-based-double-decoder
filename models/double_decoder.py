@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from components.layers import CausalLayer, ComboDecoderLayer
+from components.layers import BasicLayer, ComboDecoderLayer
 import torch.nn.functional as F
 from components.block_masks import create_sft_masks, create_pretrain_masks, create_inference_masks, create_masks
 from components.initialization import initialize_model
@@ -35,8 +35,8 @@ class Double_Decoder(nn.Module):
 
         # Encoder
         self.encoder_layers = nn.ModuleList([
-            CausalLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
-                        use_checkpoint=gradient_checkpointing, mup=mup)
+            BasicLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
+                        use_checkpoint=gradient_checkpointing, mup=mup, causal=True)
             for _ in range(num_encoder_layers)
         ])
 
@@ -128,7 +128,7 @@ class Double_Decoder(nn.Module):
         # Creating outputs
         encoder_output = self.encode(encoder_input_ids)
         logits = self.decode(decoder_input_ids, encoder_output, block_masks, decoder_input_positions)
-                
+        
         # Computing loss here
         if labels is not None:
             loss = F.cross_entropy(

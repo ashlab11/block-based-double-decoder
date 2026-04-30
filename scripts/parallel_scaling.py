@@ -201,8 +201,7 @@ def model_forward(model, batch, needs_blocks):
 
 
 def eval_model(model, eval_loader, device, max_batches, needs_blocks):
-    eager = getattr(model, "_orig_mod", model)
-    eager.eval()
+    model.eval()
     total_loss, total_tok = 0.0, 0
     with torch.no_grad():
         for i, raw_batch in enumerate(eval_loader):
@@ -212,11 +211,16 @@ def eval_model(model, eval_loader, device, max_batches, needs_blocks):
                      if isinstance(v, torch.Tensor) else v
                      for k, v in raw_batch.items()}
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model_forward(eager, batch, needs_blocks)
+                try:
+                    out = model_forward(model, batch, needs_blocks)
+                except Exception:
+                    # Fallback to eager if compiled eval hits inductor bugs
+                    eager = getattr(model, "_orig_mod", model)
+                    out = model_forward(eager, batch, needs_blocks)
             ntok = (batch["labels"] != -100).sum().item()
             total_loss += out["loss"].item() * ntok
             total_tok += ntok
-    eager.train()
+    model.train()
     avg_loss = total_loss / max(1, total_tok)
     ppl = float(torch.exp(torch.tensor(avg_loss)))
     return avg_loss, ppl
@@ -285,8 +289,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         current_step = trainers[0]["step"]
         is_step_boundary = trainers[0]["micro"] % grad_accum == 0
 
-        # Periodic eval (~5 eval points, but not for very short runs)
-        eval_interval = max(10, total_steps // 5)
+        # Periodic eval (~5 eval points during training for loss curves)
+        eval_interval = max(1, total_steps // 5)
         if current_step > 0 and is_step_boundary and current_step % eval_interval == 0:
             for t in trainers:
                 eval_loss, _ = eval_model(t["model"], eval_loader, device,

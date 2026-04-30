@@ -25,7 +25,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -61,204 +60,38 @@ GPU_PEAK_TFLOPS = {
 }
 
 
-# ── Monkey-patches for fast tensor masks ────────────────────────────────────
+# ── Monkey-patch: cache block masks across models ───────────────────────────
 #
-# The block structure is simple:
-#   self_mask[q, kv]  = (q >= kv) AND (same_block)
-#   cross_mask[q, kv] = (kv_block < q_block) OR (kv == 0)
-#
-# flex_attention's create_block_mask(_compile=True) runs torch.compile to
-# build fused kernels for these masks — great for long sequences, but the
-# compilation overhead dominates for small models at seq_len=2048.
-#
-# Instead, we create [seq_len, seq_len] boolean tensors (16MB total) and
-# use standard SDPA / manual attention. Same block structure, no compile.
+# flex_attention's fused kernels are faster than manual attention (no O(N²)
+# score materialization). The overhead is create_block_mask compilation,
+# which happens once. But create_masks is called 5× per batch (once per
+# model) — we cache the result since all models share the same batch.
 
-def _create_pretrain_masks_tensor(blocks, seq_len, device):
-    """Same semantics as create_pretrain_masks, returns plain bool tensors."""
-    from components.block_masks import _precompute_block_ids
-    block_ids = _precompute_block_ids(blocks, seq_len, device)
-    pos = torch.arange(seq_len, device=device)
+_mask_cache_blocks_id = None
+_mask_cache_result = None
 
-    # Self: causal AND same block
-    causal = pos[:, None] >= pos[None, :]                    # [Q, KV]
-    same_block = block_ids[:, None] == block_ids[None, :]    # [Q, KV]
-    self_mask = causal & same_block
-
-    # Cross: previous block OR first token
-    earlier = block_ids[None, :] < block_ids[:, None]        # [Q, KV]
-    first_token = pos[None, :] == 0                          # [1, KV]
-    cross_mask = earlier | first_token
-
-    return {"self_mask": self_mask, "cross_mask": cross_mask}
-
-
-def _patched_create_masks(batch_size, blocks, device, input_ids,
-                          encoder_input_ids, decoder_input_ids, sft):
-    """Drop-in replacement for block_masks.create_masks using tensor masks."""
-    if sft:
-        # SFT not used in scaling runs — fall back to original
-        from components.block_masks import create_sft_masks
-        return create_sft_masks(batch_size, blocks, device,
-                                encoder_input_ids.shape[1],
-                                decoder_input_ids.shape[1])
-    return _create_pretrain_masks_tensor(blocks, input_ids.shape[1], device)
-
-
-def _patched_self_attn_forward(self, x, block_masks=None, input_pos=None, **kwargs):
-    """SelfAttention.forward with tensor mask support via SDPA."""
-    B, L, D = x.size()
-
-    qkv = self.qkv(x)
-    query, key, value = torch.split(qkv, [self.dim, self.dim, self.dim], dim=-1)
-    query = query.reshape(B, L, self.num_heads, self.head_dim)
-    key = key.reshape(B, L, self.num_heads, self.head_dim)
-    value = value.reshape(B, L, self.num_heads, self.head_dim)
-
-    query = self.rotary_emb(query, input_pos=input_pos)
-    key = self.rotary_emb(key, input_pos=input_pos)
-
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-
-    self_mask = None if block_masks is None else block_masks['self_mask']
-
-    if self_mask is None:
-        output = F.scaled_dot_product_attention(
-            query, key, value, is_causal=True, scale=self.attn_scale)
-    elif isinstance(self_mask, torch.Tensor):
-        # Tensor mask: use SDPA with bool attn_mask [Q, KV]
-        output = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=self_mask, scale=self.attn_scale)
-    else:
-        from torch.nn.attention.flex_attention import flex_attention
-        output = flex_attention(query, key, value,
-                                block_mask=self_mask, scale=self.attn_scale)
-
-    if self.gating:
-        gating_modulator = self.gater(x).reshape(B, self.num_heads, L, self.head_dim)
-        output = output * gating_modulator
-
-    output = output.transpose(1, 2).reshape(B, L, D)
-    return self.out_proj(output)
-
-
-def _patched_combo_attn_forward(self, x, encoder_inputs,
-                                block_masks=None, decoder_input_positions=None):
-    """ComboAttention.forward with tensor mask support via manual attention."""
-    B, L, D = x.size()
-    _, L_enc, _ = encoder_inputs.size()
-
-    # --- Projections (unchanged) ---
-    query = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
-
-    dec_kv = self.kv_proj(x) if self.shared else self.dec_kv_proj(x)
-    dec_key, dec_value = torch.split(dec_kv, [self.dim, self.dim], dim=-1)
-    dec_key = dec_key.reshape(B, L, self.num_heads, self.head_dim)
-    dec_value = dec_value.reshape(B, L, self.num_heads, self.head_dim)
-
-    query = self.query_rotary(query, input_pos=decoder_input_positions)
-    dec_key = self.key_rotary(dec_key, input_pos=decoder_input_positions)
-
-    query = query.transpose(1, 2)
-    dec_key = dec_key.transpose(1, 2)
-    dec_value = dec_value.transpose(1, 2)
-
-    enc_kv = self.kv_proj(encoder_inputs) if self.shared else self.enc_kv_proj(encoder_inputs)
-    enc_key, enc_value = torch.split(enc_kv, [self.dim, self.dim], dim=-1)
-    enc_key = enc_key.reshape(B, L_enc, self.num_heads, self.head_dim)
-    enc_value = enc_value.reshape(B, L_enc, self.num_heads, self.head_dim)
-
-    enc_key = self.key_rotary(enc_key)
-    enc_key = enc_key.transpose(1, 2)
-    enc_value = enc_value.transpose(1, 2)
-
-    # --- Attention ---
-    try:
-        from flash_attn import flash_attn_func
-        HAS_FLASH = True
-    except ImportError:
-        HAS_FLASH = False
-
-    use_flash = block_masks is None and HAS_FLASH
-
-    if use_flash:
-        query, enc_key, dec_key = query.transpose(1, 2), enc_key.transpose(1, 2), dec_key.transpose(1, 2)
-        enc_value, dec_value = enc_value.transpose(1, 2), dec_value.transpose(1, 2)
-        dec_output, dec_lse, _ = flash_attn_func(
-            query, dec_key, dec_value, causal=True,
-            return_attn_probs=True, softmax_scale=self.attn_scale)
-        enc_output, enc_lse, _ = flash_attn_func(
-            query, enc_key, enc_value, causal=False,
-            return_attn_probs=True, softmax_scale=self.attn_scale)
-
-    elif block_masks is None or isinstance(block_masks.get('self_mask'), torch.Tensor):
-        # Manual attention: either no masks or tensor block masks.
-        # We need LSE for the sigmoid gate, so compute scores explicitly.
-        scale = self.attn_scale or 1.0 / (self.head_dim ** 0.5)
-
-        # Decoder self-attention
-        dec_scores = torch.matmul(query, dec_key.transpose(-2, -1)) * scale
-        if block_masks is not None:
-            # Tensor block mask [Q, KV] broadcasts to [B, H, Q, KV]
-            dec_scores.masked_fill_(~block_masks['self_mask'], float('-inf'))
+def _cached_create_masks(batch_size, blocks, device, input_ids,
+                         encoder_input_ids, decoder_input_ids, sft):
+    """Cache block masks per batch — all 5 models share the same blocks."""
+    global _mask_cache_blocks_id, _mask_cache_result
+    blocks_id = id(blocks)
+    if blocks_id != _mask_cache_blocks_id:
+        _mask_cache_blocks_id = blocks_id
+        from components.block_masks import create_pretrain_masks, create_sft_masks
+        if sft:
+            _mask_cache_result = create_sft_masks(
+                batch_size, blocks, device,
+                encoder_input_ids.shape[1], decoder_input_ids.shape[1])
         else:
-            causal_mask = torch.triu(
-                torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1)
-            dec_scores.masked_fill_(causal_mask, float('-inf'))
-        dec_lse = torch.logsumexp(dec_scores, dim=-1)
-        dec_attn = torch.softmax(dec_scores, dim=-1)
-        dec_output = torch.matmul(dec_attn, dec_value)
-
-        # Encoder cross-attention
-        enc_scores = torch.matmul(query, enc_key.transpose(-2, -1)) * scale
-        if block_masks is not None:
-            enc_scores.masked_fill_(~block_masks['cross_mask'], float('-inf'))
-        enc_lse = torch.logsumexp(enc_scores, dim=-1)
-        enc_attn = torch.softmax(enc_scores, dim=-1)
-        enc_output = torch.matmul(enc_attn, enc_value)
-
-    else:
-        # flex_attention path (BlockMask objects)
-        from torch.nn.attention.flex_attention import flex_attention
-        self_mask = block_masks['self_mask']
-        cross_mask = block_masks['cross_mask']
-        dec_output, dec_lse = flex_attention(
-            query, dec_key, dec_value,
-            block_mask=self_mask, return_lse=True, scale=self.attn_scale)
-        enc_output, enc_lse = flex_attention(
-            query, enc_key, enc_value,
-            block_mask=cross_mask, return_lse=True, scale=self.attn_scale)
-
-    # --- Mixing (unchanged) ---
-    if self.logit_biases:
-        dec_lse = ((dec_lse + self.logit_bias_proj[:, 0].reshape(1, self.num_heads, 1))
-                   * self.mix_temp.reshape(1, self.num_heads, 1))
-        enc_lse = ((enc_lse + self.logit_bias_proj[:, 1].reshape(1, self.num_heads, 1))
-                   * self.mix_temp.reshape(1, self.num_heads, 1))
-
-    dec_w = torch.sigmoid(dec_lse - enc_lse).unsqueeze(-1)
-    dec_w = dec_w.transpose(1, 2) if use_flash else dec_w
-    output = dec_w * dec_output + (1 - dec_w) * enc_output
-
-    output = output.reshape(B, L, D) if use_flash else output.transpose(1, 2).reshape(B, L, D)
-    return self.out_proj(output)
+            _mask_cache_result = create_pretrain_masks(
+                blocks, input_ids.shape[1], device)
+    return _mask_cache_result
 
 
 def install_fast_masks():
-    """Monkey-patch block_masks and attention modules for fast tensor masks."""
-    import components.block_masks as bm
+    """Monkey-patch create_masks with a cached version."""
     import models.double_decoder as dd
-    from components.attention import SelfAttention, ComboAttention
-
-    # Patch both the module AND the double_decoder's imported reference,
-    # since double_decoder.py does `from components.block_masks import create_masks`
-    # which creates its own binding that doesn't update when we patch the module.
-    bm.create_masks = _patched_create_masks
-    dd.create_masks = _patched_create_masks
-    SelfAttention.forward = _patched_self_attn_forward
-    ComboAttention.forward = _patched_combo_attn_forward
+    dd.create_masks = _cached_create_masks
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

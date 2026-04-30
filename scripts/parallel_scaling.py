@@ -336,14 +336,15 @@ def main():
     parser = argparse.ArgumentParser(description="Parallel scaling-law training")
     parser.add_argument("--tokens", type=int, default=10_000_000,
                         help="Total training tokens per model (default: 10M)")
-    parser.add_argument("--batch-size", type=int, default=16,
-                        help="Micro-batch size in sequences (default: 16)")
-    parser.add_argument("--grad-accum", type=int, default=32,
-                        help="Gradient accumulation steps (default: 32, eff_batch=512)")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Micro-batch size in sequences (default: 32)")
+    parser.add_argument("--grad-accum", type=int, default=16,
+                        help="Gradient accumulation steps (default: 16, eff_batch=512)")
     parser.add_argument("--eval-batches", type=int, default=10,
                         help="Number of eval batches per model (default: 10)")
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (on by default)")
     parser.add_argument("--train-file", type=str,
                         default="data/Pretrain/slimpajama_6b_packed.jsonl")
     parser.add_argument("--eval-file", type=str,
@@ -355,7 +356,10 @@ def main():
     device = torch.device("cuda")
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.set_float32_matmul_precision("high")  # TF32 for fp32 matmuls
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    use_compile = not args.no_compile
 
     # Patch in fast tensor masks (no flex_attention / torch.compile overhead)
     install_fast_masks()
@@ -370,8 +374,7 @@ def main():
     print(f"Tokens per model: {args.tokens:,}  |  Optimizer steps: {total_steps}")
     print(f"Effective batch: {args.batch_size} × {args.grad_accum} = "
           f"{args.batch_size * args.grad_accum} seqs = {tokens_per_step:,} tok/step")
-    if args.compile:
-        print("torch.compile: ENABLED (first few steps will be slow)")
+    print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
     tokenizer = PreTrainedTokenizerFast(
@@ -408,7 +411,7 @@ def main():
     print(f"\nBuilding {len(ARCHITECTURES)} models:\n")
     trainers = []
     for name, arch in ARCHITECTURES:
-        model = build_model(arch, vocab_size, device, use_compile=args.compile)
+        model = build_model(arch, vocab_size, device, use_compile=use_compile)
         opt = build_optimizer(model, arch["dim"])
         sched = build_scheduler(opt, total_steps)
         ne = non_emb_param_count(model)
@@ -439,6 +442,23 @@ def main():
     for t in trainers:
         t["model"].train()
         t["opt"].zero_grad(set_to_none=True)
+
+    # Warmup: trigger torch.compile tracing on a dummy batch
+    if use_compile:
+        print("\nCompiling models (one-time cost)...")
+        compile_t0 = time.time()
+        dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
+        dummy_labels = dummy_ids.clone()
+        dummy_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
+        dummy_batch = {"input_ids": dummy_ids, "labels": dummy_labels,
+                       "blocks": dummy_blocks, "sft": False}
+        for t in trainers:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = t["model"](**dummy_batch)
+            out["loss"].backward()
+            t["opt"].zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        print(f"  Compiled in {time.time() - compile_t0:.1f}s\n")
 
     t0 = time.time()
 

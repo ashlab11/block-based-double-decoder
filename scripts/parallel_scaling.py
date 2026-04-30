@@ -137,9 +137,14 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False):
             init_strategy="xavier_uniform", gradient_checkpointing=False,
             mup_base_dim=MUP_BASE_DIM)
     elif model_type == "sed":
+        # StandardDecoder layers are 16d² (self+cross+MLP) vs DD's 12d².
+        # Use fewer decoder layers to match DD/Dec param count at same width:
+        # DD: (enc+dec)*12d² = 144d²;  SED: enc*12d² + sed_dec*16d² = 144d²
+        # → sed_dec = dec * 12/16 = dec * 3/4
+        sed_dec = max(1, (dec * 3) // 4)
         model = StandardEncDec(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
-            num_encoder_layers=enc, num_decoder_layers=dec,
+            num_encoder_layers=enc, num_decoder_layers=sed_dec,
             seq_len=SEQ_LEN, init_strategy="xavier_uniform",
             gradient_checkpointing=False, mup_base_dim=MUP_BASE_DIM)
     elif model_type == "dec":

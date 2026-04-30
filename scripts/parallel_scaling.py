@@ -413,6 +413,10 @@ def main():
     use_compile = not args.no_compile
     install_fast_masks()
 
+    # 15 models × multiple inner functions need >8 cached compiled graphs
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 64
+
     gpu_tflops = detect_gpu_tflops()
     gpu_name = torch.cuda.get_device_name(0)
     tokens_per_step = args.batch_size * args.grad_accum * SEQ_LEN

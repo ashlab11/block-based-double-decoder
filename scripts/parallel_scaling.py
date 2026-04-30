@@ -121,15 +121,27 @@ GPU_PEAK_TFLOPS = {
 
 # ── Monkey-patch: cache block masks across models ───────────────────────────
 
-_mask_cache_blocks_id = None
+_mask_cache_key = None
 _mask_cache_result = None
 
+@torch.compiler.disable()  # mirror create_masks in components/block_masks.py;
+# without this, Inductor traces the cache lookup, builds dynamo guards that
+# hold refs to `blocks`, and recompiles every time `blocks` is GC'd.
 def _cached_create_masks(batch_size, blocks, device, input_ids,
                          encoder_input_ids, decoder_input_ids, sft):
-    global _mask_cache_blocks_id, _mask_cache_result
-    blocks_id = id(blocks)
-    if blocks_id != _mask_cache_blocks_id:
-        _mask_cache_blocks_id = blocks_id
+    global _mask_cache_key, _mask_cache_result
+    # Cache key MUST include seq_len: Python id() can be reused across
+    # GC'd tensors of different shapes, so id(blocks) alone returns stale
+    # block_masks during eval where seq_len varies per batch (e.g. lambada).
+    if sft:
+        seq_len_key = (encoder_input_ids.shape[1], decoder_input_ids.shape[1])
+        bs_key = batch_size
+    else:
+        seq_len_key = input_ids.shape[1]
+        bs_key = None
+    cache_key = (id(blocks), seq_len_key, sft, bs_key)
+    if cache_key != _mask_cache_key:
+        _mask_cache_key = cache_key
         from components.block_masks import create_pretrain_masks, create_sft_masks
         if sft:
             _mask_cache_result = create_sft_masks(

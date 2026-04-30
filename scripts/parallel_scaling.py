@@ -1183,9 +1183,16 @@ def main():
                 with open(out_path, "w") as f:
                     json.dump(all_results[tok_label], f, indent=2)
 
-        # Free GPU memory before next model type
+        # Wipe compile/mask caches before the next model type. Without
+        # this, DD's compiled flex_attention HOP graphs (with closure
+        # cells holding DD-era block_ids tensors) sit in dynamo's cache
+        # and can match guards on SED's first variable-shape eval call,
+        # producing a stale-tensor-reference CUDA IMA. Observed
+        # concretely as SED bpb crashing right after DD's full cycle
+        # finished. The reset costs ~one recompile on SED's first
+        # batch, much cheaper than a debug rerun.
         del models_info
-        torch.cuda.empty_cache()
+        _reset_compile_caches()
 
     # ── Summary ─────────────────────────────────────────────────────────────
     sweep_time = time.time() - sweep_t0

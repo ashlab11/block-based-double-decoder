@@ -285,8 +285,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         current_step = trainers[0]["step"]
         is_step_boundary = trainers[0]["micro"] % grad_accum == 0
 
-        # Periodic eval (~5 eval points during training for loss curves)
-        eval_interval = max(1, total_steps // 5)
+        # Periodic eval (~5 eval points, but not for very short runs)
+        eval_interval = max(10, total_steps // 5)
         if current_step > 0 and is_step_boundary and current_step % eval_interval == 0:
             for t in trainers:
                 eval_loss, _ = eval_model(t["model"], eval_loader, device,

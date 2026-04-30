@@ -372,7 +372,8 @@ def main():
     print("\nEvaluating...")
     results = {}
     for t in trainers:
-        model = t["model"]
+        # Use eager model for eval (torch.compile retrace hits inductor bugs)
+        model = getattr(t["model"], "_orig_mod", t["model"])
         model.eval()
         total_loss, total_tok = 0.0, 0
         with torch.no_grad():

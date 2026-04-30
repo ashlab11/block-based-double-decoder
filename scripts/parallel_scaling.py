@@ -249,9 +249,14 @@ def _patched_combo_attn_forward(self, x, encoder_inputs,
 def install_fast_masks():
     """Monkey-patch block_masks and attention modules for fast tensor masks."""
     import components.block_masks as bm
+    import models.double_decoder as dd
     from components.attention import SelfAttention, ComboAttention
 
+    # Patch both the module AND the double_decoder's imported reference,
+    # since double_decoder.py does `from components.block_masks import create_masks`
+    # which creates its own binding that doesn't update when we patch the module.
     bm.create_masks = _patched_create_masks
+    dd.create_masks = _patched_create_masks
     SelfAttention.forward = _patched_self_attn_forward
     ComboAttention.forward = _patched_combo_attn_forward
 

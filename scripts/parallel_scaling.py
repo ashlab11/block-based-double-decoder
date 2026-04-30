@@ -148,7 +148,7 @@ def main():
     parser.add_argument("--eval-file", type=str,
                         default="data/Pretrain/slimpajama_6b_eval_packed.jsonl")
     parser.add_argument("--tokenizer-file", type=str,
-                        default="tokenizer/tokenizer.json")
+                        default="tokenizer/tokenizer_32k.json")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -248,6 +248,14 @@ def main():
             k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in raw_batch.items()
         }
+
+        # Sanity check on first batch
+        if batch_idx == 0:
+            max_id = batch["input_ids"].max().item()
+            assert max_id < vocab_size, (
+                f"Token ID {max_id} >= vocab_size {vocab_size}. "
+                f"Data was likely tokenized with a different tokenizer. "
+                f"Try --tokenizer-file tokenizer/tokenizer_32k.json")
 
         # Forward + backward for each model sequentially.
         # block_masks.py uses a global (_pretrain_block_ids) set during

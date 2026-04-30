@@ -78,9 +78,11 @@ def non_emb_param_count(model):
 
 
 def build_model(arch, vocab_size, device, use_compile=False):
+    dim = arch["dim"]
     model = Double_Decoder(
         vocab_size=vocab_size,
-        dim=arch["dim"],
+        dim=dim,
+        num_heads=dim // 64,
         num_encoder_layers=arch["num_encoder_layers"],
         num_decoder_layers=arch["num_decoder_layers"],
         seq_len=SEQ_LEN,

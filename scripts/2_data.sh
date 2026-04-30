@@ -142,10 +142,28 @@ if [ "$NEED_SLOW_PATH" = true ]; then
     fi
 fi
 
+# ── 2d: SFT data (UltraChat) ────────────────────────────────────────────────
+# Used by parallel_scaling.py --run-sft. ~50M tokens, ~5 min download+tokenize.
+# Skipped if the JSONL already exists.
+echo ""
+echo "── 2d: SFT data (UltraChat 50M tokens) ──"
+mkdir -p data/SFT
+if [ -f "data/SFT/ultrachat.jsonl" ] && [ -f "data/SFT/ultrachat_eval.jsonl" ]; then
+    echo "  SFT data already exists, skipping."
+else
+    echo "  Tokenizing UltraChat with tokenizer/tokenizer_32k.json..."
+    python data/retrieval_scripts/ultrachat.py \
+        --tokenizer tokenizer/tokenizer_32k.json \
+        --target-tokens 50000000 \
+        --out-dir data/SFT
+fi
+
 TRAIN_LINES=$(wc -l < data/Pretrain/slimpajama_6b_packed.jsonl)
+SFT_LINES=$(wc -l < data/SFT/ultrachat.jsonl 2>/dev/null || echo "0")
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Data pipeline complete ✓"
-echo "  Packed sequences: $TRAIN_LINES"
+echo "  Packed pretrain sequences: $TRAIN_LINES"
+echo "  SFT pairs: $SFT_LINES"
 echo "  Next: bash scripts/3_preflight.sh"
 echo "═══════════════════════════════════════════════════════════════"

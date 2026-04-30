@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # ------------------------------------------------------------------
 
+import argparse
 from datasets import load_dataset
 from pathlib import Path
 import json
@@ -12,9 +13,16 @@ from transformers import PreTrainedTokenizerFast
 
 
 # -------- settings -------------------------------------------------
-OUT_DIR = Path("data/SFT")
-OUT_DIR.mkdir(exist_ok=True)
-target_tokens = 50_000_000 # 50M tokens
+parser = argparse.ArgumentParser(description="Retrieve and tokenize UltraChat for SFT.")
+parser.add_argument("--tokenizer", default="tokenizer/tokenizer_32k.json",
+                    help="Tokenizer file (must match the one used for pretraining)")
+parser.add_argument("--target-tokens", type=int, default=50_000_000)
+parser.add_argument("--out-dir", default="data/SFT")
+args = parser.parse_args()
+
+OUT_DIR = Path(args.out_dir)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+target_tokens = args.target_tokens
 # Maximum total tokens for a single training pair (includes +1 BOS and +1 EOS added later)
 SEQ_LEN = 2048
 # Batch size for on-the-fly tokenization
@@ -22,6 +30,7 @@ BATCH_SIZE = 64
 
 # -------- main loop ------------------------------------------------
 print(f"▶ Retrieving {target_tokens // 1_000_000}M tokens from Ultrachat")
+print(f"  Tokenizer: {args.tokenizer}")
 
 try:
     ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
@@ -33,9 +42,12 @@ tok_so_far    = 0
 output_file   = OUT_DIR / "ultrachat.jsonl"
 test_file     = OUT_DIR / "ultrachat_eval.jsonl"
 
-# Initialize tokenizer once
+# Initialize tokenizer once. Default is tokenizer_32k.json (matches what
+# parallel_scaling.py and the pretraining configs use). The legacy
+# tokenizer.json has a different (smaller) vocab and would silently produce
+# wrong token IDs.
 tokenizer = PreTrainedTokenizerFast(
-    tokenizer_file="tokenizer/tokenizer.json"
+    tokenizer_file=args.tokenizer
 )
 
 print(f"Writing to {output_file}")

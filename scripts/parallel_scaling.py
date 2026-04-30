@@ -27,6 +27,13 @@ Usage:
     python scripts/parallel_scaling.py --dry-run                    # plan only
     python scripts/parallel_scaling.py --skip-full-eval             # PPL only
     python scripts/parallel_scaling.py --mid-eval-points 5          # 5 mid evals
+
+    # Smoke test: pretrain + paper_full evals + SFT + paper_full evals (post-SFT).
+    # Requires data/SFT/ultrachat.jsonl — run data/retrieval_scripts/ultrachat.py first.
+    python scripts/parallel_scaling.py \\
+        --arch-set large --only-arch 5M --token-set large --token-budgets 100M \\
+        --auto-batch-size --eval-suite paper_full --eval-max-examples 50 \\
+        --run-sft --sft-tokens 50000000
 """
 
 import sys
@@ -53,6 +60,8 @@ from models.double_decoder import Double_Decoder
 from models.standard_enc_dec import StandardEncDec
 from models.decoder import DecoderOnlyModel
 from collators.double_decoder.pretrain import BasicPretrainCollator
+from collators.double_decoder.sft import BasicSFTCollator
+from collators.decoder.sft import DecoderSFTCollator
 from components.initialization import initialize_model
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -336,6 +345,102 @@ def eval_model(model, eval_loader, device, max_batches, needs_blocks):
     return avg_loss, ppl
 
 
+# ── SFT helpers ─────────────────────────────────────────────────────────────
+
+def build_sft_collator(model_type, tokenizer, seq_len):
+    """Pick the right SFT collator for the model type.
+    DD/SED use BasicSFTCollator (encoder + decoder split with cross-attn block_masks).
+    DecoderOnly uses DecoderSFTCollator (single sequence with masked-context labels).
+    """
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+    eos_id = tokenizer.convert_tokens_to_ids("</s>")
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+    cls = DecoderSFTCollator if model_type == "dec" else BasicSFTCollator
+    return cls(bos_token_id=bos_id, eos_token_id=eos_id,
+               pad_token_id=pad_id, max_seq_len=seq_len)
+
+
+def build_sft_optimizer(model, dim, base_lr):
+    """SFT optimizer: same μP-aware param groups as pretrain but with the
+    much smaller SFT base LR (e.g. 2e-5). Embedding + output projection get
+    base_lr; hidden weights get base_lr × (mup_base_dim / dim)."""
+    mup_mult = MUP_BASE_DIM / dim
+    embed_params, hidden_decay, no_decay = [], [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "embedding" in name or "output_projection" in name:
+            embed_params.append(p)
+        elif isinstance(dict(model.named_modules()).get(
+                name.rsplit(".", 1)[0]), (nn.LayerNorm, nn.RMSNorm)):
+            no_decay.append(p)
+        elif p.dim() <= 1:
+            no_decay.append(p)
+        else:
+            hidden_decay.append(p)
+    return AdamW([
+        {"params": embed_params, "lr": base_lr, "weight_decay": 0.1},
+        {"params": hidden_decay, "lr": base_lr * mup_mult, "weight_decay": 0.1},
+        {"params": no_decay, "lr": base_lr, "weight_decay": 0.0},
+    ], betas=(0.9, 0.95), eps=1e-8, fused=True)
+
+
+def sft_one_model(trainer, sft_loader, device, total_micro_batches,
+                  grad_accum, base_lr, log_interval=None):
+    """Run SFT on a single trainer's model for `total_micro_batches // grad_accum`
+    optimizer steps. Modifies the model in-place. Returns (avg_loss, train_time_sec, n_steps).
+
+    Uses the same compiled forward as pretrain — torch.compile will trace a new
+    graph on the first SFT forward (different kwargs: encoder_input_ids/
+    decoder_input_ids/sft=True for DD/SED) and cache it. ~30s warmup then fast.
+    """
+    eager = getattr(trainer["model"], "_orig_mod", trainer["model"])
+    eager.train()
+    opt = build_sft_optimizer(trainer["model"], trainer["arch"]["dim"], base_lr)
+    total_steps = max(1, total_micro_batches // grad_accum)
+    sched = build_scheduler(opt, total_steps)  # reuse 5%-warmup linear-decay
+    if log_interval is None:
+        log_interval = max(1, total_steps // 10)
+
+    opt.zero_grad(set_to_none=True)
+    losses = []
+    micro = 0
+    step = 0
+    t0 = time.time()
+
+    for batch_idx, raw_batch in enumerate(sft_loader):
+        if batch_idx >= total_micro_batches:
+            break
+        batch = {k: (v.to(device, non_blocking=True)
+                     if isinstance(v, torch.Tensor) else v)
+                 for k, v in raw_batch.items()}
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = trainer["model"](**batch)
+            loss = out["loss"]
+        (loss / grad_accum).backward()
+        losses.append(loss.detach().item())
+        micro += 1
+
+        if micro % grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(eager.parameters(), 1.0)
+            opt.step()
+            sched.step()
+            opt.zero_grad(set_to_none=True)
+            step += 1
+            if step % log_interval == 0:
+                recent = losses[-grad_accum:] if len(losses) >= grad_accum else losses
+                avg = sum(recent) / max(1, len(recent))
+                elapsed = time.time() - t0
+                print(f"      [sft {trainer['display']}] step {step}/{total_steps}  "
+                      f"loss={avg:.3f}  [{elapsed:.0f}s]")
+
+    train_time = time.time() - t0
+    # Average of last 10% of losses gives a stable end-of-training number.
+    tail = max(1, len(losses) // 10)
+    avg_final_loss = sum(losses[-tail:]) / tail if losses else float("nan")
+    return avg_final_loss, train_time, step
+
+
 # ── Training one token budget ───────────────────────────────────────────────
 
 def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accum,
@@ -343,7 +448,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                      output_dir, mid_eval_points=0,
                      run_full_eval=True, eval_suite="paper", eval_max_examples=500,
                      eval_data_file="data/Pretrain/slimpajama_eval_packed.jsonl",
-                     tokenizer=None):
+                     tokenizer=None,
+                     run_sft=False, sft_train_file=None, sft_eval_file=None,
+                     sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4):
     """Train all co-resident models for one token budget. After training,
     run held-out PPL eval, then (optionally) the full benchmark suite, and
     write per-run JSONs into output_dir.
@@ -501,39 +608,126 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "eval_curve": eval_curve,
         }
 
-        # Full eval suite (in-process; reuses already-compiled graph; pass
+        # Pre-SFT eval suite (in-process; reuses already-compiled graph; pass
         # the eager module so eval doesn't trigger recompiles for new shapes).
+        eval_names = []
         if run_full_eval:
-            eager = getattr(t["model"], "_orig_mod", t["model"])
-            is_enc_dec = t["model_type"] in ("dd", "sed")
             try:
                 eval_names = resolve_eval_names(eval_suite)
             except ValueError as e:
                 print(f"      [eval] bad suite '{eval_suite}': {e}")
                 eval_names = []
-            if eval_names:
+
+        if eval_names:
+            eager = getattr(t["model"], "_orig_mod", t["model"])
+            is_enc_dec = t["model_type"] in ("dd", "sed")
+            eval_t0 = time.time()
+            print(f"      [pretrain-eval] running {len(eval_names)} evals on "
+                  f"{t['display']} (max_examples={eval_max_examples})...")
+            eager.eval()
+            try:
+                bench = run_evals_on_model(
+                    model=eager, tokenizer=tokenizer, device=device,
+                    is_enc_dec=is_enc_dec, eval_names=eval_names,
+                    max_examples=eval_max_examples, batch_size=batch_size,
+                    eval_file=eval_data_file,
+                )
+                run_result["pretrain_evals"] = bench
+                run_result["pretrain_eval_time_sec"] = round(time.time() - eval_t0, 1)
+            except Exception as e:
+                print(f"      [pretrain-eval] FAILED for {t['display']}: {e}")
+                import traceback
+                traceback.print_exc()
+                run_result["pretrain_evals_error"] = str(e)
+            finally:
+                eager.train()
+
+        # ── SFT step ─────────────────────────────────────────────────────
+        # Builds a per-model-type dataloader with the right SFT collator,
+        # SFT-trains for sft_tokens (~50M default), then re-runs the same
+        # eval suite on the SFT'd model. Both result blocks land in the
+        # same per-run JSON so plot_comparison can show pre/post deltas.
+        if run_sft:
+            sft_t0 = time.time()
+            sft_collator = build_sft_collator(t["model_type"], tokenizer, SEQ_LEN)
+            try:
+                sft_train_ds = load_dataset(
+                    "json", data_files=sft_train_file, split="train")
+            except Exception as e:
+                print(f"      [sft] FAILED to load {sft_train_file}: {e}")
+                run_result["sft_error"] = str(e)
+                # Skip SFT for this trainer; still write JSON below.
+                run_path = scaling_dir / f"{t['model_type']}_{t['name']}_{tok_label}tok_results.json"
+                with open(run_path, "w") as f:
+                    json.dump(run_result, f, indent=2)
+                results[t["display"]] = run_result
+                results[t["display"]]["aggregate_mfu_pct"] = round(agg_mfu, 2)
+                continue
+
+            # SFT batch size: re-use pretrain bs (memory profile slightly
+            # higher for DD/SED encoder+decoder forward but this works for
+            # all sizes that fit pretrain at 80GB; on tighter machines the
+            # user can lower --sft-grad-accum to halve effective batch).
+            sft_loader = DataLoader(
+                sft_train_ds, batch_size=batch_size, shuffle=True,
+                collate_fn=sft_collator, drop_last=True,
+                num_workers=2, pin_memory=True)
+
+            # Total micro-batches to hit sft_tokens. (batch_size × seq_len
+            # tokens forward-passed per micro-batch; loss is computed over
+            # output tokens only but compute scales with total seq.)
+            sft_total_micro = max(sft_grad_accum,
+                                  sft_tokens // (batch_size * SEQ_LEN))
+            # Cap to dataset size so we don't iterate past the file.
+            sft_total_micro = min(sft_total_micro, len(sft_loader))
+            sft_steps = sft_total_micro // sft_grad_accum
+
+            print(f"      [sft] {t['display']}: ~{sft_tokens/1e6:.0f}M tokens "
+                  f"({sft_total_micro} micro / {sft_steps} steps  "
+                  f"bs={batch_size} ga={sft_grad_accum} lr={sft_lr})")
+
+            try:
+                avg_sft_loss, sft_train_time, sft_n_steps = sft_one_model(
+                    t, sft_loader, device, sft_total_micro,
+                    sft_grad_accum, sft_lr)
+                run_result["sft_final_loss"] = round(avg_sft_loss, 4)
+                run_result["sft_train_time_sec"] = round(sft_train_time, 1)
+                run_result["sft_total_steps"] = sft_n_steps
+                run_result["sft_tokens"] = sft_total_micro * batch_size * SEQ_LEN
+                run_result["sft_hparams"] = {
+                    "lr": sft_lr, "grad_accum": sft_grad_accum,
+                    "batch_size": batch_size, "tokens_target": sft_tokens,
+                }
+                print(f"      [sft] done: loss={avg_sft_loss:.3f}  "
+                      f"time={sft_train_time:.0f}s")
+            except Exception as e:
+                print(f"      [sft] training FAILED for {t['display']}: {e}")
+                import traceback
+                traceback.print_exc()
+                run_result["sft_error"] = str(e)
+
+            # Post-SFT eval suite (skipped if SFT itself failed).
+            if eval_names and "sft_error" not in run_result:
+                eager = getattr(t["model"], "_orig_mod", t["model"])
+                is_enc_dec = t["model_type"] in ("dd", "sed")
                 eval_t0 = time.time()
-                print(f"      [eval] running {len(eval_names)} evals on "
-                      f"{t['display']} (max_examples={eval_max_examples})...")
+                print(f"      [sft-eval] running {len(eval_names)} evals on "
+                      f"SFT'd {t['display']} (max_examples={eval_max_examples})...")
                 eager.eval()
                 try:
-                    bench = run_evals_on_model(
-                        model=eager,
-                        tokenizer=tokenizer,
-                        device=device,
-                        is_enc_dec=is_enc_dec,
-                        eval_names=eval_names,
-                        max_examples=eval_max_examples,
-                        batch_size=batch_size,
+                    bench_sft = run_evals_on_model(
+                        model=eager, tokenizer=tokenizer, device=device,
+                        is_enc_dec=is_enc_dec, eval_names=eval_names,
+                        max_examples=eval_max_examples, batch_size=batch_size,
                         eval_file=eval_data_file,
                     )
-                    run_result["benchmark_evals"] = bench
-                    run_result["benchmark_eval_time_sec"] = round(time.time() - eval_t0, 1)
+                    run_result["sft_evals"] = bench_sft
+                    run_result["sft_eval_time_sec"] = round(time.time() - eval_t0, 1)
                 except Exception as e:
-                    print(f"      [eval] FAILED for {t['display']}: {e}")
+                    print(f"      [sft-eval] FAILED for {t['display']}: {e}")
                     import traceback
                     traceback.print_exc()
-                    run_result["benchmark_evals_error"] = str(e)
+                    run_result["sft_evals_error"] = str(e)
                 finally:
                     eager.train()
 
@@ -600,6 +794,29 @@ def main():
     parser.add_argument("--eval-data-file", type=str, default=None,
                         help="Held-out file for intrinsic ppl/bpb evals "
                              "(default: derived from --eval-file)")
+    # SFT step (off by default for back-compat; smoke test enables it)
+    parser.add_argument("--run-sft", dest="run_sft", action="store_true",
+                        default=False,
+                        help="After pretrain + pretrain-eval, SFT each model on "
+                             "UltraChat for --sft-tokens, then re-run the eval suite. "
+                             "Per-run JSON gains pretrain_evals + sft_evals keys.")
+    parser.add_argument("--no-sft", dest="run_sft", action="store_false",
+                        help="Explicitly disable SFT (overrides --run-sft).")
+    parser.add_argument("--sft-tokens", type=int, default=50_000_000,
+                        help="SFT token budget per model (default 50M; matches "
+                             "the data prep target in retrieval_scripts/ultrachat.py)")
+    parser.add_argument("--sft-train-file", type=str,
+                        default="data/SFT/ultrachat.jsonl",
+                        help="SFT training data (run "
+                             "scripts/retrieval_scripts/ultrachat.py to build it)")
+    parser.add_argument("--sft-eval-file", type=str,
+                        default="data/SFT/ultrachat_eval.jsonl")
+    parser.add_argument("--sft-lr", type=float, default=2e-5,
+                        help="SFT base LR (μP-scaled per arch internally). "
+                             "Default 2e-5 matches existing configs/runs/sft_*.yaml")
+    parser.add_argument("--sft-grad-accum", type=int, default=4,
+                        help="SFT grad-accum steps. Effective batch is "
+                             "batch_size * sft_grad_accum.")
     # I/O + misc
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
     parser.add_argument("--no-compile", action="store_true")
@@ -665,6 +882,19 @@ def main():
           f"target effective batch: {args.target_effective_batch}")
     print(f"Mid-training eval points: {args.mid_eval_points}  |  "
           f"Full eval suite: {'OFF' if args.skip_full_eval else args.eval_suite}")
+    if args.run_sft:
+        # Fail fast if SFT data missing — better here than 30min into a run.
+        for f in (args.sft_train_file, args.sft_eval_file):
+            full = PROJECT_ROOT / f if not os.path.isabs(f) else Path(f)
+            if not full.exists():
+                print(f"ERROR: --run-sft set but SFT data missing: {full}")
+                print(f"  Run: python data/retrieval_scripts/ultrachat.py "
+                      f"--tokenizer tokenizer/tokenizer_32k.json")
+                sys.exit(1)
+        print(f"SFT: ON  budget={args.sft_tokens/1e6:.0f}M tok  lr={args.sft_lr}  "
+              f"ga={args.sft_grad_accum}  data={args.sft_train_file}")
+    else:
+        print(f"SFT: OFF (use --run-sft to enable)")
     print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
     print(f"Output dir: {args.output_dir}  |  arch tag: {arch_tag}")
 
@@ -820,7 +1050,13 @@ def main():
                         eval_suite=args.eval_suite,
                         eval_max_examples=args.eval_max_examples,
                         eval_data_file=args.eval_data_file,
-                        tokenizer=tokenizer)
+                        tokenizer=tokenizer,
+                        run_sft=args.run_sft,
+                        sft_train_file=args.sft_train_file,
+                        sft_eval_file=args.sft_eval_file,
+                        sft_tokens=args.sft_tokens,
+                        sft_lr=args.sft_lr,
+                        sft_grad_accum=args.sft_grad_accum)
                     all_results.setdefault(tok_label, {}).update(results)
                     out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
                     with open(out_path, "w") as f:
@@ -857,7 +1093,13 @@ def main():
                     eval_suite=args.eval_suite,
                     eval_max_examples=args.eval_max_examples,
                     eval_data_file=args.eval_data_file,
-                    tokenizer=tokenizer)
+                    tokenizer=tokenizer,
+                    run_sft=args.run_sft,
+                    sft_train_file=args.sft_train_file,
+                    sft_eval_file=args.sft_eval_file,
+                    sft_tokens=args.sft_tokens,
+                    sft_lr=args.sft_lr,
+                    sft_grad_accum=args.sft_grad_accum)
                 all_results.setdefault(tok_label, {}).update(results)
                 out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
                 with open(out_path, "w") as f:

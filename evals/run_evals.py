@@ -87,6 +87,17 @@ GROUPS = {
                    "hellaswag", "piqa", "arc_easy", "arc_challenge",
                    "winogrande", "lambada", "lambada_enc_dec", "boolq", "token_accuracy",
                    "positional_accuracy", "attention_analysis"],
+    # paper_full: paper + the differentiating evals (knowledge, long-context
+    # retrieval, asymmetric generation). Generation tasks (xsum/squad/triviaqa)
+    # are near-zero pre-SFT; that's expected and is the point of running them
+    # both pre- and post-SFT to show the delta.
+    "paper_full": ["ppl", "bpb", "wikitext_ppl", "wikitext_bpb",
+                   "hellaswag", "piqa", "arc_easy", "arc_challenge",
+                   "winogrande", "lambada", "lambada_enc_dec", "boolq", "mmlu",
+                   "truthfulqa", "token_accuracy", "positional_accuracy",
+                   "niah", "copy_retrieval",
+                   "xsum", "squad", "triviaqa",
+                   "attention_analysis"],
 }
 
 

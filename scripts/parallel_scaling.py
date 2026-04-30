@@ -183,7 +183,7 @@ def eval_model(model, eval_loader, device, max_batches):
 
 # ── Training one token budget ───────────────────────────────────────────────
 
-def train_one_budget(models_info, total_tokens, batch_size, grad_accum,
+def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accum,
                      train_loader, eval_loader, device, gpu_tflops,
                      eval_batches):
     """Train all 5 models on one token budget. Returns results dict."""
@@ -257,23 +257,50 @@ def train_one_budget(models_info, total_tokens, batch_size, grad_accum,
 
     print(f"    Done in {train_time:.1f}s  MFU={agg_mfu:.1f}%")
 
-    # Eval
+    # Eval + write per-run results compatible with `scaling_laws.py collect`
+    scaling_dir = PROJECT_ROOT / "checkpoints" / "scaling"
+    scaling_dir.mkdir(parents=True, exist_ok=True)
+
     results = {}
     for t in trainers:
         avg_loss, ppl = eval_model(t["model"], eval_loader, device, eval_batches)
         print(f"      {t['name']:>5}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
-        results[t["name"]] = {
-            "name": t["name"],
-            "non_emb_params": t["ne"],
-            "total_params": sum(p.numel() for p in t["model"].parameters()),
-            "tokens_seen": t["tokens_seen"],
-            "steps": t["step"],
+
+        arch = next(a for n, a in ARCHITECTURES if n == t["name"])
+        total_params = sum(p.numel() for p in t["model"].parameters())
+
+        run_result = {
             "final_eval_loss": round(avg_loss, 4),
             "final_eval_ppl": round(ppl, 2),
-            "train_curve": t["curve"],
+            "total_steps": t["step"],
+            "tokens_seen": t["tokens_seen"],
+            "total_params": total_params,
             "training_time_sec": round(train_time, 2),
-            "aggregate_mfu_pct": round(agg_mfu, 2),
+            "hparams": {
+                "dim": arch["dim"],
+                "num_encoder_layers": arch["num_encoder_layers"],
+                "num_decoder_layers": arch["num_decoder_layers"],
+                "num_heads": arch["dim"] // 64,
+                "seq_len": SEQ_LEN,
+                "mup_base_dim": MUP_BASE_DIM,
+                "lr": BASE_LR,
+                "batch_size": batch_size,
+                "grad_accum_steps": grad_accum,
+                "total_tokens": total_tokens,
+            },
+            "train_curve": t["curve"],
+            "eval_curve": [(t["step"], round(avg_loss, 4))],
         }
+
+        # Write per-run file: checkpoints/scaling/dd_0.5M_10Mtok_results.json
+        run_name = f"dd_{t['name']}_{tok_label}tok"
+        run_path = scaling_dir / f"{run_name}_results.json"
+        with open(run_path, "w") as f:
+            json.dump(run_result, f, indent=2)
+
+        results[t["name"]] = run_result
+        results[t["name"]]["aggregate_mfu_pct"] = round(agg_mfu, 2)
+
     return results
 
 
@@ -401,7 +428,7 @@ def main():
         print(f"{'='*70}\n")
 
         results = train_one_budget(
-            models_info, total_tokens, args.batch_size, args.grad_accum,
+            models_info, tok_label, total_tokens, args.batch_size, args.grad_accum,
             train_loader, eval_loader, device, gpu_tflops, args.eval_batches)
 
         all_results[tok_label] = results

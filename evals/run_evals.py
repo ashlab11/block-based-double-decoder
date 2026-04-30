@@ -98,6 +98,95 @@ def _load_eval_fn(name):
     return getattr(module, info["fn"])
 
 
+def resolve_eval_names(spec):
+    """Resolve a group name or comma-separated list to a list of eval names."""
+    spec = spec.strip()
+    if spec in GROUPS:
+        return list(GROUPS[spec])
+    return [e.strip() for e in spec.split(",") if e.strip()]
+
+
+# ── In-process eval runner ─────────────────────────────────────────────────
+
+def run_evals_on_model(
+    model,
+    tokenizer,
+    device,
+    is_enc_dec,
+    eval_names,
+    max_examples=None,
+    batch_size=64,
+    eval_file="data/Pretrain/slimpajama_eval_packed.jsonl",
+    on_progress=None,
+):
+    """Run a set of evals against a live (already-loaded) model.
+
+    This is the in-process counterpart to the CLI in main(): no checkpoint
+    load, no torch.compile wrap. The caller passes the model directly so
+    parallel sweeps can reuse the already-compiled graph and avoid the
+    ~10-60s reload+recompile tax per (param, token) cell.
+
+    Args:
+        model: live nn.Module (eager — strip torch.compile wrappers first)
+        tokenizer: PreTrainedTokenizerFast
+        device: torch.device
+        is_enc_dec: True for Double_Decoder/StandardEncDec, False for decoder-only.
+            Passed explicitly because we know it from model_type, not state_dict.
+        eval_names: list of registered eval names (use resolve_eval_names()
+            to expand a group like "paper").
+        max_examples: per-eval cap; None means no cap.
+        batch_size: forward batch for scoring.
+        eval_file: held-out packed jsonl for intrinsic evals.
+        on_progress: optional callback(str) for log lines; defaults to print.
+
+    Returns: dict { eval_name: result_dict } — same shape as
+        all_results["evals"] in the CLI's saved JSON.
+    """
+    import inspect
+    log = on_progress if on_progress is not None else print
+
+    unknown = [e for e in eval_names if e not in EVAL_REGISTRY]
+    if unknown:
+        raise ValueError(f"Unknown evals: {unknown}. "
+                         f"Available: {sorted(EVAL_REGISTRY.keys())}")
+
+    results = {}
+    for i, name in enumerate(eval_names):
+        log(f"  [{i+1}/{len(eval_names)}] {name}")
+        eval_fn = _load_eval_fn(name)
+        sig = inspect.signature(eval_fn)
+        kwargs = {
+            "model": model,
+            "tokenizer": tokenizer,
+            "device": device,
+            "is_enc_dec": is_enc_dec,
+        }
+        if max_examples is not None and "max_examples" in sig.parameters:
+            kwargs["max_examples"] = max_examples
+        if max_examples is not None and "num_examples" in sig.parameters:
+            kwargs["num_examples"] = max_examples
+        if "batch_size" in sig.parameters:
+            kwargs["batch_size"] = batch_size
+        if "eval_file" in sig.parameters:
+            kwargs["eval_file"] = eval_file
+
+        start = time.time()
+        try:
+            result = eval_fn(**kwargs)
+            result["time_seconds"] = round(time.time() - start, 1)
+            results[name] = result
+            _print_result(name, result, result["time_seconds"])
+        except Exception as e:
+            elapsed = round(time.time() - start, 1)
+            log(f"    FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            results[name] = {"name": name, "error": str(e),
+                             "time_seconds": elapsed}
+
+    return results
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -124,13 +213,12 @@ def main():
     args = parser.parse_args()
 
     # Resolve eval list
-    eval_spec = args.evals.strip()
-    if eval_spec in GROUPS:
-        eval_names = GROUPS[eval_spec]
-    else:
-        eval_names = [e.strip() for e in eval_spec.split(",")]
-
-    # Validate
+    try:
+        eval_names = resolve_eval_names(args.evals)
+    except ValueError as e:
+        print(str(e))
+        print(f"Groups: {sorted(GROUPS.keys())}")
+        sys.exit(1)
     unknown = [e for e in eval_names if e not in EVAL_REGISTRY]
     if unknown:
         print(f"Unknown evals: {unknown}")
@@ -160,59 +248,24 @@ def main():
         print(f"  Compiled (first forward will be slower due to tracing)")
     print()
 
-    # Run evals
+    eval_results = run_evals_on_model(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        is_enc_dec=is_enc_dec,
+        eval_names=eval_names,
+        max_examples=args.max_examples,
+        batch_size=args.batch_size,
+        eval_file=args.eval_file,
+    )
+
     all_results = {
         "checkpoint": args.checkpoint,
         "model_type": model_type,
         "parameters": param_count,
         "device": str(device),
-        "evals": {},
+        "evals": eval_results,
     }
-
-    for i, name in enumerate(eval_names):
-        print(f"\n{'─'*60}")
-        print(f"  [{i+1}/{len(eval_names)}] Running: {name}")
-        print(f"{'─'*60}")
-
-        eval_fn = _load_eval_fn(name)
-        start = time.time()
-
-        try:
-            # Build kwargs based on what the eval function accepts
-            kwargs = {
-                "model": model,
-                "tokenizer": tokenizer,
-                "device": device,
-                "is_enc_dec": is_enc_dec,
-            }
-            # Only pass kwargs the function actually accepts
-            import inspect
-            sig = inspect.signature(eval_fn)
-
-            if args.max_examples is not None and "max_examples" in sig.parameters:
-                kwargs["max_examples"] = args.max_examples
-            if "num_examples" in sig.parameters and args.max_examples is not None:
-                kwargs["num_examples"] = args.max_examples
-            if "batch_size" in sig.parameters:
-                kwargs["batch_size"] = args.batch_size
-            if "eval_file" in sig.parameters:
-                kwargs["eval_file"] = args.eval_file
-
-            result = eval_fn(**kwargs)
-            elapsed = time.time() - start
-            result["time_seconds"] = round(elapsed, 1)
-            all_results["evals"][name] = result
-
-            # Print key metric
-            _print_result(name, result, elapsed)
-
-        except Exception as e:
-            elapsed = time.time() - start
-            print(f"  FAILED: {e}")
-            import traceback
-            traceback.print_exc()
-            all_results["evals"][name] = {"name": name, "error": str(e),
-                                           "time_seconds": round(elapsed, 1)}
 
     # Summary
     print(f"\n{'='*60}")

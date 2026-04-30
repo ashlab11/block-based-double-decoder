@@ -4,13 +4,29 @@ Full scaling-law grid: 3 model types × 5 param sizes × 5 token budgets.
 
 Trains Double_Decoder (dd), StandardEncDec (sed), and DecoderOnlyModel (dec)
 at all 25 (param, token) grid points. Models are compiled once and
-re-initialized for each token budget.
+re-initialized for each token budget. After every fully-trained model the
+full eval suite (configurable, default "paper") runs in-process and the
+results are embedded in the per-run JSON.
 
 Usage:
-    python scripts/parallel_scaling.py                              # full grid
-    python scripts/parallel_scaling.py --token-budgets 10M,50M      # subset
-    python scripts/parallel_scaling.py --model-types dd,dec          # subset
-    python scripts/parallel_scaling.py --no-compile                  # skip compile
+    # Original small sweep (backward-compatible)
+    python scripts/parallel_scaling.py --arch-set small --token-set small
+
+    # Large sweep, tiered hardware (run each on the appropriate GPU)
+    python scripts/parallel_scaling.py --arch-set large --token-set large \\
+        --only-arch 5M,25M     # L40
+    python scripts/parallel_scaling.py --arch-set large --token-set large \\
+        --only-arch 50M,150M   # H100
+    python scripts/parallel_scaling.py --arch-set large --token-set large \\
+        --only-arch 300M       # B200
+
+    # Subsets / debug
+    python scripts/parallel_scaling.py --token-budgets 10M,50M
+    python scripts/parallel_scaling.py --model-types dd,dec
+    python scripts/parallel_scaling.py --no-compile
+    python scripts/parallel_scaling.py --dry-run                    # plan only
+    python scripts/parallel_scaling.py --skip-full-eval             # PPL only
+    python scripts/parallel_scaling.py --mid-eval-points 5          # 5 mid evals
 """
 
 import sys
@@ -50,25 +66,52 @@ MODEL_TYPE_NAMES = {"dd": "Double_Decoder", "sed": "StandardEncDec", "dec": "Dec
 FIXED_ENC_LAYERS = 8
 FIXED_DEC_LAYERS = 4
 
-ARCHITECTURES = [
-    ("0.6M",  dict(dim=64,  num_encoder_layers=8, num_decoder_layers=4)),
-    ("2.4M",  dict(dim=128, num_encoder_layers=8, num_decoder_layers=4)),
-    ("5.3M",  dict(dim=192, num_encoder_layers=8, num_decoder_layers=4)),
-    ("14.7M", dict(dim=320, num_encoder_layers=8, num_decoder_layers=4)),
-    ("28.9M", dict(dim=448, num_encoder_layers=8, num_decoder_layers=4)),
-]
+# enc=8, dec=4: non-emb ≈ 144·dim². So dim choices target user-stated param sizes:
+#   d=64  → 0.59M    d=128 → 2.4M     d=192 → 5.3M     d=320 → 14.7M    d=448 → 28.9M
+#   d=576 → 47.8M    d=1024→ 150.9M   d=1408→ 285.3M
+# "5M" / "25M" / "50M" / "150M" / "300M" labels are user-facing rounded names.
+ARCH_SETS = {
+    "small": [
+        ("0.6M",  dict(dim=64,  num_encoder_layers=8, num_decoder_layers=4)),
+        ("2.4M",  dict(dim=128, num_encoder_layers=8, num_decoder_layers=4)),
+        ("5.3M",  dict(dim=192, num_encoder_layers=8, num_decoder_layers=4)),
+        ("14.7M", dict(dim=320, num_encoder_layers=8, num_decoder_layers=4)),
+        ("28.9M", dict(dim=448, num_encoder_layers=8, num_decoder_layers=4)),
+    ],
+    "large": [
+        ("5M",    dict(dim=192,  num_encoder_layers=8, num_decoder_layers=4)),
+        ("25M",   dict(dim=448,  num_encoder_layers=8, num_decoder_layers=4)),
+        ("50M",   dict(dim=576,  num_encoder_layers=8, num_decoder_layers=4)),
+        ("150M",  dict(dim=1024, num_encoder_layers=8, num_decoder_layers=4)),
+        ("300M",  dict(dim=1408, num_encoder_layers=8, num_decoder_layers=4)),
+    ],
+}
 
-TOKEN_BUDGETS = [
-    ("10M",  10_000_000),
-    ("50M",  50_000_000),
-    ("100M", 100_000_000),
-    ("300M", 300_000_000),
-    ("600M", 600_000_000),
-]
+TOKEN_SETS = {
+    "small": [
+        ("10M",  10_000_000),
+        ("50M",  50_000_000),
+        ("100M", 100_000_000),
+        ("300M", 300_000_000),
+        ("600M", 600_000_000),
+    ],
+    "large": [
+        ("100M", 100_000_000),
+        ("500M", 500_000_000),
+        ("1B",   1_000_000_000),
+        ("3B",   3_000_000_000),
+        ("6B",   6_000_000_000),
+    ],
+}
+
+# Backward-compat aliases (kept so external callers / tests still work).
+ARCHITECTURES = ARCH_SETS["small"]
+TOKEN_BUDGETS = TOKEN_SETS["small"]
 
 SEQ_LEN = 2048
 MUP_BASE_DIM = 64
 BASE_LR = 0.002
+TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 tok = 1.05M tok/step
 
 GPU_PEAK_TFLOPS = {
     "H100": 990, "H200": 990, "A100": 312, "A100-SXM": 624,
@@ -124,18 +167,25 @@ def non_emb_param_count(model):
     return total - emb
 
 
-def build_model(model_type, arch, vocab_size, device, use_compile=False):
+def build_model(model_type, arch, vocab_size, device, use_compile=False,
+                grad_ckpt=None):
     dim = arch["dim"]
     num_heads = dim // 64
     enc = arch["num_encoder_layers"]
     dec = arch["num_decoder_layers"]
+
+    # Activation memory scales with dim²·layers·seq_len; for the large sweep
+    # (dim ≥ 320) the 3 co-resident models won't fit on 80 GB without it.
+    # Decoder-only doesn't take this kwarg; it has no checkpoint hooks here.
+    if grad_ckpt is None:
+        grad_ckpt = dim >= 320
 
     if model_type == "dd":
         model = Double_Decoder(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_encoder_layers=enc, num_decoder_layers=dec,
             seq_len=SEQ_LEN, shared=True, logit_biases=False,
-            init_strategy="xavier_uniform", gradient_checkpointing=False,
+            init_strategy="xavier_uniform", gradient_checkpointing=grad_ckpt,
             mup_base_dim=MUP_BASE_DIM)
     elif model_type == "sed":
         # StandardDecoder layers are 16d² (self+cross+MLP) vs DD's 12d².
@@ -147,7 +197,7 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False):
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_encoder_layers=enc, num_decoder_layers=sed_dec,
             seq_len=SEQ_LEN, init_strategy="xavier_uniform",
-            gradient_checkpointing=False, mup_base_dim=MUP_BASE_DIM)
+            gradient_checkpointing=grad_ckpt, mup_base_dim=MUP_BASE_DIM)
     elif model_type == "dec":
         model = DecoderOnlyModel(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
@@ -192,6 +242,54 @@ def build_scheduler(optimizer, total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
+# ── Auto-tune batch size ────────────────────────────────────────────────────
+
+def _probe_step(model, batch_size, vocab_size, seq_len, device, needs_blocks):
+    """Run one forward+backward+sync at the given batch size. Raises OOM
+    or returns successfully — caller catches OOM and shrinks."""
+    dummy_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    dummy_blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:4] + 1)[0]
+    batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
+             "blocks": dummy_blocks, "sft": False}
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        out = model_forward(model, batch, needs_blocks)
+    out["loss"].backward()
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad = None
+    torch.cuda.synchronize()
+
+
+def auto_tune_batch_size(model, vocab_size, seq_len, device, needs_blocks,
+                         max_bs=128, candidates=None):
+    """Probe descending batch sizes; return largest that fits, with one
+    safety step below as headroom for activation spikes mid-training."""
+    if candidates is None:
+        candidates = [128, 96, 64, 48, 32, 24, 16, 12, 8, 4, 2, 1]
+    candidates = [c for c in candidates if c <= max_bs]
+    largest_ok = None
+    for bs in candidates:
+        try:
+            _probe_step(model, bs, vocab_size, seq_len, device, needs_blocks)
+            largest_ok = bs
+            torch.cuda.empty_cache()
+            break
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            continue
+    if largest_ok is None:
+        raise RuntimeError(f"Could not fit batch_size=1 for model on device {device}")
+    # One step below for safety. _probe_step succeeded at largest_ok, so the
+    # next-smaller candidate is also safe; pick it unless we're already at 1.
+    safer = next((c for c in candidates if c < largest_ok), largest_ok)
+    return safer
+
+
+def grad_accum_for(batch_size, target_effective):
+    """Compute grad-accum to reach target effective batch."""
+    return max(1, target_effective // max(1, batch_size))
+
+
 def model_forward(model, batch, needs_blocks):
     """Dispatch forward based on model type."""
     if needs_blocks:
@@ -229,7 +327,25 @@ def eval_model(model, eval_loader, device, max_batches, needs_blocks):
 # ── Training one token budget ───────────────────────────────────────────────
 
 def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accum,
-                     train_loader, eval_loader, device, gpu_tflops, eval_batches):
+                     train_loader, eval_loader, device, gpu_tflops, eval_batches,
+                     output_dir, mid_eval_points=0,
+                     run_full_eval=True, eval_suite="paper", eval_max_examples=500,
+                     eval_data_file="data/Pretrain/slimpajama_eval_packed.jsonl",
+                     tokenizer=None):
+    """Train all co-resident models for one token budget. After training,
+    run held-out PPL eval, then (optionally) the full benchmark suite, and
+    write per-run JSONs into output_dir.
+
+    Args:
+        mid_eval_points: how many PPL evals to run during training (0 = end-only).
+            Each mid-eval costs ~10 forward batches per model — set to 5 for
+            a loss curve, 0 for a fast large-token run.
+        run_full_eval: if True, run evals/run_evals.run_evals_on_model() on
+            each fully-trained model and embed under run_result["benchmark_evals"].
+        eval_suite: group name ("paper", "quick", "all", "intrinsic", ...) or
+            comma-separated eval names.
+        eval_max_examples: per-eval cap (500 matches the SFT script default).
+    """
     tokens_per_step = batch_size * grad_accum * SEQ_LEN
     total_steps = max(1, total_tokens // tokens_per_step)
     total_micro = total_steps * grad_accum
@@ -289,13 +405,16 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         current_step = trainers[0]["step"]
         is_step_boundary = trainers[0]["micro"] % grad_accum == 0
 
-        # Periodic eval (~5 eval points during training for loss curves)
-        eval_interval = max(1, total_steps // 5)
-        if current_step > 0 and is_step_boundary and current_step % eval_interval == 0:
-            for t in trainers:
-                eval_loss, _ = eval_model(t["model"], eval_loader, device,
-                                          eval_batches, t["needs_blocks"])
-                t["eval_curve"].append((t["step"], t["tokens_seen"], round(eval_loss, 4)))
+        # Periodic eval — only if user opted in. With mid_eval_points=0 we skip
+        # all mid-training PPL evals (final-only), saving ~mid_eval_points × 10
+        # forward batches per model. The large sweep defaults to 0.
+        if mid_eval_points > 0:
+            eval_interval = max(1, total_steps // mid_eval_points)
+            if current_step > 0 and is_step_boundary and current_step % eval_interval == 0:
+                for t in trainers:
+                    eval_loss, _ = eval_model(t["model"], eval_loader, device,
+                                              eval_batches, t["needs_blocks"])
+                    t["eval_curve"].append((t["step"], t["tokens_seen"], round(eval_loss, 4)))
 
         # Log progress
         if current_step > 0 and current_step % log_interval == 0 and is_step_boundary:
@@ -317,9 +436,16 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
     agg_mfu = total_flops / (train_time * gpu_tflops * 1e12) * 100
     print(f"    Done in {train_time:.1f}s  MFU={agg_mfu:.1f}%")
 
-    # Eval + write per-run results
-    scaling_dir = PROJECT_ROOT / "checkpoints" / "scaling"
+    # Eval + write per-run results — all artifacts land in output_dir so
+    # L40/H100/B200 tier jobs writing to the same parallel_scaling/ folder
+    # produce a unified result set.
+    scaling_dir = Path(output_dir)
     scaling_dir.mkdir(parents=True, exist_ok=True)
+
+    # Lazy import — only needed when run_full_eval is True. Doing it here
+    # lets `--skip-full-eval` runs work even if eval module deps are missing.
+    if run_full_eval:
+        from evals.run_evals import run_evals_on_model, resolve_eval_names
 
     results = {}
     for t in trainers:
@@ -363,7 +489,43 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "eval_curve": eval_curve,
         }
 
-        # Write: checkpoints/scaling/{prefix}_{size}_{tokens}tok_results.json
+        # Full eval suite (in-process; reuses already-compiled graph; pass
+        # the eager module so eval doesn't trigger recompiles for new shapes).
+        if run_full_eval:
+            eager = getattr(t["model"], "_orig_mod", t["model"])
+            is_enc_dec = t["model_type"] in ("dd", "sed")
+            try:
+                eval_names = resolve_eval_names(eval_suite)
+            except ValueError as e:
+                print(f"      [eval] bad suite '{eval_suite}': {e}")
+                eval_names = []
+            if eval_names:
+                eval_t0 = time.time()
+                print(f"      [eval] running {len(eval_names)} evals on "
+                      f"{t['display']} (max_examples={eval_max_examples})...")
+                eager.eval()
+                try:
+                    bench = run_evals_on_model(
+                        model=eager,
+                        tokenizer=tokenizer,
+                        device=device,
+                        is_enc_dec=is_enc_dec,
+                        eval_names=eval_names,
+                        max_examples=eval_max_examples,
+                        batch_size=batch_size,
+                        eval_file=eval_data_file,
+                    )
+                    run_result["benchmark_evals"] = bench
+                    run_result["benchmark_eval_time_sec"] = round(time.time() - eval_t0, 1)
+                except Exception as e:
+                    print(f"      [eval] FAILED for {t['display']}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    run_result["benchmark_evals_error"] = str(e)
+                finally:
+                    eager.train()
+
+        # Write: {output_dir}/{prefix}_{size}_{tokens}tok_results.json
         run_name = f"{t['model_type']}_{t['name']}_{tok_label}tok"
         run_path = scaling_dir / f"{run_name}_results.json"
         with open(run_path, "w") as f:
@@ -379,16 +541,58 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
 
 def main():
     parser = argparse.ArgumentParser(description="Full scaling-law grid training")
+    # Grid selection
+    parser.add_argument("--arch-set", choices=sorted(ARCH_SETS.keys()),
+                        default="small",
+                        help="Predefined arch set: 'small' (0.6M–28.9M, original) "
+                             "or 'large' (5M–300M, new sweep). Default: small")
+    parser.add_argument("--token-set", choices=sorted(TOKEN_SETS.keys()),
+                        default="small",
+                        help="Predefined token set: 'small' (10M–600M) or "
+                             "'large' (100M–6B). Default: small")
+    parser.add_argument("--only-arch", type=str, default=None,
+                        help="Comma-separated arch labels to run from the chosen "
+                             "arch set (e.g. '5M,25M' for L40 tier of large sweep)")
     parser.add_argument("--token-budgets", type=str, default=None,
                         help="Comma-separated token budgets (e.g. '10M,50M')")
     parser.add_argument("--model-types", type=str, default=None,
                         help="Comma-separated model types (e.g. 'dd,dec'). "
                              "Default: all 3 (dd,sed,dec)")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--grad-accum", type=int, default=32)
-    parser.add_argument("--eval-batches", type=int, default=10)
+    # Batch sizing
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Per-step batch size; overridden by --auto-batch-size")
+    parser.add_argument("--grad-accum", type=int, default=32,
+                        help="Grad accumulation; overridden by --auto-batch-size")
+    parser.add_argument("--auto-batch-size", action="store_true",
+                        help="Probe largest fitting batch size per (arch, gpu) "
+                             "and derive grad_accum from --target-effective-batch")
+    parser.add_argument("--target-effective-batch", type=int,
+                        default=TARGET_EFFECTIVE_BATCH,
+                        help=f"Effective batch (seqs) for grad_accum derivation "
+                             f"(default {TARGET_EFFECTIVE_BATCH})")
+    parser.add_argument("--max-batch-size", type=int, default=128,
+                        help="Cap for the auto-tune search ceiling")
+    # Eval control
+    parser.add_argument("--eval-batches", type=int, default=10,
+                        help="Forward batches for the cheap held-out PPL eval")
+    parser.add_argument("--mid-eval-points", type=int, default=0,
+                        help="Number of mid-training PPL eval points "
+                             "(0 = end-only, default). Use 5 for a loss curve.")
+    parser.add_argument("--eval-suite", type=str, default="paper",
+                        help="Eval group ('paper'|'quick'|'all'|'intrinsic') or "
+                             "comma-separated list of eval names. Default: paper")
+    parser.add_argument("--eval-max-examples", type=int, default=500,
+                        help="Per-eval example cap (default 500)")
+    parser.add_argument("--skip-full-eval", action="store_true",
+                        help="Skip the in-process benchmark suite after training")
+    parser.add_argument("--eval-data-file", type=str, default=None,
+                        help="Held-out file for intrinsic ppl/bpb evals "
+                             "(default: derived from --eval-file)")
+    # I/O + misc
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
     parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Plan only: print resolved batch sizes and FLOPs/cell")
     parser.add_argument("--train-file", type=str,
                         default="data/Pretrain/slimpajama_6b_packed.jsonl")
     parser.add_argument("--eval-file", type=str,
@@ -397,17 +601,34 @@ def main():
                         default="tokenizer/tokenizer_32k.json")
     args = parser.parse_args()
 
-    # Parse subsets
+    # Resolve arch + token grid
+    arch_list = ARCH_SETS[args.arch_set]
+    if args.only_arch:
+        wanted = set(s.strip() for s in args.only_arch.split(","))
+        arch_list = [(name, arch) for name, arch in arch_list if name in wanted]
+        if not arch_list:
+            print(f"--only-arch {args.only_arch} matched nothing in arch-set "
+                  f"'{args.arch_set}': {[n for n,_ in ARCH_SETS[args.arch_set]]}")
+            sys.exit(1)
+
+    token_list = TOKEN_SETS[args.token_set]
     if args.token_budgets:
         requested = set(args.token_budgets.split(","))
-        budgets = [(l, v) for l, v in TOKEN_BUDGETS if l in requested]
+        budgets = [(l, v) for l, v in token_list if l in requested]
     else:
-        budgets = TOKEN_BUDGETS
+        budgets = list(token_list)
 
     if args.model_types:
         model_types = [mt.strip() for mt in args.model_types.split(",")]
     else:
-        model_types = MODEL_TYPES
+        model_types = list(MODEL_TYPES)
+
+    # Tag for the per-budget aggregate filename so concurrent tier jobs
+    # (L40/H100/B200) don't race on the same parallel_<tok>tok_results.json.
+    arch_tag = "-".join(name for name, _ in arch_list)
+
+    if args.eval_data_file is None:
+        args.eval_data_file = args.eval_file
 
     device = torch.device("cuda")
     torch.backends.cuda.enable_flash_sdp(True)
@@ -423,14 +644,17 @@ def main():
 
     gpu_tflops = detect_gpu_tflops()
     gpu_name = torch.cuda.get_device_name(0)
-    tokens_per_step = args.batch_size * args.grad_accum * SEQ_LEN
 
     print(f"GPU: {gpu_name}  (peak BF16: {gpu_tflops:.0f} TFLOPS)")
-    print(f"Effective batch: {args.batch_size} × {args.grad_accum} = "
-          f"{args.batch_size * args.grad_accum} seqs = {tokens_per_step:,} tok/step")
-    print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
+    print(f"Arch set: {args.arch_set}  archs: {[n for n,_ in arch_list]}")
+    print(f"Token set: {args.token_set}  budgets: {[l for l,_ in budgets]}")
     print(f"Model types: {model_types}")
-    print(f"Token budgets: {[l for l, _ in budgets]}")
+    print(f"Auto batch size: {'ON' if args.auto_batch_size else 'OFF'}  "
+          f"target effective batch: {args.target_effective_batch}")
+    print(f"Mid-training eval points: {args.mid_eval_points}  |  "
+          f"Full eval suite: {'OFF' if args.skip_full_eval else args.eval_suite}")
+    print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
+    print(f"Output dir: {args.output_dir}  |  arch tag: {arch_tag}")
 
     # ── Tokenizer + Data ────────────────────────────────────────────────────
     tokenizer = PreTrainedTokenizerFast(
@@ -458,14 +682,36 @@ def main():
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
                              collate_fn=collator, drop_last=True)
 
+    # ── Dry-run: plan-only summary ─────────────────────────────────────────
+    if args.dry_run:
+        print(f"\n{'='*70}")
+        print(f"  DRY RUN — no training, no eval")
+        print(f"{'='*70}")
+        for name, arch in arch_list:
+            ne = (arch["num_encoder_layers"] + arch["num_decoder_layers"]) * 12 * arch["dim"] ** 2
+            for tok_label, total_tokens in budgets:
+                # Assume 35% MFU as a planning heuristic; co-resident 3 models.
+                flops = 6 * ne * total_tokens * len(model_types)
+                est_sec = flops / (gpu_tflops * 1e12 * 0.35)
+                print(f"  {name:>5} × {tok_label:>5}: "
+                      f"non_emb={ne:>11,}  total_FLOPs={flops:.2e}  "
+                      f"est={est_sec/3600:.2f}h @35% MFU")
+        return
+
     # ── Run each model type sequentially ───────────────────────────────────
-    # Build/compile 5 models per type, train all budgets, then tear down.
-    # This keeps only 5 models in memory and in the compile cache at a time,
-    # avoiding the cache thrashing that kills MFU with 15 interleaved models.
+    # Build/compile N models per type, train all budgets, then tear down.
+    # This keeps only N models in memory and in the compile cache at a time,
+    # avoiding the cache thrashing that kills MFU with all interleaved models.
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_results = {}
     sweep_t0 = time.time()
+
+    # We need to know per-arch batch size before compile warmup if we want
+    # the warmup to use the same shape as training. Auto-tune is per-arch and
+    # per-model-type, but the dataloader is shared across the 3 model types
+    # within an arch — so we tune each model and take the *min* batch size.
+    # Result: one (batch_size, grad_accum) pair per (arch, all-3-types).
 
     for mt in model_types:
         needs_blocks = mt in ("dd", "sed")
@@ -473,19 +719,24 @@ def main():
         print(f"  Model type: {MODEL_TYPE_NAMES[mt]} ({mt})")
         print(f"{'#'*70}")
 
-        # Build and compile 5 models for this type
-        print(f"\n  Building 5 models:")
+        # Build and compile models for this type
+        print(f"\n  Building {len(arch_list)} models:")
         models_info = []
-        for name, arch in ARCHITECTURES:
+        for name, arch in arch_list:
             model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
             ne = non_emb_param_count(model)
-            print(f"    {name:>6}: dim={arch['dim']:>3}  non_emb={ne:>10,}")
+            print(f"    {name:>6}: dim={arch['dim']:>4}  non_emb={ne:>11,}  "
+                  f"grad_ckpt={arch['dim'] >= 320}")
             models_info.append({
                 "name": name, "model_type": mt, "arch": arch,
                 "model": model, "ne": ne, "needs_blocks": needs_blocks,
             })
 
-        # Compile warmup for this type's 5 models
+        # Compile warmup (uses initial --batch-size; actual training batch is
+        # set per-arch below). torch.compile re-traces if shapes change, but
+        # with dynamic=False in eval and inductor's shape specialization, the
+        # warmup at one shape still pays off because backward graph + key
+        # kernels get cached.
         if use_compile:
             print(f"  Compiling...")
             compile_t0 = time.time()
@@ -503,29 +754,102 @@ def main():
             torch.cuda.synchronize()
             print(f"  Compiled in {time.time() - compile_t0:.1f}s")
 
-        # Train all token budgets for this model type
-        for tok_label, total_tokens in budgets:
-            total_steps = max(1, total_tokens // tokens_per_step)
-            total_micro = total_steps * args.grad_accum
+        # Per-arch batch sizing. We auto-tune once per arch (probing all
+        # model types, taking min) and store on the models_info entry so
+        # train_one_budget uses the right batch_size.
+        per_arch_bs = {}  # arch_name -> (batch_size, grad_accum)
+        if args.auto_batch_size:
+            print(f"\n  Auto-tuning batch size per arch (max={args.max_batch_size}):")
+            for m in models_info:
+                bs = auto_tune_batch_size(
+                    m["model"], vocab_size, SEQ_LEN, device,
+                    m["needs_blocks"], max_bs=args.max_batch_size)
+                # Same arch+model_type may appear multiple times across model
+                # types in outer loop; we want the min across all 3 types,
+                # but inside this `for mt` we only see one. Track per (arch).
+                prior = per_arch_bs.get(m["name"])
+                per_arch_bs[m["name"]] = bs if prior is None else min(prior, bs)
+            for name, bs in per_arch_bs.items():
+                ga = grad_accum_for(bs, args.target_effective_batch)
+                print(f"    {name:>6}: batch_size={bs:>3}  grad_accum={ga:>3}  "
+                      f"effective={bs*ga} seqs = {bs*ga*SEQ_LEN:,} tok/step")
+        else:
+            for name, _ in arch_list:
+                per_arch_bs[name] = args.batch_size
 
-            print(f"\n  {'='*66}")
-            print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
-                  f"{total_micro} micro-batches")
-            print(f"  {'='*66}\n")
-
-            results = train_one_budget(
-                models_info, tok_label, total_tokens, args.batch_size, args.grad_accum,
-                train_loader, eval_loader, device, gpu_tflops, args.eval_batches)
-
-            # Merge into all_results[tok_label]
-            if tok_label not in all_results:
-                all_results[tok_label] = {}
-            all_results[tok_label].update(results)
-
-            # Save per-budget results (incrementally)
-            out_path = out_dir / f"parallel_{tok_label}tok_results.json"
-            with open(out_path, "w") as f:
-                json.dump(all_results[tok_label], f, indent=2)
+        # Train all token budgets for this model type, per-arch.
+        # We can't co-resident-train models with different batch sizes through
+        # a single shared train_loader (loader yields one batch shape). So
+        # when auto-tuning produces different batch sizes per arch, we run
+        # one arch at a time inside this model_type loop.
+        if args.auto_batch_size and len(set(per_arch_bs.values())) > 1:
+            # Per-arch loop: re-create dataloader at each arch's batch size.
+            for m in models_info:
+                bs = per_arch_bs[m["name"]]
+                ga = grad_accum_for(bs, args.target_effective_batch)
+                arch_loader = DataLoader(train_ds, batch_size=bs,
+                                         collate_fn=collator, drop_last=True)
+                arch_eval_loader = DataLoader(eval_ds, batch_size=bs,
+                                              collate_fn=collator, drop_last=True)
+                for tok_label, total_tokens in budgets:
+                    tok_per_step = bs * ga * SEQ_LEN
+                    total_steps = max(1, total_tokens // tok_per_step)
+                    print(f"\n  {'='*66}")
+                    print(f"    {mt} × {m['name']} × {tok_label} tokens  |  "
+                          f"{total_steps} steps  |  bs={bs} ga={ga}")
+                    print(f"  {'='*66}\n")
+                    results = train_one_budget(
+                        [m], tok_label, total_tokens, bs, ga,
+                        arch_loader, arch_eval_loader, device, gpu_tflops,
+                        args.eval_batches,
+                        output_dir=args.output_dir,
+                        mid_eval_points=args.mid_eval_points,
+                        run_full_eval=not args.skip_full_eval,
+                        eval_suite=args.eval_suite,
+                        eval_max_examples=args.eval_max_examples,
+                        eval_data_file=args.eval_data_file,
+                        tokenizer=tokenizer)
+                    all_results.setdefault(tok_label, {}).update(results)
+                    out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
+                    with open(out_path, "w") as f:
+                        json.dump(all_results[tok_label], f, indent=2)
+        else:
+            # All archs share one batch size — co-resident path (faster).
+            # Use the min so the smallest-tolerated arch sets the shape.
+            bs = min(per_arch_bs.values()) if per_arch_bs else args.batch_size
+            ga = (grad_accum_for(bs, args.target_effective_batch)
+                  if args.auto_batch_size else args.grad_accum)
+            tokens_per_step = bs * ga * SEQ_LEN
+            print(f"\n  Co-resident batch: bs={bs} ga={ga}  "
+                  f"{tokens_per_step:,} tok/step")
+            run_loader = (DataLoader(train_ds, batch_size=bs,
+                                     collate_fn=collator, drop_last=True)
+                          if args.auto_batch_size else train_loader)
+            run_eval_loader = (DataLoader(eval_ds, batch_size=bs,
+                                          collate_fn=collator, drop_last=True)
+                               if args.auto_batch_size else eval_loader)
+            for tok_label, total_tokens in budgets:
+                total_steps = max(1, total_tokens // tokens_per_step)
+                total_micro = total_steps * ga
+                print(f"\n  {'='*66}")
+                print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
+                      f"{total_micro} micro-batches")
+                print(f"  {'='*66}\n")
+                results = train_one_budget(
+                    models_info, tok_label, total_tokens, bs, ga,
+                    run_loader, run_eval_loader, device, gpu_tflops,
+                    args.eval_batches,
+                    output_dir=args.output_dir,
+                    mid_eval_points=args.mid_eval_points,
+                    run_full_eval=not args.skip_full_eval,
+                    eval_suite=args.eval_suite,
+                    eval_max_examples=args.eval_max_examples,
+                    eval_data_file=args.eval_data_file,
+                    tokenizer=tokenizer)
+                all_results.setdefault(tok_label, {}).update(results)
+                out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
+                with open(out_path, "w") as f:
+                    json.dump(all_results[tok_label], f, indent=2)
 
         # Free GPU memory before next model type
         del models_info
@@ -533,12 +857,14 @@ def main():
 
     # ── Summary ─────────────────────────────────────────────────────────────
     sweep_time = time.time() - sweep_t0
-    combined_path = out_dir / "scaling_grid_results.json"
+    # Arch-tagged combined file so concurrent tier jobs don't stomp each other.
+    # scripts/merge_parallel_results.py rebuilds the unified grid afterward.
+    combined_path = out_dir / f"scaling_grid_results_{arch_tag}.json"
     with open(combined_path, "w") as f:
         json.dump(all_results, f, indent=2)
 
     print(f"\n{'='*70}")
-    print(f"  Full grid complete in {sweep_time/60:.1f} min")
+    print(f"  Sweep complete in {sweep_time/60:.1f} min")
     print(f"  Results → {combined_path}")
     print(f"{'='*70}")
 
@@ -548,7 +874,7 @@ def main():
         header = f"  {'params':<8}" + "".join(f"  {l:>8}" for l, _ in budgets)
         print(header)
         print("  " + "-" * (len(header) - 2))
-        for name, _ in ARCHITECTURES:
+        for name, _ in arch_list:
             row = f"  {name:<8}"
             display = f"{mt}_{name}"
             for tok_label, _ in budgets:
@@ -559,7 +885,9 @@ def main():
                     row += f"  {'—':>8}"
             print(row)
 
-    print(f"\nTo collect in scaling_laws.py format:")
+    print(f"\nTo merge across tier runs:")
+    print(f"  python scripts/merge_parallel_results.py")
+    print(f"To collect in scaling_laws.py format:")
     print(f"  python scripts/scaling_laws.py collect")
 
 

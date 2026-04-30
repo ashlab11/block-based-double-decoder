@@ -30,6 +30,8 @@ from datasets import load_dataset
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from transformers import PreTrainedTokenizerFast
+
 from models.double_decoder import Double_Decoder
 from collators.double_decoder.pretrain import BasicPretrainCollator
 from components.initialization import initialize_model
@@ -45,7 +47,6 @@ ARCHITECTURES = [
 ]
 
 SEQ_LEN = 2048
-VOCAB_SIZE = 32_000
 MUP_BASE_DIM = 64
 BASE_LR = 0.002  # lr_for_dim(64) = 2e-3 * sqrt(64/64)
 
@@ -76,9 +77,9 @@ def non_emb_param_count(model):
     return total - emb
 
 
-def build_model(arch, device, use_compile=False):
+def build_model(arch, vocab_size, device, use_compile=False):
     model = Double_Decoder(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size,
         dim=arch["dim"],
         num_encoder_layers=arch["num_encoder_layers"],
         num_decoder_layers=arch["num_decoder_layers"],
@@ -146,6 +147,8 @@ def main():
                         default="data/Pretrain/slimpajama_6b_packed.jsonl")
     parser.add_argument("--eval-file", type=str,
                         default="data/Pretrain/slimpajama_6b_eval_packed.jsonl")
+    parser.add_argument("--tokenizer-file", type=str,
+                        default="tokenizer/tokenizer.json")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -166,9 +169,18 @@ def main():
     if args.compile:
         print("torch.compile: ENABLED (first few steps will be slow)")
 
+    # ── Tokenizer ────────────────────────────────────────────────────────────
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(PROJECT_ROOT / args.tokenizer_file))
+    vocab_size = tokenizer.vocab_size
+    bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
+    eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
+    print(f"Tokenizer: vocab_size={vocab_size}  bos={bos_token_id}  eos={eos_token_id}")
+
     # ── Data ────────────────────────────────────────────────────────────────
-    print("\nLoading data...")
-    collator = BasicPretrainCollator(bos_token_id=1, eos_token_id=2, max_seq_len=SEQ_LEN)
+    print("Loading data...")
+    collator = BasicPretrainCollator(
+        bos_token_id=bos_token_id, eos_token_id=eos_token_id, max_seq_len=SEQ_LEN)
 
     train_ds = load_dataset(
         "json", data_files=str(PROJECT_ROOT / args.train_file),
@@ -192,7 +204,7 @@ def main():
     print(f"\nBuilding {len(ARCHITECTURES)} models:\n")
     trainers = []
     for name, arch in ARCHITECTURES:
-        model = build_model(arch, device, use_compile=args.compile)
+        model = build_model(arch, vocab_size, device, use_compile=args.compile)
         opt = build_optimizer(model, arch["dim"])
         sched = build_scheduler(opt, total_steps)
         ne = non_emb_param_count(model)

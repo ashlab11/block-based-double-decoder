@@ -409,13 +409,19 @@ def build_sft_optimizer(model, dim, base_lr):
 
 
 def sft_one_model(trainer, sft_loader, device, total_micro_batches,
-                  grad_accum, base_lr, log_interval=None):
+                  grad_accum, base_lr, log_interval=None,
+                  gpu_tflops=None, tokens_per_micro=None):
     """Run SFT on a single trainer's model for `total_micro_batches // grad_accum`
-    optimizer steps. Modifies the model in-place. Returns (avg_loss, train_time_sec, n_steps).
+    optimizer steps. Modifies the model in-place.
+    Returns (avg_loss, train_time_sec, n_steps, mfu_pct).
 
     Uses the same compiled forward as pretrain — torch.compile will trace a new
     graph on the first SFT forward (different kwargs: encoder_input_ids/
     decoder_input_ids/sft=True for DD/SED) and cache it. ~30s warmup then fast.
+
+    If gpu_tflops and tokens_per_micro are passed, progress lines and the
+    final return include MFU using the same 6·ne·tokens approximation used
+    by pretrain — directly comparable across phases.
     """
     eager = getattr(trainer["model"], "_orig_mod", trainer["model"])
     eager.train()
@@ -424,6 +430,8 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
     sched = build_scheduler(opt, total_steps)  # reuse 5%-warmup linear-decay
     if log_interval is None:
         log_interval = max(1, total_steps // 10)
+
+    track_mfu = gpu_tflops is not None and tokens_per_micro is not None
 
     opt.zero_grad(set_to_none=True)
     losses = []
@@ -454,14 +462,23 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
                 recent = losses[-grad_accum:] if len(losses) >= grad_accum else losses
                 avg = sum(recent) / max(1, len(recent))
                 elapsed = time.time() - t0
+                mfu_str = ""
+                if track_mfu:
+                    flops = 6 * trainer["ne"] * micro * tokens_per_micro
+                    mfu = flops / (max(elapsed, 1e-6) * gpu_tflops * 1e12) * 100
+                    mfu_str = f"  MFU={mfu:.1f}%"
                 print(f"      [sft {trainer['display']}] step {step}/{total_steps}  "
-                      f"loss={avg:.3f}  [{elapsed:.0f}s]")
+                      f"loss={avg:.3f}  [{elapsed:.0f}s]{mfu_str}")
 
     train_time = time.time() - t0
+    final_mfu = 0.0
+    if track_mfu and micro > 0:
+        flops = 6 * trainer["ne"] * micro * tokens_per_micro
+        final_mfu = flops / (max(train_time, 1e-6) * gpu_tflops * 1e12) * 100
     # Average of last 10% of losses gives a stable end-of-training number.
     tail = max(1, len(losses) // 10)
     avg_final_loss = sum(losses[-tail:]) / tail if losses else float("nan")
-    return avg_final_loss, train_time, step
+    return avg_final_loss, train_time, step, final_mfu
 
 
 # ── Training one token budget ───────────────────────────────────────────────
@@ -672,6 +689,36 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         # same per-run JSON so plot_comparison can show pre/post deltas.
         if run_sft:
             sft_t0 = time.time()
+
+            # Drop the pretrain optimizer state before SFT builds a fresh
+            # one. AdamW keeps fp32 m/v moments per parameter — cheap for
+            # 5M params but climbs into GBs for 300M+. Without this, both
+            # pretrain and SFT optimizers are alive simultaneously, eating
+            # into the activation-memory headroom that triggered the DD
+            # bs=48 OOM observed at the SFT/eval boundary.
+            t["opt"] = None
+            t["sched"] = None
+            for p in t["model"].parameters():
+                if p.grad is not None:
+                    p.grad = None
+            torch.cuda.empty_cache()
+
+            # Enc-dec SFT halves the per-batch headroom: the encoder
+            # forward runs over `encoder_input_ids` while the decoder
+            # forward runs over `decoder_input_ids`, and both sets of
+            # activations live through backward. Pretrain auto-tune
+            # picked a bs that's already at the OOM ceiling for DD's
+            # 12·d² layer density (cf. the 12 GiB dlogits allocation
+            # that crashed the first run). Halve bs and double ga so
+            # the effective batch — and hence the SGD trajectory —
+            # stays identical.
+            if t["model_type"] in ("dd", "sed"):
+                sft_bs = max(1, batch_size // 2)
+                sft_ga = max(1, sft_grad_accum * 2)
+            else:
+                sft_bs = batch_size
+                sft_ga = sft_grad_accum
+
             sft_collator = build_sft_collator(t["model_type"], tokenizer, SEQ_LEN)
             try:
                 sft_train_ds = load_dataset(
@@ -687,42 +734,41 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 results[t["display"]]["aggregate_mfu_pct"] = round(agg_mfu, 2)
                 continue
 
-            # SFT batch size: re-use pretrain bs (memory profile slightly
-            # higher for DD/SED encoder+decoder forward but this works for
-            # all sizes that fit pretrain at 80GB; on tighter machines the
-            # user can lower --sft-grad-accum to halve effective batch).
             sft_loader = DataLoader(
-                sft_train_ds, batch_size=batch_size, shuffle=True,
+                sft_train_ds, batch_size=sft_bs, shuffle=True,
                 collate_fn=sft_collator, drop_last=True,
                 num_workers=2, pin_memory=True)
 
-            # Total micro-batches to hit sft_tokens. (batch_size × seq_len
+            # Total micro-batches to hit sft_tokens. (sft_bs × seq_len
             # tokens forward-passed per micro-batch; loss is computed over
             # output tokens only but compute scales with total seq.)
-            sft_total_micro = max(sft_grad_accum,
-                                  sft_tokens // (batch_size * SEQ_LEN))
+            sft_total_micro = max(sft_ga,
+                                  sft_tokens // (sft_bs * SEQ_LEN))
             # Cap to dataset size so we don't iterate past the file.
             sft_total_micro = min(sft_total_micro, len(sft_loader))
-            sft_steps = sft_total_micro // sft_grad_accum
+            sft_steps = sft_total_micro // sft_ga
 
             print(f"      [sft] {t['display']}: ~{sft_tokens/1e6:.0f}M tokens "
                   f"({sft_total_micro} micro / {sft_steps} steps  "
-                  f"bs={batch_size} ga={sft_grad_accum} lr={sft_lr})")
+                  f"bs={sft_bs} ga={sft_ga} lr={sft_lr})")
 
             try:
-                avg_sft_loss, sft_train_time, sft_n_steps = sft_one_model(
+                avg_sft_loss, sft_train_time, sft_n_steps, sft_mfu = sft_one_model(
                     t, sft_loader, device, sft_total_micro,
-                    sft_grad_accum, sft_lr)
+                    sft_ga, sft_lr,
+                    gpu_tflops=gpu_tflops,
+                    tokens_per_micro=sft_bs * SEQ_LEN)
                 run_result["sft_final_loss"] = round(avg_sft_loss, 4)
                 run_result["sft_train_time_sec"] = round(sft_train_time, 1)
                 run_result["sft_total_steps"] = sft_n_steps
-                run_result["sft_tokens"] = sft_total_micro * batch_size * SEQ_LEN
+                run_result["sft_tokens"] = sft_total_micro * sft_bs * SEQ_LEN
+                run_result["sft_mfu_pct"] = round(sft_mfu, 2)
                 run_result["sft_hparams"] = {
-                    "lr": sft_lr, "grad_accum": sft_grad_accum,
-                    "batch_size": batch_size, "tokens_target": sft_tokens,
+                    "lr": sft_lr, "grad_accum": sft_ga,
+                    "batch_size": sft_bs, "tokens_target": sft_tokens,
                 }
                 print(f"      [sft] done: loss={avg_sft_loss:.3f}  "
-                      f"time={sft_train_time:.0f}s")
+                      f"time={sft_train_time:.0f}s  MFU={sft_mfu:.1f}%")
             except Exception as e:
                 print(f"      [sft] training FAILED for {t['display']}: {e}")
                 import traceback

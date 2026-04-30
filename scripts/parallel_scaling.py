@@ -132,13 +132,21 @@ GPU_PEAK_TFLOPS = {
 
 _mask_cache_key = None
 _mask_cache_result = None
+# Snapshot of components.block_masks._pretrain_block_ids (or _sft_block_ids)
+# captured at the time the cached BlockMask was built. The mask-fn closures
+# (pt_self_mask / pt_cross_mask / sft_cross_mask) read this global by name at
+# kernel evaluation time (late binding), so on a cache HIT the global must be
+# restored to match the cached BlockMask — otherwise an intervening cache miss
+# for a different seq_len leaves the global pointing at a shorter tensor, and
+# the kernel reads off the end → CUDA illegal memory access.
+_mask_cache_block_ids = None
 
 @torch.compiler.disable()  # mirror create_masks in components/block_masks.py;
 # without this, Inductor traces the cache lookup, builds dynamo guards that
 # hold refs to `blocks`, and recompiles every time `blocks` is GC'd.
 def _cached_create_masks(batch_size, blocks, device, input_ids,
                          encoder_input_ids, decoder_input_ids, sft):
-    global _mask_cache_key, _mask_cache_result
+    global _mask_cache_key, _mask_cache_result, _mask_cache_block_ids
     # Cache key MUST include seq_len: Python id() can be reused across
     # GC'd tensors of different shapes, so id(blocks) alone returns stale
     # block_masks during eval where seq_len varies per batch (e.g. lambada).
@@ -149,6 +157,8 @@ def _cached_create_masks(batch_size, blocks, device, input_ids,
         seq_len_key = input_ids.shape[1]
         bs_key = None
     cache_key = (id(blocks), seq_len_key, sft, bs_key)
+
+    import components.block_masks as bm
     if cache_key != _mask_cache_key:
         _mask_cache_key = cache_key
         from components.block_masks import create_pretrain_masks, create_sft_masks
@@ -156,9 +166,18 @@ def _cached_create_masks(batch_size, blocks, device, input_ids,
             _mask_cache_result = create_sft_masks(
                 batch_size, blocks, device,
                 encoder_input_ids.shape[1], decoder_input_ids.shape[1])
+            _mask_cache_block_ids = bm._sft_block_ids
         else:
             _mask_cache_result = create_pretrain_masks(
                 blocks, input_ids.shape[1], device)
+            _mask_cache_block_ids = bm._pretrain_block_ids
+    else:
+        # Cache HIT — restore the global so the cached mask-fn reads the
+        # right block_ids tensor (an intervening miss may have overwritten it).
+        if sft:
+            bm._sft_block_ids = _mask_cache_block_ids
+        else:
+            bm._pretrain_block_ids = _mask_cache_block_ids
     return _mask_cache_result
 
 

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-Train all 5 scaling-law Double_Decoder models on one GPU in a single process.
+Full scaling-law grid: 5 model sizes × 5 token budgets on one GPU.
 
-Instead of launching 25 sequential subprocesses (scaling_laws.py run), this
-trains all 5 model sizes (0.5M–30M) concurrently in a shared training loop,
-eliminating per-run startup overhead and maximizing GPU utilization by keeping
-all models resident in memory simultaneously.
-
-Uses fast tensor masks instead of flex_attention's create_block_mask to avoid
-torch.compile overhead that dominates runtime for small models.
+Trains all 25 (param_size, token_budget) combinations. Models are compiled
+once and re-initialized for each token budget, so the torch.compile cost
+is paid only once.
 
 Usage:
-    python scripts/parallel_scaling.py
-    python scripts/parallel_scaling.py --tokens 50_000_000 --batch-size 48
-    python scripts/parallel_scaling.py --compile            # enable torch.compile
+    python scripts/parallel_scaling.py                          # full 5×5 grid
+    python scripts/parallel_scaling.py --token-budgets 10M,50M  # subset
+    python scripts/parallel_scaling.py --no-compile             # skip compile
 """
 
 import sys
@@ -49,11 +45,18 @@ ARCHITECTURES = [
     ("30M",   dict(dim=384, num_encoder_layers=12, num_decoder_layers=5)),
 ]
 
+TOKEN_BUDGETS = [
+    ("10M",  10_000_000),
+    ("50M",  50_000_000),
+    ("100M", 100_000_000),
+    ("300M", 300_000_000),
+    ("600M", 600_000_000),
+]
+
 SEQ_LEN = 2048
 MUP_BASE_DIM = 64
-BASE_LR = 0.002  # lr_for_dim(64) = 2e-3 * sqrt(64/64)
+BASE_LR = 0.002
 
-# BF16 peak TFLOPS for MFU calculation
 GPU_PEAK_TFLOPS = {
     "H100": 990, "H200": 990, "A100": 312, "A100-SXM": 624,
     "L40": 362, "B200": 4500,
@@ -61,11 +64,6 @@ GPU_PEAK_TFLOPS = {
 
 
 # ── Monkey-patch: cache block masks across models ───────────────────────────
-#
-# flex_attention's fused kernels are faster than manual attention (no O(N²)
-# score materialization). The overhead is create_block_mask compilation,
-# which happens once. But create_masks is called 5× per batch (once per
-# model) — we cache the result since all models share the same batch.
 
 _mask_cache_blocks_id = None
 _mask_cache_result = None
@@ -97,7 +95,6 @@ def install_fast_masks():
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def detect_gpu_tflops():
-    """Best-effort GPU peak TFLOPS detection for MFU reporting."""
     if not torch.cuda.is_available():
         return 200.0
     name = torch.cuda.get_device_name(0).upper()
@@ -108,7 +105,6 @@ def detect_gpu_tflops():
 
 
 def non_emb_param_count(model):
-    """Non-embedding parameters (the '6ND' N)."""
     total = sum(p.numel() for p in model.parameters())
     emb = model.embedding.weight.numel()
     return total - emb
@@ -117,16 +113,11 @@ def non_emb_param_count(model):
 def build_model(arch, vocab_size, device, use_compile=False):
     dim = arch["dim"]
     model = Double_Decoder(
-        vocab_size=vocab_size,
-        dim=dim,
-        num_heads=dim // 64,
+        vocab_size=vocab_size, dim=dim, num_heads=dim // 64,
         num_encoder_layers=arch["num_encoder_layers"],
         num_decoder_layers=arch["num_decoder_layers"],
-        seq_len=SEQ_LEN,
-        shared=True,
-        logit_biases=False,
-        init_strategy="xavier_uniform",
-        gradient_checkpointing=False,
+        seq_len=SEQ_LEN, shared=True, logit_biases=False,
+        init_strategy="xavier_uniform", gradient_checkpointing=False,
         mup_base_dim=MUP_BASE_DIM,
     )
     model = model.to(device)
@@ -136,7 +127,6 @@ def build_model(arch, vocab_size, device, use_compile=False):
 
 
 def build_optimizer(model, dim):
-    """AdamW with μP per-group learning rates."""
     mup_mult = MUP_BASE_DIM / dim
     embed_params, hidden_decay, no_decay = [], [], []
     for name, p in model.named_parameters():
@@ -144,7 +134,8 @@ def build_optimizer(model, dim):
             continue
         if "embedding" in name or "output_projection" in name:
             embed_params.append(p)
-        elif isinstance(dict(model.named_modules()).get(name.rsplit(".", 1)[0]), (nn.LayerNorm, nn.RMSNorm)):
+        elif isinstance(dict(model.named_modules()).get(
+                name.rsplit(".", 1)[0]), (nn.LayerNorm, nn.RMSNorm)):
             no_decay.append(p)
         elif p.dim() <= 1:
             no_decay.append(p)
@@ -158,7 +149,6 @@ def build_optimizer(model, dim):
 
 
 def build_scheduler(optimizer, total_steps):
-    """Linear warmup (5%) → linear decay to 10% of peak."""
     warmup = max(1, int(total_steps * 0.05))
     def lr_lambda(step):
         if step < warmup:
@@ -168,135 +158,57 @@ def build_scheduler(optimizer, total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
+def eval_model(model, eval_loader, device, max_batches):
+    """Run eval on the eager (non-compiled) model."""
+    eager = getattr(model, "_orig_mod", model)
+    eager.eval()
+    total_loss, total_tok = 0.0, 0
+    with torch.no_grad():
+        for i, raw_batch in enumerate(eval_loader):
+            if i >= max_batches:
+                break
+            batch = {k: v.to(device, non_blocking=True)
+                     if isinstance(v, torch.Tensor) else v
+                     for k, v in raw_batch.items()}
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = eager(**batch)
+            ntok = (batch["labels"] != -100).sum().item()
+            total_loss += out["loss"].item() * ntok
+            total_tok += ntok
+    eager.train()
+    avg_loss = total_loss / max(1, total_tok)
+    ppl = float(torch.exp(torch.tensor(avg_loss)))
+    return avg_loss, ppl
 
-def main():
-    parser = argparse.ArgumentParser(description="Parallel scaling-law training")
-    parser.add_argument("--tokens", type=int, default=10_000_000,
-                        help="Total training tokens per model (default: 10M)")
-    parser.add_argument("--batch-size", type=int, default=16,
-                        help="Micro-batch size in sequences (default: 16)")
-    parser.add_argument("--grad-accum", type=int, default=32,
-                        help="Gradient accumulation steps (default: 32, eff_batch=512)")
-    parser.add_argument("--eval-batches", type=int, default=10,
-                        help="Number of eval batches per model (default: 10)")
-    parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
-    parser.add_argument("--no-compile", action="store_true",
-                        help="Disable torch.compile (on by default)")
-    parser.add_argument("--train-file", type=str,
-                        default="data/Pretrain/slimpajama_6b_packed.jsonl")
-    parser.add_argument("--eval-file", type=str,
-                        default="data/Pretrain/slimpajama_6b_eval_packed.jsonl")
-    parser.add_argument("--tokenizer-file", type=str,
-                        default="tokenizer/tokenizer_32k.json")
-    args = parser.parse_args()
 
-    device = torch.device("cuda")
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.set_float32_matmul_precision("high")  # TF32 for fp32 matmuls
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# ── Training one token budget ───────────────────────────────────────────────
 
-    use_compile = not args.no_compile
+def train_one_budget(models_info, total_tokens, batch_size, grad_accum,
+                     train_loader, eval_loader, device, gpu_tflops,
+                     eval_batches):
+    """Train all 5 models on one token budget. Returns results dict."""
+    tokens_per_step = batch_size * grad_accum * SEQ_LEN
+    total_steps = max(1, total_tokens // tokens_per_step)
+    total_micro = total_steps * grad_accum
+    log_interval = max(1, total_steps // 20)
 
-    # Patch in fast tensor masks (no flex_attention / torch.compile overhead)
-    install_fast_masks()
-
-    gpu_tflops = detect_gpu_tflops()
-    gpu_name = torch.cuda.get_device_name(0)
-    tokens_per_step = args.batch_size * args.grad_accum * SEQ_LEN
-    total_steps = max(1, args.tokens // tokens_per_step)
-    total_micro = total_steps * args.grad_accum
-
-    print(f"GPU: {gpu_name}  (peak BF16: {gpu_tflops:.0f} TFLOPS)")
-    print(f"Tokens per model: {args.tokens:,}  |  Optimizer steps: {total_steps}")
-    print(f"Effective batch: {args.batch_size} × {args.grad_accum} = "
-          f"{args.batch_size * args.grad_accum} seqs = {tokens_per_step:,} tok/step")
-    print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
-
-    # ── Tokenizer ────────────────────────────────────────────────────────────
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_file=str(PROJECT_ROOT / args.tokenizer_file))
-    vocab_size = tokenizer.vocab_size
-    bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
-    eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
-    print(f"Tokenizer: vocab_size={vocab_size}  bos={bos_token_id}  eos={eos_token_id}")
-
-    # ── Data ────────────────────────────────────────────────────────────────
-    print("Loading data...")
-    collator = BasicPretrainCollator(
-        bos_token_id=bos_token_id, eos_token_id=eos_token_id, max_seq_len=SEQ_LEN)
-
-    train_ds = load_dataset(
-        "json", data_files=str(PROJECT_ROOT / args.train_file),
-        split="train", streaming=True,
-    )
-    eval_ds = load_dataset(
-        "json", data_files=str(PROJECT_ROOT / args.eval_file),
-        split="train",
-    )
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size,
-        collate_fn=collator, drop_last=True,
-    )
-    eval_loader = DataLoader(
-        eval_ds, batch_size=args.batch_size,
-        collate_fn=collator, drop_last=True,
-    )
-
-    # ── Create all models ───────────────────────────────────────────────────
-    print(f"\nBuilding {len(ARCHITECTURES)} models:\n")
+    # Re-init weights, build fresh optimizer/scheduler for this budget
     trainers = []
-    for name, arch in ARCHITECTURES:
-        model = build_model(arch, vocab_size, device, use_compile=use_compile)
-        opt = build_optimizer(model, arch["dim"])
+    for m in models_info:
+        eager = getattr(m["model"], "_orig_mod", m["model"])
+        initialize_model(eager, "xavier_uniform")
+        opt = build_optimizer(m["model"], m["arch"]["dim"])
         sched = build_scheduler(opt, total_steps)
-        ne = non_emb_param_count(model)
-        mup_mult = MUP_BASE_DIM / arch["dim"]
-        print(f"  {name:>5}: dim={arch['dim']:>3}  "
-              f"layers={arch['num_encoder_layers']:>2}+{arch['num_decoder_layers']:<2}  "
-              f"non_emb={ne:>10,}  hidden_lr={BASE_LR * mup_mult:.1e}")
         trainers.append({
-            "name": name, "model": model, "opt": opt, "sched": sched,
-            "ne": ne, "step": 0, "micro": 0,
-            "loss_sum": 0.0, "loss_n": 0,
+            "name": m["name"], "model": m["model"], "opt": opt,
+            "sched": sched, "ne": m["ne"],
+            "step": 0, "micro": 0, "loss_sum": 0.0, "loss_n": 0,
             "curve": [], "tokens_seen": 0,
         })
-
-    total_ne = sum(t["ne"] for t in trainers)
-    total_all = sum(sum(p.numel() for p in t["model"].parameters()) for t in trainers)
-    print(f"\n  Total params (all models): {total_all:,}")
-    print(f"  Total non-emb params:      {total_ne:,}")
-    print(f"  Weight memory (bf16):      ~{total_all * 2 / 1e6:.0f} MB")
-    print(f"  Optimizer memory (fp32):   ~{total_all * 8 / 1e6:.0f} MB")
-
-    # ── Training loop ───────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print(f"  Training {len(trainers)} models × {total_steps} steps "
-          f"({total_micro} micro-batches)")
-    print(f"{'='*70}\n")
 
     for t in trainers:
         t["model"].train()
         t["opt"].zero_grad(set_to_none=True)
-
-    # Warmup: trigger torch.compile tracing on a dummy batch
-    if use_compile:
-        print("\nCompiling models (one-time cost)...")
-        compile_t0 = time.time()
-        dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
-        dummy_labels = dummy_ids.clone()
-        dummy_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
-        dummy_batch = {"input_ids": dummy_ids, "labels": dummy_labels,
-                       "blocks": dummy_blocks, "sft": False}
-        for t in trainers:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = t["model"](**dummy_batch)
-            out["loss"].backward()
-            t["opt"].zero_grad(set_to_none=True)
-        torch.cuda.synchronize()
-        print(f"  Compiled in {time.time() - compile_t0:.1f}s\n")
 
     t0 = time.time()
 
@@ -304,97 +216,52 @@ def main():
         if batch_idx >= total_micro:
             break
 
-        # Move batch to GPU (shared across all models)
-        batch = {
-            k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in raw_batch.items()
-        }
+        batch = {k: v.to(device, non_blocking=True)
+                 if isinstance(v, torch.Tensor) else v
+                 for k, v in raw_batch.items()}
 
-        # Sanity check on first batch
-        if batch_idx == 0:
-            max_id = batch["input_ids"].max().item()
-            assert max_id < vocab_size, (
-                f"Token ID {max_id} >= vocab_size {vocab_size}. "
-                f"Data was likely tokenized with a different tokenizer. "
-                f"Try --tokenizer-file tokenizer/tokenizer_32k.json")
-
-        # Forward + backward for each model sequentially
         for t in trainers:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = t["model"](**batch)
                 loss = out["loss"]
-
-            (loss / args.grad_accum).backward()
+            (loss / grad_accum).backward()
             t["loss_sum"] += loss.detach().item()
             t["loss_n"] += 1
             t["micro"] += 1
 
-            # Optimizer step after accumulation
-            if t["micro"] % args.grad_accum == 0:
+            if t["micro"] % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(t["model"].parameters(), 1.0)
                 t["opt"].step()
                 t["sched"].step()
                 t["opt"].zero_grad(set_to_none=True)
                 t["step"] += 1
                 t["tokens_seen"] += tokens_per_step
-
                 avg_loss = t["loss_sum"] / t["loss_n"]
                 t["curve"].append((t["step"], round(avg_loss, 4)))
                 t["loss_sum"] = 0.0
                 t["loss_n"] = 0
 
-        # Log once per optimizer step
         current_step = trainers[0]["step"]
-        if current_step > 0 and trainers[0]["micro"] % args.grad_accum == 0:
+        if current_step > 0 and current_step % log_interval == 0 and trainers[0]["micro"] % grad_accum == 0:
             elapsed = time.time() - t0
             total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
-            agg_mfu = total_flops / (elapsed * gpu_tflops * 1e12) * 100
-            losses = "  ".join(
-                f'{t["name"]}={t["curve"][-1][1]:.3f}' for t in trainers
-            )
-            print(f"  step {current_step:>4}/{total_steps}  "
-                  f"[{elapsed:5.1f}s]  agg_MFU={agg_mfu:.1f}%  {losses}")
+            mfu = total_flops / (elapsed * gpu_tflops * 1e12) * 100
+            losses = "  ".join(f'{t["name"]}={t["curve"][-1][1]:.3f}' for t in trainers)
+            print(f"    step {current_step:>5}/{total_steps}  "
+                  f"[{elapsed:6.1f}s]  MFU={mfu:.1f}%  {losses}")
 
     torch.cuda.synchronize()
     train_time = time.time() - t0
-
-    # Final MFU
     total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
     agg_mfu = total_flops / (train_time * gpu_tflops * 1e12) * 100
 
-    print(f"\n{'='*70}")
-    print(f"  Training done in {train_time:.1f}s")
-    print(f"  Aggregate MFU: {agg_mfu:.1f}%  "
-          f"(total FLOPs: {total_flops:.2e})")
-    print(f"{'='*70}")
+    print(f"    Done in {train_time:.1f}s  MFU={agg_mfu:.1f}%")
 
-    # ── Evaluation ──────────────────────────────────────────────────────────
-    print("\nEvaluating...")
+    # Eval
     results = {}
     for t in trainers:
-        # Use eager model for eval (torch.compile retrace hits inductor bugs)
-        model = getattr(t["model"], "_orig_mod", t["model"])
-        model.eval()
-        total_loss, total_tok = 0.0, 0
-        with torch.no_grad():
-            for i, raw_batch in enumerate(eval_loader):
-                if i >= args.eval_batches:
-                    break
-                batch = {
-                    k: v.to(device, non_blocking=True)
-                    if isinstance(v, torch.Tensor) else v
-                    for k, v in raw_batch.items()
-                }
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    out = model(**batch)
-                ntok = (batch["labels"] != -100).sum().item()
-                total_loss += out["loss"].item() * ntok
-                total_tok += ntok
-
-        avg_loss = total_loss / max(1, total_tok)
-        ppl = float(torch.exp(torch.tensor(avg_loss)))
-        print(f"  {t['name']:>5}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
-
+        avg_loss, ppl = eval_model(t["model"], eval_loader, device, eval_batches)
+        print(f"      {t['name']:>5}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
         results[t["name"]] = {
             "name": t["name"],
             "non_emb_params": t["ne"],
@@ -407,15 +274,169 @@ def main():
             "training_time_sec": round(train_time, 2),
             "aggregate_mfu_pct": round(agg_mfu, 2),
         }
+    return results
 
-    # ── Save ────────────────────────────────────────────────────────────────
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Full scaling-law grid training")
+    parser.add_argument("--token-budgets", type=str, default=None,
+                        help="Comma-separated token budgets (e.g. '10M,50M,100M'). "
+                             "Default: all 5 (10M,50M,100M,300M,600M)")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--grad-accum", type=int, default=32,
+                        help="Gradient accumulation (default: 32, eff_batch=512)")
+    parser.add_argument("--eval-batches", type=int, default=10)
+    parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
+    parser.add_argument("--no-compile", action="store_true")
+    parser.add_argument("--train-file", type=str,
+                        default="data/Pretrain/slimpajama_6b_packed.jsonl")
+    parser.add_argument("--eval-file", type=str,
+                        default="data/Pretrain/slimpajama_6b_eval_packed.jsonl")
+    parser.add_argument("--tokenizer-file", type=str,
+                        default="tokenizer/tokenizer_32k.json")
+    args = parser.parse_args()
+
+    # Parse token budgets
+    if args.token_budgets:
+        requested = set(args.token_budgets.split(","))
+        budgets = [(l, v) for l, v in TOKEN_BUDGETS if l in requested]
+        if not budgets:
+            print(f"No matching budgets. Available: {[l for l,_ in TOKEN_BUDGETS]}")
+            return
+    else:
+        budgets = TOKEN_BUDGETS
+
+    device = torch.device("cuda")
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.set_float32_matmul_precision("high")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    use_compile = not args.no_compile
+    install_fast_masks()
+
+    gpu_tflops = detect_gpu_tflops()
+    gpu_name = torch.cuda.get_device_name(0)
+    tokens_per_step = args.batch_size * args.grad_accum * SEQ_LEN
+
+    print(f"GPU: {gpu_name}  (peak BF16: {gpu_tflops:.0f} TFLOPS)")
+    print(f"Effective batch: {args.batch_size} × {args.grad_accum} = "
+          f"{args.batch_size * args.grad_accum} seqs = {tokens_per_step:,} tok/step")
+    print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
+    print(f"Token budgets: {[l for l, _ in budgets]}")
+
+    # ── Tokenizer + Data ────────────────────────────────────────────────────
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(PROJECT_ROOT / args.tokenizer_file))
+    vocab_size = tokenizer.vocab_size
+    bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
+    eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
+    print(f"Tokenizer: vocab_size={vocab_size}  bos={bos_token_id}  eos={eos_token_id}")
+
+    print("Loading data...")
+    collator = BasicPretrainCollator(
+        bos_token_id=bos_token_id, eos_token_id=eos_token_id, max_seq_len=SEQ_LEN)
+
+    train_ds = load_dataset(
+        "json", data_files=str(PROJECT_ROOT / args.train_file),
+        split="train", streaming=True)
+    eval_ds = load_dataset(
+        "json", data_files=str(PROJECT_ROOT / args.eval_file),
+        split="train")
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              collate_fn=collator, drop_last=True)
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
+                             collate_fn=collator, drop_last=True)
+
+    # ── Build and compile models ONCE ───────────────────────────────────────
+    print(f"\nBuilding {len(ARCHITECTURES)} models:\n")
+    models_info = []
+    for name, arch in ARCHITECTURES:
+        model = build_model(arch, vocab_size, device, use_compile=use_compile)
+        ne = non_emb_param_count(model)
+        mup_mult = MUP_BASE_DIM / arch["dim"]
+        print(f"  {name:>5}: dim={arch['dim']:>3}  "
+              f"layers={arch['num_encoder_layers']:>2}+{arch['num_decoder_layers']:<2}  "
+              f"non_emb={ne:>10,}  hidden_lr={BASE_LR * mup_mult:.1e}")
+        models_info.append({"name": name, "arch": arch, "model": model, "ne": ne})
+
+    total_ne = sum(m["ne"] for m in models_info)
+    print(f"\n  Total non-emb params: {total_ne:,}")
+
+    # Compile warmup (once for all budgets)
+    if use_compile:
+        print("\nCompiling models (one-time cost)...")
+        compile_t0 = time.time()
+        dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
+        dummy_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
+        dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
+                       "blocks": dummy_blocks, "sft": False}
+        for m in models_info:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = m["model"](**dummy_batch)
+            out["loss"].backward()
+            # Reset grads from warmup
+            for p in m["model"].parameters():
+                if p.grad is not None:
+                    p.grad = None
+        torch.cuda.synchronize()
+        print(f"  Compiled in {time.time() - compile_t0:.1f}s")
+
+    # ── Run each token budget ───────────────────────────────────────────────
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tok_label = f"{args.tokens // 1_000_000}M"
-    out_path = out_dir / f"parallel_{tok_label}tok_results.json"
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults → {out_path}")
+    all_results = {}
+    sweep_t0 = time.time()
+
+    for tok_label, total_tokens in budgets:
+        total_steps = max(1, total_tokens // tokens_per_step)
+        total_micro = total_steps * args.grad_accum
+
+        print(f"\n{'='*70}")
+        print(f"  {tok_label} tokens  |  {total_steps} steps  |  "
+              f"{total_micro} micro-batches")
+        print(f"{'='*70}\n")
+
+        results = train_one_budget(
+            models_info, total_tokens, args.batch_size, args.grad_accum,
+            train_loader, eval_loader, device, gpu_tflops, args.eval_batches)
+
+        all_results[tok_label] = results
+
+        # Save per-budget results
+        out_path = out_dir / f"parallel_{tok_label}tok_results.json"
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"    Results → {out_path}")
+
+    # ── Save combined grid results ──────────────────────────────────────────
+    sweep_time = time.time() - sweep_t0
+    combined_path = out_dir / "scaling_grid_results.json"
+    with open(combined_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    print(f"\n{'='*70}")
+    print(f"  Full grid complete in {sweep_time/60:.1f} min")
+    print(f"  Combined results → {combined_path}")
+    print(f"{'='*70}")
+
+    # Print loss grid
+    print(f"\n  Eval loss grid (params × tokens):\n")
+    header = f"  {'params':<8}" + "".join(f"  {l:>8}" for l, _ in budgets)
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for name, _ in ARCHITECTURES:
+        row = f"  {name:<8}"
+        for tok_label, _ in budgets:
+            if tok_label in all_results and name in all_results[tok_label]:
+                loss = all_results[tok_label][name]["final_eval_loss"]
+                row += f"  {loss:>8.4f}"
+            else:
+                row += f"  {'—':>8}"
+        print(row)
 
 
 if __name__ == "__main__":

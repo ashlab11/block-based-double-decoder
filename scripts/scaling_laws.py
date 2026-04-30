@@ -203,92 +203,132 @@ MODEL_TYPE_PREFIXES = [
 
 
 def cmd_collect(args):
-    """Read all results JSONs and output plain-text tables."""
+    """Read all results JSONs and output plain-text tables.
+
+    Scans checkpoints/scaling/ for {prefix}_{plabel}_{tlabel}tok_results.json
+    across all model type prefixes (dd, sed, dec) and both legacy and
+    width-only param labels.
+    """
+    import re
 
     rows = []
     curves = []
-    missing = []
 
-    for prefix, type_name in MODEL_TYPE_PREFIXES:
-        for plabel in PARAM_LABELS:
-            arch = ARCHITECTURES[plabel]
-            dim = arch["dim"]
-            enc = arch["num_encoder_layers"]
-            dec = arch["num_decoder_layers"]
-            ne = non_emb_params(dim, enc, dec)
+    # Discover all result files by scanning the directory
+    if not CHECKPOINT_DIR.exists():
+        print(f"No results directory: {CHECKPOINT_DIR}")
+        return
 
-            for tlabel in TOKEN_LABELS:
-                tokens = TOKEN_VALUES[tlabel]
-                name = f"{prefix}_{plabel}_{tlabel}tok"
-                flops = compute_flops(ne, tokens)
+    result_files = sorted(CHECKPOINT_DIR.glob("*_results.json"))
+    # Parse filenames like: dd_0.5M_10Mtok_results.json or dd_500000p_10000000tok_results.json
+    pattern = re.compile(
+        r"^(dd|sed|dec)_(.+?)_(\d+[A-Za-z]*)tok_results\.json$"
+    )
 
-                # Check for results file
-                results_file = CHECKPOINT_DIR / f"{name}_results.json"
-                if not results_file.exists():
-                    # Also check legacy dd_ format (run_name_from_labels)
-                    if prefix == "dd":
-                        legacy_name = run_name_from_labels(plabel, tlabel)
-                        legacy_file = CHECKPOINT_DIR / f"{legacy_name}_results.json"
-                        if legacy_file.exists():
-                            results_file = legacy_file
-                            name = legacy_name
-                        else:
-                            raw_name = f"dd_{PARAM_VALUES[plabel]}p_{tokens}tok"
-                            raw_file = CHECKPOINT_DIR / f"{raw_name}_results.json"
-                            if raw_file.exists():
-                                results_file = raw_file
-                                name = raw_name
+    known_prefixes = {p: tn for p, tn in MODEL_TYPE_PREFIXES}
+    seen_plabels = set()
+    seen_tlabels = set()
 
-                if not results_file.exists():
-                    missing.append(name)
-                    rows.append(dict(
-                        name=name, prefix=prefix, type_name=type_name,
-                        plabel=plabel, tlabel=tlabel,
-                        non_emb_params=ne, tokens=tokens, flops=flops,
-                        dim=dim, enc=enc, dec=dec,
-                        loss=None, ppl=None, steps=None,
-                        total_params=None, time_sec=None,
-                    ))
+    for fpath in result_files:
+        m = pattern.match(fpath.name)
+        if not m:
+            # Try legacy format: dd_{plabel}_{tlabel}tok_results.json
+            # where plabel might be from PARAM_LABELS
+            legacy = re.match(r"^(dd)_(\d+)p_(\d+)tok_results\.json$", fpath.name)
+            if legacy:
+                prefix = legacy.group(1)
+                # Map raw param value to label
+                raw_params = int(legacy.group(2))
+                raw_tokens = int(legacy.group(3))
+                plabel = None
+                for pl, pv in PARAM_VALUES.items():
+                    if pv == raw_params:
+                        plabel = pl
+                        break
+                tlabel = None
+                for tl, tv in TOKEN_VALUES.items():
+                    if tv == raw_tokens:
+                        tlabel = tl
+                        break
+                if plabel is None or tlabel is None:
                     continue
+            else:
+                continue
+        else:
+            prefix = m.group(1)
+            plabel = m.group(2)
+            tlabel = m.group(3)
 
-                with open(results_file) as f:
-                    data = json.load(f)
+        if prefix not in known_prefixes:
+            continue
 
-                rows.append(dict(
-                    name=name, prefix=prefix, type_name=type_name,
-                    plabel=plabel, tlabel=tlabel,
-                    non_emb_params=ne, tokens=tokens, flops=flops,
-                    dim=dim, enc=enc, dec=dec,
-                    loss=data["final_eval_loss"],
-                    ppl=data["final_eval_ppl"],
-                    steps=data["total_steps"],
-                    total_params=data.get("total_params"),
-                    time_sec=data.get("training_time_sec"),
+        type_name = known_prefixes[prefix]
+        seen_plabels.add(plabel)
+        seen_tlabels.add(tlabel)
+
+        # Resolve architecture for non-emb param count
+        if plabel in ARCHITECTURES:
+            arch = ARCHITECTURES[plabel]
+        else:
+            arch = None
+
+        with open(fpath) as f:
+            data = json.load(f)
+
+        # Get params from hparams or architecture
+        hparams = data.get("hparams", {})
+        dim = hparams.get("dim") or (arch["dim"] if arch else 0)
+        enc = hparams.get("num_encoder_layers") or (arch["num_encoder_layers"] if arch else 0)
+        dec = hparams.get("num_decoder_layers") or (arch["num_decoder_layers"] if arch else 0)
+        ne = non_emb_params(dim, enc, dec) if dim > 0 else data.get("non_emb_params", 0)
+
+        tokens = hparams.get("total_tokens") or TOKEN_VALUES.get(tlabel, 0)
+        flops = compute_flops(ne, tokens) if ne > 0 and tokens > 0 else 0
+
+        name = fpath.stem.replace("_results", "")
+
+        rows.append(dict(
+            name=name, prefix=prefix, type_name=type_name,
+            plabel=plabel, tlabel=tlabel,
+            non_emb_params=ne, tokens=tokens, flops=flops,
+            dim=dim, enc=enc, dec=dec,
+            loss=data["final_eval_loss"],
+            ppl=data["final_eval_ppl"],
+            steps=data["total_steps"],
+            total_params=data.get("total_params"),
+            time_sec=data.get("training_time_sec"),
+        ))
+
+        if args.curves:
+            for step, loss in data.get("train_curve", []):
+                curves.append(dict(
+                    name=name, prefix=prefix, non_emb_params=ne,
+                    tokens=tokens, step=step, train_loss=loss,
+                ))
+            for step, loss in data.get("eval_curve", []):
+                curves.append(dict(
+                    name=name, prefix=prefix, non_emb_params=ne,
+                    tokens=tokens, step=step, eval_loss=loss,
                 ))
 
-                if args.curves:
-                    for step, loss in data.get("train_curve", []):
-                        curves.append(dict(
-                            name=name, prefix=prefix, non_emb_params=ne,
-                            tokens=tokens, step=step, train_loss=loss,
-                        ))
-                    for step, loss in data.get("eval_curve", []):
-                        curves.append(dict(
-                            name=name, prefix=prefix, non_emb_params=ne,
-                            tokens=tokens, step=step, eval_loss=loss,
-                        ))
+    # Sort labels for display
+    def _sort_key(label):
+        """Sort labels numerically: '0.6M' → 0.6, '14.7M' → 14.7"""
+        m = re.match(r"([\d.]+)", label)
+        return float(m.group(1)) if m else label
+
+    plabels = sorted(seen_plabels, key=_sort_key)
+    tlabels = sorted(seen_tlabels, key=_sort_key)
 
     # ── Output ──────────────────────────────────────────────────────────
 
-    found_prefixes = sorted(set(r["prefix"] for r in rows if r["loss"] is not None))
-    total_found = sum(1 for r in rows if r["loss"] is not None)
-    total_missing = len(missing)
+    found_prefixes = sorted(set(r["prefix"] for r in rows))
 
     print("=== SCALING LAW RESULTS ===")
-    print(f"# Model types found: {', '.join(found_prefixes) or 'none'}")
-    print(f"# Runs: {total_found} found, {total_missing} missing")
-    if total_missing > 0 and total_missing <= 20:
-        print(f"# Missing: {', '.join(missing)}")
+    print(f"# Model types: {', '.join(found_prefixes) or 'none'}")
+    print(f"# Param widths: {', '.join(plabels)}")
+    print(f"# Token budgets: {', '.join(tlabels)}")
+    print(f"# Total runs found: {len(rows)}")
     print()
 
     # ── Summary table (one row per run) ─────────────────────────────────
@@ -298,16 +338,14 @@ def cmd_collect(args):
     print("\t".join(cols))
 
     for r in rows:
-        if r["loss"] is None:
-            continue
         vals = [
             r["name"],
             r["prefix"],
             str(r["non_emb_params"]),
             str(r["tokens"]),
             f"{r['flops']:.3e}",
-            f"{r['loss']:.6f}" if r["loss"] is not None else "N/A",
-            f"{r['ppl']:.4f}" if r["ppl"] is not None else "N/A",
+            f"{r['loss']:.6f}",
+            f"{r['ppl']:.4f}",
             str(r["dim"]),
             str(r["enc"]),
             str(r["dec"]),
@@ -319,41 +357,45 @@ def cmd_collect(args):
 
     # ── Loss grids per model type ─────────────────────────────────────
     for prefix, type_name in MODEL_TYPE_PREFIXES:
-        prefix_rows = [r for r in rows if r["prefix"] == prefix and r["loss"] is not None]
+        prefix_rows = [r for r in rows if r["prefix"] == prefix]
         if not prefix_rows:
             continue
 
         print()
         print(f"--- LOSS GRID: {type_name} ({prefix}) ---")
-        header = f"{'params':<10}" + "".join(f"{t:>12}" for t in TOKEN_LABELS)
+        header = f"{'params':<10}" + "".join(f"{t:>12}" for t in tlabels)
         print(header)
         print("-" * len(header))
 
-        for plabel in PARAM_LABELS:
+        for plabel in plabels:
             row_str = f"{plabel:<10}"
-            for tlabel in TOKEN_LABELS:
+            for tlabel in tlabels:
                 match = [r for r in prefix_rows
                          if r["plabel"] == plabel and r["tlabel"] == tlabel]
-                if match and match[0]["loss"] is not None:
+                if match:
                     row_str += f"{match[0]['loss']:>12.4f}"
                 else:
                     row_str += f"{'---':>12}"
             print(row_str)
 
-    # ── FLOPs grid (shared across model types) ────────────────────────
+    # ── FLOPs grid ────────────────────────────────────────────────────
     print()
     print("--- FLOPS GRID (params × tokens) ---")
-    header = f"{'params':<10}" + "".join(f"{t:>12}" for t in TOKEN_LABELS)
+    header = f"{'params':<10}" + "".join(f"{t:>12}" for t in tlabels)
     print(header)
     print("-" * len(header))
 
-    for plabel in PARAM_LABELS:
-        arch = ARCHITECTURES[plabel]
-        ne = non_emb_params(arch["dim"], arch["num_encoder_layers"], arch["num_decoder_layers"])
+    for plabel in plabels:
+        # Get dim from any row with this plabel
+        plabel_rows = [r for r in rows if r["plabel"] == plabel]
+        if not plabel_rows:
+            continue
+        ne = plabel_rows[0]["non_emb_params"]
         row_str = f"{plabel:<10}"
-        for tlabel in TOKEN_LABELS:
-            tokens = TOKEN_VALUES[tlabel]
-            flops = compute_flops(ne, tokens)
+        for tlabel in tlabels:
+            tlabel_rows = [r for r in rows if r["tlabel"] == tlabel]
+            tokens = tlabel_rows[0]["tokens"] if tlabel_rows else 0
+            flops = compute_flops(ne, tokens) if tokens > 0 else 0
             row_str += f"{flops:>12.2e}"
         print(row_str)
 

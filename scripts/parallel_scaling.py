@@ -43,12 +43,18 @@ from components.initialization import initialize_model
 MODEL_TYPES = ["dd", "sed", "dec"]
 MODEL_TYPE_NAMES = {"dd": "Double_Decoder", "sed": "StandardEncDec", "dec": "DecoderOnly"}
 
+# Fixed depth, width-only scaling for clean μP transfer.
+# enc=8, dec=4 across all sizes; only dim varies.
+# DD/Dec non-emb ≈ 144·dim²;  StandardEncDec ≈ 160·dim² (extra cross-attn params).
+FIXED_ENC_LAYERS = 8
+FIXED_DEC_LAYERS = 4
+
 ARCHITECTURES = [
-    ("0.5M",  dict(dim=64,  num_encoder_layers=7,  num_decoder_layers=3)),
-    ("2.5M",  dict(dim=128, num_encoder_layers=9,  num_decoder_layers=4)),
-    ("5M",    dict(dim=192, num_encoder_layers=8,  num_decoder_layers=4)),
-    ("15M",   dict(dim=256, num_encoder_layers=13, num_decoder_layers=6)),
-    ("30M",   dict(dim=384, num_encoder_layers=12, num_decoder_layers=5)),
+    ("0.6M",  dict(dim=64,  num_encoder_layers=8, num_decoder_layers=4)),
+    ("2.4M",  dict(dim=128, num_encoder_layers=8, num_decoder_layers=4)),
+    ("5.3M",  dict(dim=192, num_encoder_layers=8, num_decoder_layers=4)),
+    ("14.7M", dict(dim=320, num_encoder_layers=8, num_decoder_layers=4)),
+    ("28.9M", dict(dim=448, num_encoder_layers=8, num_decoder_layers=4)),
 ]
 
 TOKEN_BUDGETS = [

@@ -50,9 +50,18 @@ echo "  Step 2: Data Pipeline"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── Fast path: download pre-packed data from HuggingFace ────────────────────
+# Set FORCE_SLOW_PATH=1 to skip the HF download. Required after any change
+# to tokenizer/hf_tokenizer.py's special_tokens list (e.g. the sentinel
+# additions in commit 5c78ad4) — the HF pre-pack is keyed to the older
+# tokenizer and using it produces off-by-15 token IDs across the entire
+# vocabulary.
 NEED_SLOW_PATH=false
 
-if [ -f "data/Pretrain/slimpajama_6b_packed.jsonl" ] && \
+if [ "${FORCE_SLOW_PATH:-0}" = "1" ]; then
+    echo ""
+    echo "── FORCE_SLOW_PATH=1 set: skipping HF fast path, rebuilding from source ──"
+    NEED_SLOW_PATH=true
+elif [ -f "data/Pretrain/slimpajama_6b_packed.jsonl" ] && \
    [ -f "data/Pretrain/slimpajama_6b_eval_packed.jsonl" ] && \
    [ -f "tokenizer/tokenizer_32k.json" ]; then
     echo ""

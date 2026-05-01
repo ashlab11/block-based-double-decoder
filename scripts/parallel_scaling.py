@@ -512,6 +512,29 @@ def target_effective_batch_for(non_emb_params):
     return int(math.ceil(raw / 32) * 32)
 
 
+def step_floor_cap(total_tokens, seq_len, min_steps):
+    """Largest effective batch (in seqs) that still leaves room for at least
+    `min_steps` optimizer steps over `total_tokens` tokens. Used to keep the
+    bottom-right of the sweep (large N × small T) from being starved of
+    schedule space — at 300M × 100M with the N-only cap (512 seqs) you get
+    only ~95 steps (4 warmup), and the LR barely escapes warmup before decay.
+
+    Returns floor(total_tokens / (min_steps · seq_len)) rounded down to a
+    multiple of 32, with a hard minimum of 32. If min_steps <= 0, no cap
+    (returns float('inf')) so callers can min() it freely with the N-cap.
+
+    Note: when the auto-tuned micro_batch already exceeds this cap (rare —
+    typically only for tiny models with very small T), grad_accum collapses
+    to 1 and effective_batch = micro_batch > target. The cap can't shrink
+    micro_batch from here (that would need re-running auto_tune_batch_size
+    with a max_bs constraint); it only constrains grad_accum upward.
+    """
+    if min_steps is None or min_steps <= 0:
+        return float('inf')
+    raw = total_tokens // (min_steps * seq_len)
+    return max(32, (raw // 32) * 32)
+
+
 def model_forward(model, batch, needs_blocks):
     """Dispatch forward based on model type."""
     if needs_blocks:
@@ -1186,9 +1209,20 @@ def main():
                         help=f"Effective batch (seqs) for grad_accum derivation. "
                              f"Default: AUTO — scales with model size via "
                              f"target_effective_batch_for(non_emb_params), "
-                             f"giving 96 seqs for 5M up to 512 for 300M. "
-                             f"Pass an int to override (legacy fixed-batch "
-                             f"behaviour was {TARGET_EFFECTIVE_BATCH}).")
+                             f"giving 96 seqs for 5M up to 512 for 300M, then "
+                             f"capped per-cell so each (arch, tokens) cell gets "
+                             f"at least --min-optimizer-steps. Pass an int to "
+                             f"override both (legacy fixed-batch behaviour was "
+                             f"{TARGET_EFFECTIVE_BATCH}).")
+    parser.add_argument("--min-optimizer-steps", type=int, default=500,
+                        help="Step-budget floor: when --target-effective-batch "
+                             "is AUTO, each (arch, tokens) cell's target is "
+                             "capped down so total_tokens / (target · seq_len) "
+                             ">= this many optimizer steps. Prevents large-N × "
+                             "small-T cells (300M × 100M = 95 steps with the "
+                             "N-only cap) from starving the LR schedule. Set 0 "
+                             "to disable (use the N-only cap regardless of T). "
+                             "Ignored when --target-effective-batch is set.")
     # Optimizer / μP toggles (pretrain only; SFT path is unaffected)
     parser.add_argument("--no-mup", action="store_true",
                         help="Disable μP entirely. With --no-mup, models are "
@@ -1538,14 +1572,18 @@ def main():
             # Per-arch effective batch: explicit CLI value wins; otherwise
             # auto-scale from each model's non-emb param count so small
             # models don't get starved of optimizer steps by the 300M-sized
-            # default. Build a {arch_name: ne} lookup from models_info.
+            # default. Build a {arch_name: ne} lookup from models_info. Only
+            # the N-cap is shown here — the actual target also gets a per-cell
+            # T-cap (--min-optimizer-steps) applied inside the budget loop,
+            # so cells with small total_tokens may end up with a lower target
+            # than printed below.
             arch_ne = {m["name"]: m["ne"] for m in models_info}
             for name, bs in per_arch_bs.items():
                 tgt = (args.target_effective_batch
                        if args.target_effective_batch is not None
                        else target_effective_batch_for(arch_ne[name]))
                 ga = grad_accum_for(bs, tgt)
-                src = "CLI" if args.target_effective_batch is not None else "auto"
+                src = "CLI" if args.target_effective_batch is not None else "auto/N-cap"
                 print(f"    {name:>6}: batch_size={bs:>3}  grad_accum={ga:>3}  "
                       f"effective={bs*ga} seqs = {bs*ga*SEQ_LEN:,} tok/step  "
                       f"(target={tgt} {src})")
@@ -1562,10 +1600,6 @@ def main():
             # Per-arch loop: re-create dataloader at each arch's batch size.
             for m in models_info:
                 bs = per_arch_bs[m["name"]]
-                tgt = (args.target_effective_batch
-                       if args.target_effective_batch is not None
-                       else target_effective_batch_for(m["ne"]))
-                ga = grad_accum_for(bs, tgt)
                 # Only this model_type's loader is needed (single-trainer path),
                 # but train_one_budget expects the full dict, so build it.
                 arch_loaders = {
@@ -1579,11 +1613,21 @@ def main():
                     for mt_ in MODEL_TYPES
                 }
                 for tok_label, total_tokens in budgets:
+                    # Per-cell target: N-cap (critical batch) ∧ T-cap (step floor).
+                    # Has to be inside the budget loop because the T-cap
+                    # depends on this cell's total_tokens.
+                    if args.target_effective_batch is not None:
+                        tgt = args.target_effective_batch
+                    else:
+                        tgt = min(target_effective_batch_for(m["ne"]),
+                                  step_floor_cap(total_tokens, SEQ_LEN,
+                                                 args.min_optimizer_steps))
+                    ga = grad_accum_for(bs, tgt)
                     tok_per_step = bs * ga * SEQ_LEN
                     total_steps = max(1, total_tokens // tok_per_step)
                     print(f"\n  {'='*66}")
                     print(f"    {mt} × {m['name']} × {tok_label} tokens  |  "
-                          f"{total_steps} steps  |  bs={bs} ga={ga}")
+                          f"{total_steps} steps  |  bs={bs} ga={ga} (target={tgt})")
                     print(f"  {'='*66}\n")
                     base_cfg = {
                         "arch_set": args.arch_set, "token_set": args.token_set,
@@ -1636,22 +1680,6 @@ def main():
             # All archs share one batch size — co-resident path (faster).
             # Use the min so the smallest-tolerated arch sets the shape.
             bs = min(per_arch_bs.values()) if per_arch_bs else args.batch_size
-            # Co-resident: one effective batch for the whole group. Pick the
-            # max of per-arch auto targets so the largest model still gets a
-            # reasonable batch (smaller models tolerate larger batches and
-            # just lose a bit of step granularity). Override wins as before.
-            if args.auto_batch_size:
-                if args.target_effective_batch is not None:
-                    tgt = args.target_effective_batch
-                else:
-                    tgt = max(target_effective_batch_for(m["ne"])
-                              for m in models_info)
-                ga = grad_accum_for(bs, tgt)
-            else:
-                ga = args.grad_accum
-            tokens_per_step = bs * ga * SEQ_LEN
-            print(f"\n  Co-resident batch: bs={bs} ga={ga}  "
-                  f"{tokens_per_step:,} tok/step")
             if args.auto_batch_size:
                 run_loaders = {
                     mt_: DataLoader(train_ds, batch_size=bs,
@@ -1667,11 +1695,32 @@ def main():
                 run_loaders = train_loaders
                 run_eval_loaders = eval_loaders
             for tok_label, total_tokens in budgets:
+                # Co-resident: one effective batch for the whole co-resident
+                # group. Take max of per-arch N-caps (so the largest model
+                # still gets a reasonable batch — smaller co-resident models
+                # tolerate the larger batch with a bit of step-count loss),
+                # then apply the T-cap floor for THIS cell so the LR schedule
+                # still has room. Per-cell because T-cap depends on this
+                # cell's total_tokens.
+                if args.auto_batch_size:
+                    if args.target_effective_batch is not None:
+                        tgt = args.target_effective_batch
+                    else:
+                        n_cap = max(target_effective_batch_for(m["ne"])
+                                    for m in models_info)
+                        tgt = min(n_cap, step_floor_cap(total_tokens, SEQ_LEN,
+                                                        args.min_optimizer_steps))
+                    ga = grad_accum_for(bs, tgt)
+                else:
+                    ga = args.grad_accum
+                    tgt = bs * ga
+                tokens_per_step = bs * ga * SEQ_LEN
                 total_steps = max(1, total_tokens // tokens_per_step)
                 total_micro = total_steps * ga
                 print(f"\n  {'='*66}")
                 print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
-                      f"{total_micro} micro-batches")
+                      f"{total_micro} micro-batches  |  bs={bs} ga={ga} "
+                      f"(target={tgt})")
                 print(f"  {'='*66}\n")
                 base_cfg = {
                     "arch_set": args.arch_set, "token_set": args.token_set,

@@ -66,14 +66,14 @@ class StandardEncDec(nn.Module):
         initialize_model(self, init_strategy)
 
     def encode(self, input_ids, block_masks = None):
-        x = self.embedding(input_ids) * self.mup_mult
+        x = self.embedding(input_ids)
         for layer in self.encoder_layers:
             x = layer(x, block_masks)
         x = self.encoder_norm(x)
         return x
 
     def decode(self, input_ids, encoder_output, block_masks=None, decoder_input_positions=None):
-        x = self.embedding(input_ids) * self.mup_mult
+        x = self.embedding(input_ids)
         for layer in self.decoder_layers:
             x = layer(x, encoder_output, block_masks,
                       decoder_input_positions=decoder_input_positions)

@@ -77,7 +77,7 @@ class Double_Decoder(nn.Module):
     def decode(self, input_ids, encoder_output, block_masks = None, decoder_input_positions=None):
 
         # Embed input tokens (μP: scale embedding output by base_dim/dim)
-        x = self.embedding(input_ids) * self.mup_mult
+        x = self.embedding(input_ids)
 
         # Apply decoder layers
         for layer in self.decoder_layers:

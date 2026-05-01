@@ -48,7 +48,7 @@ class DecoderOnlyModel(nn.Module):
         input_ids,
         labels = None):
         # Encode (μP: scale embedding output by base_dim/dim)
-        x = self.embedding(input_ids) * self.mup_mult
+        x = self.embedding(input_ids)
 
         for layer in self.layers:
             x = layer(x)

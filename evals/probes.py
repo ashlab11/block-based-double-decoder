@@ -146,7 +146,21 @@ def _make_copy_example(seq_len, vocab_size, repeat_offset, rng):
 
 def eval_copy_retrieval(model, tokenizer, device, is_enc_dec,
                         num_examples=200, max_offset=512, batch_size=64):
-    """Test exact token copying from earlier in the sequence (batched per offset)."""
+    """Test exact token copying from earlier in the sequence (batched per offset).
+
+    All batches are right-padded to model.seq_len before the forward pass.
+    Without that, FlexAttention's compiled mask kernel (BLOCK_M=BLOCK_N=128)
+    over-reads the input tile when the actual seq_len is shorter than 128
+    (offsets 32 and 64 here produce sequences as short as ~34 tokens), which
+    surfaces as a CUDA illegal memory access. Padding to the trained seq_len
+    also reuses the same FlexAttention specialization the model was trained
+    with — zero recompile cost.
+    """
+    model_class_name = type(model).__name__
+    is_dd = model_class_name == "Double_Decoder"
+    is_sed = model_class_name == "StandardEncDec"
+    target_seq_len = getattr(model, "seq_len", 2048)
+
     vocab_size = tokenizer.vocab_size
     rng = random.Random(42)
 
@@ -176,14 +190,28 @@ def eval_copy_retrieval(model, tokenizer, device, is_enc_dec,
             batch_targets = targets[batch_start:batch_start + batch_size]
             batch_ppos = pred_positions[batch_start:batch_start + batch_size]
 
-            max_len = max(len(s) for s in batch_seqs)
-            padded = [s + [pad_id] * (max_len - len(s)) for s in batch_seqs]
+            real_max_len = max(len(s) for s in batch_seqs)
+            pad_to = max(target_seq_len, real_max_len)
+            padded = [s + [pad_id] * (pad_to - len(s)) for s in batch_seqs]
             input_t = torch.tensor(padded, device=device)
+            B = input_t.shape[0]
 
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                                       enabled=device.type == "cuda"):
-                if is_enc_dec:
-                    blocks = _sample_pretrain_blocks(max_len, device, seed=max_len)
+                if is_dd:
+                    # Boundaries bounded by real_max_len so all padding positions
+                    # land in a single trailing block (block_id = max_real+1) that
+                    # never matches any real position's block_id under same_blk —
+                    # padding can't bleed into the prediction at pred_pos.
+                    blocks = _sample_pretrain_blocks(real_max_len, device,
+                                                     seed=real_max_len)
+                    logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
+                elif is_sed:
+                    # SED's create_masks_ED treats `blocks` as per-batch encoder
+                    # lengths (shape [B], indexed by `enc_lens[b]`). Mask gates
+                    # out kv positions >= real_max_len so padding is invisible.
+                    blocks = torch.full((B,), real_max_len,
+                                        dtype=torch.int64, device=device)
                     logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
                 else:
                     logits = model(input_ids=input_t)["logits"]

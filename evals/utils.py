@@ -421,9 +421,16 @@ def _seq_lp_batch_inner(model, id_lists, device, pad_id, is_enc_dec):
     input_t = torch.tensor(padded, device=device)
 
     if is_enc_dec:
-        # Sample block boundaries matching training distribution (3-8 blocks).
-        # Use max_len as seed so the same batch shape gives reproducible results.
-        blocks = _sample_pretrain_blocks(max_len, device, seed=max_len)
+        # Each enc-dec arch interprets `blocks` differently — DD wants per-seq
+        # boundary positions for combo-attn block masking, SED wants per-batch
+        # encoder lengths for create_masks_ED's `enc_lens[b]` indexing. Passing
+        # the wrong shape OOB-reads the closure tensor → silent garbage or IMA.
+        model_class_name = type(model).__name__
+        if model_class_name == "StandardEncDec":
+            blocks = torch.full((input_t.shape[0],), max_len,
+                                dtype=torch.int64, device=device)
+        else:
+            blocks = _sample_pretrain_blocks(max_len, device, seed=max_len)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
     else:
@@ -460,7 +467,13 @@ def get_sequence_log_probs(model, tokenizer, input_ids_list, device, is_enc_dec)
 
     if is_enc_dec:
         seq_len = len(input_ids_list)
-        blocks = _sample_pretrain_blocks(seq_len, device, seed=seq_len)
+        # Same DD-vs-SED divergence as _seq_lp_batch_inner: SED's create_masks_ED
+        # reads `enc_lens[b]` so blocks must be shape [B], not boundary positions.
+        model_class_name = type(model).__name__
+        if model_class_name == "StandardEncDec":
+            blocks = torch.full((1,), seq_len, dtype=torch.int64, device=device)
+        else:
+            blocks = _sample_pretrain_blocks(seq_len, device, seed=seq_len)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model(input_ids=input_t, blocks=blocks, sft=False)["logits"]
     else:

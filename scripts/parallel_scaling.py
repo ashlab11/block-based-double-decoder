@@ -198,6 +198,13 @@ MUP_BASE_DIM = 64
 BASE_LR = 0.002  # fallback default; overridden per-arch from configs/mup_tuned.json
 TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 tok = 1.05M tok/step
 
+# CLI-driven toggles set by main() after argparse. Module-level so build_optimizer
+# can read them without threading kwargs through train_one_budget. --no-mup zeros
+# out the (mup_base_dim/dim) hidden-LR multiplier; --peak-lr overrides BASE_LR /
+# configs/mup_tuned.json for the pretrain optimizer only.
+MUP_ENABLED = True
+LR_OVERRIDE = None
+
 # ── μP-tuned per-arch base LRs ──────────────────────────────────────────────
 # Populated from configs/mup_tuned.json (written by scripts/mup_base_sweep.py).
 # Falls back to BASE_LR when the file is absent so smoke tests don't break
@@ -375,9 +382,17 @@ def build_optimizer(model, dim, model_type=None):
     """Build μP-aware AdamW. If model_type is given, picks the per-arch tuned
     base LR from configs/mup_tuned.json (falls back to BASE_LR otherwise).
     The model_type=None branch preserves the pre-#3 behavior so any unrelated
-    callers don't break."""
-    base_lr = base_lr_for(model_type) if model_type else BASE_LR
-    mup_mult = MUP_BASE_DIM / dim
+    callers don't break.
+
+    Honors module-level CLI toggles: LR_OVERRIDE replaces base_lr (used by
+    --peak-lr); MUP_ENABLED=False forces mup_mult=1.0 so all param groups
+    train at base_lr (used by --no-mup, intended to be paired with a sane
+    --peak-lr — see CLI help for guidance)."""
+    if LR_OVERRIDE is not None:
+        base_lr = LR_OVERRIDE
+    else:
+        base_lr = base_lr_for(model_type) if model_type else BASE_LR
+    mup_mult = (MUP_BASE_DIM / dim) if MUP_ENABLED else 1.0
     embed_params, hidden_decay, no_decay = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -847,7 +862,14 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         flops_arch = compute_flops_arch(
             t["model_type"], t["ne"], t["tokens_seen"],
             enc=arch["num_encoder_layers"], dec=arch["num_decoder_layers"])
-        actual_base_lr = base_lr_for(t["model_type"])
+        actual_base_lr = (LR_OVERRIDE if LR_OVERRIDE is not None
+                          else base_lr_for(t["model_type"]))
+        if LR_OVERRIDE is not None:
+            lr_source = "CLI --peak-lr"
+        elif t["model_type"] in TUNED_LRS:
+            lr_source = "configs/mup_tuned.json"
+        else:
+            lr_source = "BASE_LR fallback"
 
         run_result = {
             "final_eval_loss": round(avg_loss, 4),
@@ -872,8 +894,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 "num_heads": arch["dim"] // 64,
                 "seq_len": SEQ_LEN,
                 "mup_base_dim": MUP_BASE_DIM,
+                "mup_enabled": MUP_ENABLED,
                 "lr": actual_base_lr,
-                "lr_source": "configs/mup_tuned.json" if t["model_type"] in TUNED_LRS else "BASE_LR fallback",
+                "lr_source": lr_source,
                 "batch_size": batch_size,
                 "grad_accum_steps": grad_accum,
                 "total_tokens": total_tokens,
@@ -1103,6 +1126,20 @@ def main():
                         default=TARGET_EFFECTIVE_BATCH,
                         help=f"Effective batch (seqs) for grad_accum derivation "
                              f"(default {TARGET_EFFECTIVE_BATCH})")
+    # Optimizer / μP toggles (pretrain only; SFT path is unaffected)
+    parser.add_argument("--no-mup", action="store_true",
+                        help="Disable μP hidden-layer LR scaling. With --no-mup, "
+                             "all optimizer param groups use base LR directly "
+                             "(no mup_base_dim/dim multiplier on hidden weights). "
+                             "Only sensible paired with --peak-lr at a width-"
+                             "appropriate value (e.g. 3e-4 for dim=576). Without "
+                             "--peak-lr the base LR stays at BASE_LR=2e-3, which "
+                             "will almost certainly diverge for non-tiny dims.")
+    parser.add_argument("--peak-lr", type=float, default=None,
+                        help="Override pretrain base LR. Bypasses configs/"
+                             "mup_tuned.json and BASE_LR. Typical non-μP values: "
+                             "3e-4 (safe default for ~50M dec), 6e-4 (nanoGPT-"
+                             "style aggressive). Does not affect SFT (--sft-lr).")
     parser.add_argument("--max-batch-size", type=int, default=128,
                         help="Cap for the auto-tune search ceiling")
     # Eval control
@@ -1185,6 +1222,17 @@ def main():
     # Pick up per-arch tuned LRs from configs/mup_tuned.json (silent no-op if
     # the file doesn't exist yet — happens until you've run mup_base_sweep).
     _load_tuned_lrs()
+
+    # Apply --no-mup / --peak-lr to the module globals consumed by
+    # build_optimizer. We do this after _load_tuned_lrs so --peak-lr cleanly
+    # overrides anything that file would have provided.
+    global MUP_ENABLED, LR_OVERRIDE
+    MUP_ENABLED = not args.no_mup
+    LR_OVERRIDE = args.peak_lr
+    if not MUP_ENABLED or LR_OVERRIDE is not None:
+        print(f"[optim] mup_enabled={MUP_ENABLED}  "
+              f"lr_override={LR_OVERRIDE}  "
+              f"(BASE_LR={BASE_LR}, MUP_BASE_DIM={MUP_BASE_DIM})")
 
     # Resolve arch + token grid
     arch_list = ARCH_SETS[args.arch_set]
@@ -1460,13 +1508,16 @@ def main():
                         "total_steps": total_steps,
                         "compile": use_compile,
                         "auto_batch_size": args.auto_batch_size,
-                        "lr": base_lr_for(mt),
-                        "lr_source": ("configs/mup_tuned.json"
+                        "lr": (LR_OVERRIDE if LR_OVERRIDE is not None
+                               else base_lr_for(mt)),
+                        "lr_source": ("CLI --peak-lr" if LR_OVERRIDE is not None
+                                      else "configs/mup_tuned.json"
                                       if mt in TUNED_LRS else "BASE_LR fallback"),
                         "run_sft": args.run_sft,
                         "sft_tokens": args.sft_tokens if args.run_sft else None,
                         "eval_suite": args.eval_suite,
                         "mup_base_dim": MUP_BASE_DIM,
+                        "mup_enabled": MUP_ENABLED,
                     }
                     wandb_runs = _init_wandb_runs(mt, [m], tok_label, base_cfg)
                     try:
@@ -1533,13 +1584,16 @@ def main():
                     "total_steps": total_steps,
                     "compile": use_compile,
                     "auto_batch_size": args.auto_batch_size,
-                    "lr": base_lr_for(mt),
-                    "lr_source": ("configs/mup_tuned.json"
+                    "lr": (LR_OVERRIDE if LR_OVERRIDE is not None
+                           else base_lr_for(mt)),
+                    "lr_source": ("CLI --peak-lr" if LR_OVERRIDE is not None
+                                  else "configs/mup_tuned.json"
                                   if mt in TUNED_LRS else "BASE_LR fallback"),
                     "run_sft": args.run_sft,
                     "sft_tokens": args.sft_tokens if args.run_sft else None,
                     "eval_suite": args.eval_suite,
                     "mup_base_dim": MUP_BASE_DIM,
+                    "mup_enabled": MUP_ENABLED,
                     "co_resident": True,
                 }
                 wandb_runs = _init_wandb_runs(mt, models_info, tok_label, base_cfg)

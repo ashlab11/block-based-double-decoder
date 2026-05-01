@@ -38,6 +38,7 @@ Usage:
 
 import sys
 import os
+import math
 import time
 import json
 import argparse
@@ -348,13 +349,21 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
     if grad_ckpt is None:
         grad_ckpt = dim >= 320
 
+    # When --no-mup is set, also drop the model's μP forward-pass multipliers
+    # (readout mult, μP attention scale) so the model trains as a vanilla
+    # transformer at this width. mup_base_dim=0 makes mup=False inside each
+    # model, which sets mup_readout_mult=1.0 and attn_scale=None (SDPA falls
+    # back to the standard 1/√head_dim — identical to the μP-on value, so
+    # only the readout changes).
+    mup_base = MUP_BASE_DIM if MUP_ENABLED else 0
+
     if model_type == "dd":
         model = Double_Decoder(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_encoder_layers=enc, num_decoder_layers=dec,
             seq_len=SEQ_LEN, shared=True, logit_biases=False,
             init_strategy="xavier_uniform", gradient_checkpointing=grad_ckpt,
-            mup_base_dim=MUP_BASE_DIM)
+            mup_base_dim=mup_base)
     elif model_type == "sed":
         # StandardDecoder layers are 16d² (self+cross+MLP) vs DD's 12d².
         # Use fewer decoder layers to match DD/Dec param count at same width:
@@ -365,12 +374,12 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_encoder_layers=enc, num_decoder_layers=sed_dec,
             seq_len=SEQ_LEN, init_strategy="xavier_uniform",
-            gradient_checkpointing=grad_ckpt, mup_base_dim=MUP_BASE_DIM)
+            gradient_checkpointing=grad_ckpt, mup_base_dim=mup_base)
     elif model_type == "dec":
         model = DecoderOnlyModel(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_layers=enc + dec, seq_len=SEQ_LEN,
-            init_strategy="xavier_uniform", mup_base_dim=MUP_BASE_DIM)
+            init_strategy="xavier_uniform", mup_base_dim=mup_base)
 
     model = model.to(device)
     if use_compile:
@@ -572,7 +581,11 @@ def build_sft_optimizer(model, dim, base_lr, model_type=None):
     explicitly from CLI (--sft-lr) rather than read from configs/mup_tuned.json
     since SFT is fine-tuning, not pretraining. Kept in the signature so future
     "tune SFT LR per arch" work can plug in without touching call sites."""
-    mup_mult = MUP_BASE_DIM / dim
+    # Honor --no-mup: when μP is globally disabled, the SFT optimizer also
+    # gives every group raw base_lr (no mup_base_dim/dim multiplier). Keeps
+    # SFT consistent with pretrain so the same flag means the same thing
+    # across phases.
+    mup_mult = (MUP_BASE_DIM / dim) if MUP_ENABLED else 1.0
     embed_params, hidden_decay, no_decay = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -754,7 +767,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             t["micro"] += 1
 
             if t["micro"] % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(t["model"].parameters(), 1.0)
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(
+                    t["model"].parameters(), 1.0)
                 t["opt"].step()
                 t["sched"].step()
                 t["opt"].zero_grad(set_to_none=True)
@@ -767,8 +781,19 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                         cur_lr = t["sched"].get_last_lr()[0]
                     except Exception:
                         cur_lr = None
+                    # clip_grad_norm_ returns the *pre-clip* total norm. Log
+                    # both that and min(., 1.0) (post-clip effective norm) so
+                    # the wandb chart shows when clipping is firing.
+                    gn = (grad_norm_t.item() if torch.is_tensor(grad_norm_t)
+                          else float(grad_norm_t))
+                    # Cap exp() input so an early-warmup loss spike doesn't
+                    # produce inf and corrupt wandb's auto-scaling.
+                    ppl = math.exp(min(avg_loss, 30.0))
                     _wandb_log(wandb_runs, t["display"], {
                         "train/loss": avg_loss,
+                        "train/perplexity": ppl,
+                        "train/grad_norm": gn,
+                        "train/clip_grad_norm": min(gn, 1.0),
                         "train/tokens_seen": t["tokens_seen"],
                         **({"train/lr": cur_lr} if cur_lr is not None else {}),
                     }, step=t["step"])
@@ -893,7 +918,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 "num_decoder_layers": arch["num_decoder_layers"],
                 "num_heads": arch["dim"] // 64,
                 "seq_len": SEQ_LEN,
-                "mup_base_dim": MUP_BASE_DIM,
+                "mup_base_dim": MUP_BASE_DIM if MUP_ENABLED else 0,
                 "mup_enabled": MUP_ENABLED,
                 "lr": actual_base_lr,
                 "lr_source": lr_source,
@@ -1128,10 +1153,14 @@ def main():
                              f"(default {TARGET_EFFECTIVE_BATCH})")
     # Optimizer / μP toggles (pretrain only; SFT path is unaffected)
     parser.add_argument("--no-mup", action="store_true",
-                        help="Disable μP hidden-layer LR scaling. With --no-mup, "
-                             "all optimizer param groups use base LR directly "
-                             "(no mup_base_dim/dim multiplier on hidden weights). "
-                             "Only sensible paired with --peak-lr at a width-"
+                        help="Disable μP entirely. With --no-mup, models are "
+                             "built with mup_base_dim=0 (no readout multiplier, "
+                             "no μP-flavored attention scale — falls back to "
+                             "the standard 1/√head_dim) AND all optimizer param "
+                             "groups use base LR directly (no mup_base_dim/dim "
+                             "multiplier on hidden weights). The model trains "
+                             "as a vanilla transformer at this width. Only "
+                             "sensible paired with --peak-lr at a width-"
                              "appropriate value (e.g. 3e-4 for dim=576). Without "
                              "--peak-lr the base LR stays at BASE_LR=2e-3, which "
                              "will almost certainly diverge for non-tiny dims.")

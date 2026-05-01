@@ -703,7 +703,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                      tokenizer=None,
                      run_sft=False, sft_train_file=None, sft_eval_file=None,
                      sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4,
-                     wandb_runs=None):
+                     wandb_runs=None, save_checkpoints=False):
     """Train all co-resident models for one token budget. After training,
     run held-out PPL eval, then (optionally) the full benchmark suite, and
     write per-run JSONs into output_dir.
@@ -933,6 +933,20 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "train_curve": t["train_curve"],
             "eval_curve": eval_curve,
         }
+
+        # Persist trained weights (opt-in via --save-checkpoints) so chat.py
+        # / inference scripts can reload the same model. Stored alongside the
+        # per-run JSON; payload is state_dict + minimal hparams + vocab_size.
+        if save_checkpoints:
+            ckpt_path = scaling_dir / f"{t['model_type']}_{t['name']}_{tok_label}tok.pt"
+            eager_for_save = getattr(t["model"], "_orig_mod", t["model"])
+            torch.save({
+                "state_dict": eager_for_save.state_dict(),
+                "hparams": run_result["hparams"],
+                "vocab_size": eager_for_save.embedding.weight.shape[0],
+                "model_type": t["model_type"],
+            }, ckpt_path)
+            print(f"      [save] {t['display']} → {ckpt_path}")
 
         # Pre-SFT eval suite (in-process; reuses already-compiled graph; pass
         # the eager module so eval doesn't trigger recompiles for new shapes).
@@ -1220,6 +1234,11 @@ def main():
                              "'single_middle' / 'logspace' for ablation controls.")
     # I/O + misc
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
+    parser.add_argument("--save-checkpoints", action="store_true",
+                        help="After each (arch, tokens, model_type) finishes pretraining, "
+                             "dump model weights to <output-dir>/<model_type>_<arch>_<tokens>tok.pt "
+                             "so chat.py / inference can reload them. Off by default to avoid "
+                             "filling disk during full sweeps.")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan only: print resolved batch sizes and FLOPs/cell")
@@ -1567,7 +1586,8 @@ def main():
                             sft_tokens=args.sft_tokens,
                             sft_lr=args.sft_lr,
                             sft_grad_accum=args.sft_grad_accum,
-                            wandb_runs=wandb_runs)
+                            wandb_runs=wandb_runs,
+                            save_checkpoints=args.save_checkpoints)
                     finally:
                         _finish_wandb_runs(wandb_runs)
                     all_results.setdefault(tok_label, {}).update(results)
@@ -1644,7 +1664,8 @@ def main():
                         sft_tokens=args.sft_tokens,
                         sft_lr=args.sft_lr,
                         sft_grad_accum=args.sft_grad_accum,
-                        wandb_runs=wandb_runs)
+                        wandb_runs=wandb_runs,
+                        save_checkpoints=args.save_checkpoints)
                 finally:
                     _finish_wandb_runs(wandb_runs)
                 all_results.setdefault(tok_label, {}).update(results)

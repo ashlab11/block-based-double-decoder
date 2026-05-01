@@ -88,6 +88,112 @@ ARCHITECTURES = ARCH_SETS["small"]
 TOKEN_BUDGETS = TOKEN_SETS["small"]
 
 SEQ_LEN = 2048
+
+
+# ── Wandb (optional, opt-in via --wandb-project) ────────────────────────────
+# Lazy-imported so the script still runs in environments without wandb installed.
+# All helpers no-op when --wandb-project is not set.
+
+_WANDB_OPTS = {"project": None, "entity": None, "prefix": None,
+               "_module": None, "_imported": False}
+
+
+def _wandb_module():
+    if not _WANDB_OPTS["_imported"]:
+        try:
+            import wandb as _wb
+            _WANDB_OPTS["_module"] = _wb
+        except ImportError:
+            print("[wandb] --wandb-project set but `wandb` not installed; "
+                  "logging disabled. `pip install wandb` to enable.")
+            _WANDB_OPTS["_module"] = None
+        _WANDB_OPTS["_imported"] = True
+    return _WANDB_OPTS["_module"]
+
+
+def _wandb_enabled():
+    return _WANDB_OPTS["project"] is not None and _wandb_module() is not None
+
+
+def _init_wandb_runs(model_type, models_info, tok_label, base_config):
+    """Spin up one wandb run per (arch, model_type) for this token budget.
+    Returns dict keyed by display name `{model_type}_{arch_label}` to match
+    how trainers identify themselves inside train_one_budget."""
+    if not _wandb_enabled():
+        return {}
+    wb = _wandb_module()
+    runs = {}
+    prefix = _WANDB_OPTS["prefix"]
+    for m in models_info:
+        arch_label = m["name"]
+        display = f"{model_type}_{arch_label}"
+        name_parts = [p for p in (prefix, model_type, arch_label,
+                                  f"{tok_label}tok") if p]
+        run_name = "_".join(name_parts)
+        cfg = dict(base_config)
+        cfg.update({
+            "model_type": model_type,
+            "arch_label": arch_label,
+            "tok_label": tok_label,
+            "non_emb_params": m.get("ne"),
+            "dim": m["arch"]["dim"],
+            "num_encoder_layers": m["arch"]["num_encoder_layers"],
+            "num_decoder_layers": m["arch"]["num_decoder_layers"],
+        })
+        try:
+            runs[display] = wb.init(
+                project=_WANDB_OPTS["project"],
+                entity=_WANDB_OPTS["entity"],
+                name=run_name,
+                group=f"{arch_label}_{tok_label}tok",
+                tags=[model_type, arch_label, tok_label],
+                config=cfg,
+                reinit=True,
+            )
+        except Exception as e:
+            print(f"[wandb] init failed for {run_name}: {e}")
+    return runs
+
+
+def _finish_wandb_runs(runs):
+    if not runs:
+        return
+    wb = _wandb_module()
+    if wb is None:
+        return
+    for run in runs.values():
+        try:
+            run.finish()
+        except Exception:
+            pass
+
+
+def _wandb_log(runs, display, metrics, step=None):
+    if not runs or display not in runs:
+        return
+    try:
+        if step is not None:
+            runs[display].log(metrics, step=step)
+        else:
+            runs[display].log(metrics)
+    except Exception as e:
+        print(f"[wandb] log failed for {display}: {e}")
+
+
+def _flatten_evals(evals_dict, prefix):
+    """Flatten nested benchmark eval dict to wandb-loggable scalar metrics.
+    e.g. {'piqa': {'acc': 0.5}} → {'pretrain_evals/piqa/acc': 0.5}"""
+    flat = {}
+    if not isinstance(evals_dict, dict):
+        return flat
+    for eval_name, metrics in evals_dict.items():
+        if isinstance(metrics, dict):
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    flat[f"{prefix}/{eval_name}/{k}"] = v
+        elif isinstance(metrics, (int, float)):
+            flat[f"{prefix}/{eval_name}"] = metrics
+    return flat
 MUP_BASE_DIM = 64
 BASE_LR = 0.002  # fallback default; overridden per-arch from configs/mup_tuned.json
 TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 tok = 1.05M tok/step
@@ -568,7 +674,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                      eval_data_file="data/Pretrain/slimpajama_eval_packed.jsonl",
                      tokenizer=None,
                      run_sft=False, sft_train_file=None, sft_eval_file=None,
-                     sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4):
+                     sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4,
+                     wandb_runs=None):
     """Train all co-resident models for one token budget. After training,
     run held-out PPL eval, then (optionally) the full benchmark suite, and
     write per-run JSONs into output_dir.
@@ -640,6 +747,16 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 t["tokens_seen"] += tokens_per_step
                 avg_loss = t["loss_sum"] / t["loss_n"]
                 t["train_curve"].append((t["step"], t["tokens_seen"], round(avg_loss, 4)))
+                if wandb_runs:
+                    try:
+                        cur_lr = t["sched"].get_last_lr()[0]
+                    except Exception:
+                        cur_lr = None
+                    _wandb_log(wandb_runs, t["display"], {
+                        "train/loss": avg_loss,
+                        "train/tokens_seen": t["tokens_seen"],
+                        **({"train/lr": cur_lr} if cur_lr is not None else {}),
+                    }, step=t["step"])
                 t["loss_sum"] = 0.0
                 t["loss_n"] = 0
 
@@ -656,6 +773,10 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                     eval_loss, _ = eval_model(t["model"], eval_loaders[t["model_type"]],
                                               device, eval_batches, t["needs_blocks"])
                     t["eval_curve"].append((t["step"], t["tokens_seen"], round(eval_loss, 4)))
+                    if wandb_runs:
+                        _wandb_log(wandb_runs, t["display"], {
+                            "eval/loss_mid": eval_loss,
+                        }, step=t["step"])
 
         # Log progress
         if current_step > 0 and current_step % log_interval == 0 and is_step_boundary:
@@ -704,6 +825,11 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         avg_loss, ppl = eval_model(t["model"], eval_loaders[t["model_type"]],
                                    device, eval_batches, t["needs_blocks"])
         print(f"      {t['display']:>12}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
+        if wandb_runs:
+            _wandb_log(wandb_runs, t["display"], {
+                "eval/loss": avg_loss,
+                "eval/ppl": ppl,
+            }, step=t["step"])
 
         arch = t["arch"]
         total_params = sum(p.numel() for p in t["model"].parameters())
@@ -786,6 +912,10 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 )
                 run_result["pretrain_evals"] = bench
                 run_result["pretrain_eval_time_sec"] = round(time.time() - eval_t0, 1)
+                if wandb_runs:
+                    _wandb_log(wandb_runs, t["display"],
+                               _flatten_evals(bench, "pretrain_evals"),
+                               step=t["step"])
             except Exception as e:
                 print(f"      [pretrain-eval] FAILED for {t['display']}: {e}")
                 import traceback
@@ -881,6 +1011,14 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 }
                 print(f"      [sft] done: loss={avg_sft_loss:.3f}  "
                       f"time={sft_train_time:.0f}s  MFU={sft_mfu:.1f}%")
+                if wandb_runs:
+                    _wandb_log(wandb_runs, t["display"], {
+                        "sft/loss": avg_sft_loss,
+                        "sft/training_time_sec": sft_train_time,
+                        "sft/mfu_pct": sft_mfu,
+                        "sft/total_steps": sft_n_steps,
+                        "sft/tokens": run_result["sft_tokens"],
+                    })
             except Exception as e:
                 print(f"      [sft] training FAILED for {t['display']}: {e}")
                 import traceback
@@ -909,6 +1047,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                     )
                     run_result["sft_evals"] = bench_sft
                     run_result["sft_eval_time_sec"] = round(time.time() - eval_t0, 1)
+                    if wandb_runs:
+                        _wandb_log(wandb_runs, t["display"],
+                                   _flatten_evals(bench_sft, "sft_evals"))
                 except Exception as e:
                     print(f"      [sft-eval] FAILED for {t['display']}: {e}")
                     import traceback
@@ -1022,7 +1163,24 @@ def main():
                         default="data/Pretrain/slimpajama_6b_eval_packed.jsonl")
     parser.add_argument("--tokenizer-file", type=str,
                         default="tokenizer/tokenizer_32k.json")
+    # Wandb (optional, opt-in)
+    parser.add_argument("--wandb-project", type=str, default=None,
+                        help="If set, log each (arch, tok_budget, model_type) cell "
+                             "as a wandb run. Default: no wandb.")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="Wandb entity (team/user); uses your wandb default if omitted.")
+    parser.add_argument("--wandb-run-name-prefix", type=str, default=None,
+                        help="Optional prefix for wandb run names "
+                             "(useful for namespacing related sweeps).")
     args = parser.parse_args()
+
+    if args.wandb_project:
+        _WANDB_OPTS["project"] = args.wandb_project
+        _WANDB_OPTS["entity"] = args.wandb_entity
+        _WANDB_OPTS["prefix"] = args.wandb_run_name_prefix
+        if _wandb_module() is None:
+            print("[wandb] disabling wandb (import failed); continuing without it")
+            _WANDB_OPTS["project"] = None
 
     # Pick up per-arch tuned LRs from configs/mup_tuned.json (silent no-op if
     # the file doesn't exist yet — happens until you've run mup_base_sweep).
@@ -1098,6 +1256,12 @@ def main():
     else:
         print(f"SFT: OFF (use --run-sft to enable)")
     print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
+    if _wandb_enabled():
+        print(f"wandb: ON  project={_WANDB_OPTS['project']}  "
+              f"entity={_WANDB_OPTS['entity'] or '<default>'}  "
+              f"prefix={_WANDB_OPTS['prefix'] or '<none>'}")
+    else:
+        print(f"wandb: OFF (use --wandb-project to enable)")
     print(f"Output dir: {args.output_dir}  |  arch tag: {arch_tag}")
     # Surface the two new knobs prominently so users can audit them in logs
     # and so any unexpected default doesn't slip through silently.
@@ -1287,23 +1451,45 @@ def main():
                     print(f"    {mt} × {m['name']} × {tok_label} tokens  |  "
                           f"{total_steps} steps  |  bs={bs} ga={ga}")
                     print(f"  {'='*66}\n")
-                    results = train_one_budget(
-                        [m], tok_label, total_tokens, bs, ga,
-                        arch_loaders, arch_eval_loaders, device, gpu_tflops,
-                        args.eval_batches,
-                        output_dir=args.output_dir,
-                        mid_eval_points=args.mid_eval_points,
-                        run_full_eval=not args.skip_full_eval,
-                        eval_suite=args.eval_suite,
-                        eval_max_examples=args.eval_max_examples,
-                        eval_data_file=args.eval_data_file,
-                        tokenizer=tokenizer,
-                        run_sft=args.run_sft,
-                        sft_train_file=args.sft_train_file,
-                        sft_eval_file=args.sft_eval_file,
-                        sft_tokens=args.sft_tokens,
-                        sft_lr=args.sft_lr,
-                        sft_grad_accum=args.sft_grad_accum)
+                    base_cfg = {
+                        "arch_set": args.arch_set, "token_set": args.token_set,
+                        "boundary_strategy": args.boundary_strategy,
+                        "batch_size": bs, "grad_accum": ga,
+                        "total_tokens": total_tokens,
+                        "tokens_per_step": tok_per_step,
+                        "total_steps": total_steps,
+                        "compile": use_compile,
+                        "auto_batch_size": args.auto_batch_size,
+                        "lr": base_lr_for(mt),
+                        "lr_source": ("configs/mup_tuned.json"
+                                      if mt in TUNED_LRS else "BASE_LR fallback"),
+                        "run_sft": args.run_sft,
+                        "sft_tokens": args.sft_tokens if args.run_sft else None,
+                        "eval_suite": args.eval_suite,
+                        "mup_base_dim": MUP_BASE_DIM,
+                    }
+                    wandb_runs = _init_wandb_runs(mt, [m], tok_label, base_cfg)
+                    try:
+                        results = train_one_budget(
+                            [m], tok_label, total_tokens, bs, ga,
+                            arch_loaders, arch_eval_loaders, device, gpu_tflops,
+                            args.eval_batches,
+                            output_dir=args.output_dir,
+                            mid_eval_points=args.mid_eval_points,
+                            run_full_eval=not args.skip_full_eval,
+                            eval_suite=args.eval_suite,
+                            eval_max_examples=args.eval_max_examples,
+                            eval_data_file=args.eval_data_file,
+                            tokenizer=tokenizer,
+                            run_sft=args.run_sft,
+                            sft_train_file=args.sft_train_file,
+                            sft_eval_file=args.sft_eval_file,
+                            sft_tokens=args.sft_tokens,
+                            sft_lr=args.sft_lr,
+                            sft_grad_accum=args.sft_grad_accum,
+                            wandb_runs=wandb_runs)
+                    finally:
+                        _finish_wandb_runs(wandb_runs)
                     all_results.setdefault(tok_label, {}).update(results)
                     out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
                     with open(out_path, "w") as f:
@@ -1338,23 +1524,46 @@ def main():
                 print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
                       f"{total_micro} micro-batches")
                 print(f"  {'='*66}\n")
-                results = train_one_budget(
-                    models_info, tok_label, total_tokens, bs, ga,
-                    run_loaders, run_eval_loaders, device, gpu_tflops,
-                    args.eval_batches,
-                    output_dir=args.output_dir,
-                    mid_eval_points=args.mid_eval_points,
-                    run_full_eval=not args.skip_full_eval,
-                    eval_suite=args.eval_suite,
-                    eval_max_examples=args.eval_max_examples,
-                    eval_data_file=args.eval_data_file,
-                    tokenizer=tokenizer,
-                    run_sft=args.run_sft,
-                    sft_train_file=args.sft_train_file,
-                    sft_eval_file=args.sft_eval_file,
-                    sft_tokens=args.sft_tokens,
-                    sft_lr=args.sft_lr,
-                    sft_grad_accum=args.sft_grad_accum)
+                base_cfg = {
+                    "arch_set": args.arch_set, "token_set": args.token_set,
+                    "boundary_strategy": args.boundary_strategy,
+                    "batch_size": bs, "grad_accum": ga,
+                    "total_tokens": total_tokens,
+                    "tokens_per_step": tokens_per_step,
+                    "total_steps": total_steps,
+                    "compile": use_compile,
+                    "auto_batch_size": args.auto_batch_size,
+                    "lr": base_lr_for(mt),
+                    "lr_source": ("configs/mup_tuned.json"
+                                  if mt in TUNED_LRS else "BASE_LR fallback"),
+                    "run_sft": args.run_sft,
+                    "sft_tokens": args.sft_tokens if args.run_sft else None,
+                    "eval_suite": args.eval_suite,
+                    "mup_base_dim": MUP_BASE_DIM,
+                    "co_resident": True,
+                }
+                wandb_runs = _init_wandb_runs(mt, models_info, tok_label, base_cfg)
+                try:
+                    results = train_one_budget(
+                        models_info, tok_label, total_tokens, bs, ga,
+                        run_loaders, run_eval_loaders, device, gpu_tflops,
+                        args.eval_batches,
+                        output_dir=args.output_dir,
+                        mid_eval_points=args.mid_eval_points,
+                        run_full_eval=not args.skip_full_eval,
+                        eval_suite=args.eval_suite,
+                        eval_max_examples=args.eval_max_examples,
+                        eval_data_file=args.eval_data_file,
+                        tokenizer=tokenizer,
+                        run_sft=args.run_sft,
+                        sft_train_file=args.sft_train_file,
+                        sft_eval_file=args.sft_eval_file,
+                        sft_tokens=args.sft_tokens,
+                        sft_lr=args.sft_lr,
+                        sft_grad_accum=args.sft_grad_accum,
+                        wandb_runs=wandb_runs)
+                finally:
+                    _finish_wandb_runs(wandb_runs)
                 all_results.setdefault(tok_label, {}).update(results)
                 out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
                 with open(out_path, "w") as f:

@@ -228,10 +228,9 @@ def _probe_one_width(dim, mup_base_dim, device, n_train_steps=0, seed=0):
     probe = AttnProbe()
     try:
         with torch.no_grad():
-            rec["embed_out_enc"] = _rms(
-                model.embedding(batch["input_ids"]) * model.mup_mult
-            )
-            rec["embed_out_dec"] = _rms(model.embedding(batch["input_ids"]))
+            raw_emb = model.embedding(batch["input_ids"])
+            rec["embed_raw"] = _rms(raw_emb)
+            rec["embed_x_mupmult"] = _rms(raw_emb * model.mup_mult)
             with probe:
                 out = model(**batch)
             rec["logits"] = _rms(out["logits"])
@@ -254,7 +253,7 @@ def _probe_one_width(dim, mup_base_dim, device, n_train_steps=0, seed=0):
 
 def _coord_check_table(records, title):
     """Render a width-vs-metric table from per-width records, return ok flag."""
-    metrics_residual = ["embed_out_enc", "embed_out_dec"]
+    metrics_residual = ["embed_raw", "embed_x_mupmult"]
     metrics_residual += [f"enc_{i}" for i in range(4)]
     metrics_residual += [f"dec_{i}" for i in range(2)]
     metrics_residual += ["logits"]
@@ -279,13 +278,21 @@ def _coord_check_table(records, title):
                 verdict = "FAIL"
             elif any(near):
                 verdict = "WARN"
+        elif m == "qk_mean":
+            verdict = "info"
         rows_attn.append((m, vals, verdict))
 
     _print_widthwise(f"{title} — residual stream", rows_resid)
     _print_widthwise(f"{title} — attention stats (uniform entropy = ln({SEQ_LEN}) = {math.log(SEQ_LEN):.3f})",
                      rows_attn)
 
-    ratios_resid = [_ratio([records[d].get(m) for d in WIDTHS]) for m in metrics_residual]
+    # Use only metrics that should genuinely be flat in the network's actual
+    # forward pass. embed_raw is what both encode/decode see; embed_x_mupmult
+    # is informational (only meaningful if you're evaluating an alternative
+    # parametrization that puts mup_mult on the embedding side).
+    flat_metrics = ["embed_raw"] + [f"enc_{i}" for i in range(4)] \
+                   + [f"dec_{i}" for i in range(2)] + ["logits"]
+    ratios_resid = [_ratio([records[d].get(m) for d in WIDTHS]) for m in flat_metrics]
     ratios_resid = [r for r in ratios_resid if not math.isnan(r)]
     qk_ratio = _ratio([records[d].get("qk_std") for d in WIDTHS])
     qk_in_range = all(records[d].get("qk_std") is not None
@@ -357,10 +364,10 @@ def check_3(device):
     expected = [e / expected[0] for e in expected]
     actual = [h / max(hidden_rows[0], 1e-15) for h in hidden_rows]
     rows = [
-        ("embed Δ-RMS",  embed_rows,  None),
-        ("hidden Δ-RMS", hidden_rows, None),
-        ("hidden vs base", actual,    None),
-        ("expected base/dim", expected, None),
+        ("embed Δ-RMS",       embed_rows,  None),
+        ("hidden Δ-RMS",      hidden_rows, "info"),       # SHOULD shrink as base/dim
+        ("hidden vs base",    actual,      "info"),
+        ("expected base/dim", expected,    "info"),
     ]
     _print_widthwise("μP one-step update RMS", rows)
 

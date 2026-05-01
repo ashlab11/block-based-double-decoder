@@ -6,6 +6,7 @@ This serves as the baseline enc-dec model against which the Double Decoder's
 combo attention mechanism is compared.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,6 +38,10 @@ class StandardEncDec(nn.Module):
         self.mup_base_dim = mup_base_dim
         mup = mup_base_dim > 0
         self.mup_mult = mup_base_dim / dim if mup else 1.0
+        # With tied embedding (constant std init), readout grows like √dim from
+        # the dim-wide dot product, not like dim — so the readout multiplier is
+        # √(base/dim), not base/dim. Verified by mup_full_check.py Check 6.
+        self.mup_readout_mult = math.sqrt(self.mup_mult)
 
         # Shared token embeddings
         self.embedding = nn.Embedding(vocab_size, dim)
@@ -78,7 +83,7 @@ class StandardEncDec(nn.Module):
             x = layer(x, encoder_output, block_masks,
                       decoder_input_positions=decoder_input_positions)
         x = self.output_norm(x)
-        logits = self.output_projection(x) * self.mup_mult
+        logits = self.output_projection(x) * self.mup_readout_mult
         return logits
 
     def forward(

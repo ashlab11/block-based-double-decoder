@@ -5,6 +5,7 @@ This module implements a combo-attention and self-attention layer with RoPE.
 
 import torch
 import torch.nn as nn
+import numpy as np
 from torchtune.modules import RotaryPositionalEmbeddings
 from torch.nn.attention.flex_attention import flex_attention
 try:
@@ -21,7 +22,7 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
-        self.attn_scale = 1.0 / self.head_dim if mup else None
+        self.attn_scale = 1.0 / np.sqrt(self.head_dim) if mup else None
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)
@@ -68,7 +69,7 @@ class SelfAttention(nn.Module):
         self.seq_len = seq_len
         self.causal = causal #Causal only affects when block masks are NOT used
         self.gating = gating
-        self.attn_scale = 1.0 / self.head_dim if mup else None
+        self.attn_scale = 1.0 / np.sqrt(self.head_dim) if mup else None
         if self.gating:
             self.gater = nn.Sequential(nn.Linear(dim, dim), nn.Sigmoid()) 
         
@@ -122,7 +123,7 @@ class ComboAttention(nn.Module):
         self.seq_len = seq_len
         self.shared = shared
         self.logit_biases = logit_biases
-        self.attn_scale = 1.0 / self.head_dim if mup else None
+        self.attn_scale = 1.0 / np.sqrt(self.head_dim) if mup else None
         
         if shared:
             self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)

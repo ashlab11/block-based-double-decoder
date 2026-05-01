@@ -64,7 +64,7 @@ class Double_Decoder(nn.Module):
     #Simple causal attention over the encoder
     def encode(self, input_ids):
         # Embed input tokens
-        x = self.embedding(input_ids) * self.mup_mult
+        x = self.embedding(input_ids)
         
         # Apply encoder layers
         for layer in self.encoder_layers:

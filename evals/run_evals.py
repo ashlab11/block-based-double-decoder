@@ -219,7 +219,7 @@ def main():
                         help="Disable torch.compile (use if compile causes issues)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", default=None, help="Save results JSON to this path")
-    parser.add_argument("--eval-file", default="data/Pretrain/slimpajama_eval_packed.jsonl",
+    parser.add_argument("--eval-file", default="data/Pretrain/slimpajama_6b_eval_packed.jsonl",
                         help="Held-out data file for intrinsic evals")
     args = parser.parse_args()
 

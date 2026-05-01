@@ -202,7 +202,9 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_file)
     bos_token_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
-    collator = cfg.collator_cls(bos_token_id=bos_token_id, eos_token_id=eos_token_id, max_seq_len=cfg.seq_len)
+    pad_token_id = tokenizer.convert_tokens_to_ids("<pad>")
+    collator = cfg.collator_cls(bos_token_id=bos_token_id, eos_token_id=eos_token_id,
+                                pad_token_id=pad_token_id, max_seq_len=cfg.seq_len) #pad needed only for standardED
 
     model, hparams = build_model(cfg, tokenizer.vocab_size)
     model = model.to(device)

@@ -21,9 +21,9 @@ def _get_rng(global_seed):
         ss = np.random.SeedSequence([global_seed, rank, wid])
     return np.random.default_rng(ss)
 
-class BasicPretrainCollator:
+class DDPretrainCollator:
     """
-    Data Collator for PrefixLM
+    Data Collator for Double Decoder
     """
     def __init__(
         self,
@@ -33,6 +33,7 @@ class BasicPretrainCollator:
         eos_token_id=2,
         label_pad_token_id=-100,
         global_seed=None,
+        **kwargs
     ):
         self.max_blocks = max_blocks
         #Creates log-spaced blocks to maximally vary lengths
@@ -52,8 +53,7 @@ class BasicPretrainCollator:
           - "encoder_input_ids": padded input sequences
           - "decoder_input_ids": padded input sequences
           - "labels":   padded label sequences
-          - "decoder_attention_mask":  mask for padding tokens in the decoder
-          - "cross_attention_mask":  mask for padding tokens in the cross-attention
+          - "blocks":  listing where to split in the combo attention
         """
         
         # 1) Get inputs and labels
@@ -77,7 +77,6 @@ class BasicPretrainCollator:
             self.rng = _get_rng(self.global_seed)
         
         block_num = self.rng.integers(2, max(3, self.max_blocks))
-        #block_num = self.rng.choice(self.possible_blocks)
         blocks = self.rng.choice(np.arange(2, self.max_seq_len - 1), size=block_num, replace=False)
         blocks = torch.sort(torch.tensor(blocks))[0]
         

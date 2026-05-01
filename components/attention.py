@@ -59,13 +59,14 @@ class CrossAttention(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, seq_len = 1024, gating = False, mup = False):
+    def __init__(self, dim, num_heads, seq_len = 1024, gating = False, mup = False, causal=True):
         super(SelfAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
         self.seq_len = seq_len
+        self.causal = causal #Causal only affects when block masks are NOT used
         self.gating = gating
         self.attn_scale = 1.0 / self.head_dim if mup else None
         if self.gating:
@@ -99,7 +100,7 @@ class SelfAttention(nn.Module):
         if self_mask is None:
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value,
-                is_causal=True, scale=self.attn_scale)
+                is_causal=self.causal, scale=self.attn_scale)
         else:
            output = flex_attention(query, key, value, block_mask=self_mask, scale=self.attn_scale)
         

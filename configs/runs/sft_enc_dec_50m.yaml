@@ -1,6 +1,6 @@
 # SFT: Standard Enc-Dec 50M on UltraChat
 model_cls: "StandardEncDec"
-collator_cls: "BasicSFTCollator"
+collator_cls: "EDSFTCollator"
 
 dim: 512
 num_encoder_layers: 8

@@ -54,7 +54,7 @@ gradient_checkpointing: {grad_ckpt}
 use_compile: false
 mup_base_dim: {mup_base_dim}
 
-collator_cls: "BasicPretrainCollator"
+collator_cls: "DDPretrainCollator"
 train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
 eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
 tokenizer_file: "tokenizer/tokenizer_32k.json"

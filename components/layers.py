@@ -7,16 +7,18 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from .attention import SelfAttention, ComboAttention, CrossAttention
 
-class CausalLayer(nn.Module):
-    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, scale = 1, attn_gating = False, use_checkpoint = False, mup = False):
-        super(CausalLayer, self).__init__()
+class BasicLayer(nn.Module):
+    def __init__(self, dim, num_heads, seq_len, mlp_dim=None, scale = 1, attn_gating = False, use_checkpoint = False, mup = False, 
+                 causal = True):
+        super(BasicLayer, self).__init__()
         self.dim = dim
         self.scale = scale
         self.use_checkpoint = use_checkpoint
         mlp_dim = mlp_dim or 4 * dim
 
         # Self-attention block
-        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, gating=attn_gating, mup=mup)
+        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, gating=attn_gating, mup=mup, 
+                                       causal=causal)
         self.norm1 = nn.RMSNorm(dim)
 
         # MLP block
@@ -26,11 +28,11 @@ class CausalLayer(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_dim, dim, bias=False))
 
-    def _forward(self, x):
+    def _forward(self, x, block_masks=None):
         # Self-attention with residual
         residual = x
         x = self.norm1(x)  # Pre-norm architecture
-        x = self.self_attn(x)
+        x = self.self_attn(x, block_masks)
         x = residual + self.scale * x
 
         # MLP with residual
@@ -41,10 +43,10 @@ class CausalLayer(nn.Module):
 
         return x
 
-    def forward(self, x):
+    def forward(self, x, block_masks=None):
         if self.use_checkpoint and self.training:
-            return grad_checkpoint(self._forward, x, use_reentrant=False)
-        return self._forward(x)
+            return grad_checkpoint(self._forward, x, block_masks, use_reentrant=False)
+        return self._forward(x, block_masks)
 
 class StandardDecoderLayer(nn.Module):
     """Standard transformer decoder layer: self-attn → cross-attn → MLP (sequential)."""
@@ -53,7 +55,7 @@ class StandardDecoderLayer(nn.Module):
         self.use_checkpoint = use_checkpoint
         mlp_dim = mlp_dim or 4 * dim
 
-        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, mup=mup)
+        self.self_attn = SelfAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, mup=mup, causal=True)
         self.cross_attn = CrossAttention(dim=dim, num_heads=num_heads, seq_len=seq_len, mup=mup)
 
         self.norm1 = nn.RMSNorm(dim)
@@ -66,10 +68,10 @@ class StandardDecoderLayer(nn.Module):
             nn.Linear(mlp_dim, dim, bias=False))
 
     def _forward(self, x, encoder_output, block_masks, decoder_input_positions=None):
-        # Self-attention (within-block causal)
+        #Causal for decoder
         residual = x
         x = self.norm1(x)
-        x = self.self_attn(x, block_masks=block_masks, input_pos=decoder_input_positions)
+        x = self.self_attn(x, input_pos=decoder_input_positions)
         x = residual + x
 
         # Cross-attention (to encoder output)

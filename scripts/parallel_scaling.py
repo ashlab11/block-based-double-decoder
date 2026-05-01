@@ -59,9 +59,12 @@ from transformers import PreTrainedTokenizerFast
 from models.double_decoder import Double_Decoder
 from models.standard_enc_dec import StandardEncDec
 from models.decoder import DecoderOnlyModel
-from collators.double_decoder.pretrain import BasicPretrainCollator
-from collators.double_decoder.sft import BasicSFTCollator
+from collators.double_decoder.pretrain import DDPretrainCollator
+from collators.double_decoder.sft import DDSFTCollator
+from collators.encoder_decoder.pretrain import EDPretrainCollator
+from collators.encoder_decoder.sft import EDSFTCollator
 from collators.decoder.sft import DecoderSFTCollator
+from collators.decoder.pretrain import DecoderPretrainCollator
 from components.initialization import initialize_model
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -186,11 +189,16 @@ def _reset_compile_caches():
 
 
 def install_fast_masks():
-    """Monkey-patch create_masks with a cached version for DD and StandardEncDec."""
+    """Monkey-patch DD's create_masks with a cached version.
+
+    Post-Asher-merge, StandardEncDec calls create_masks_ED directly with a
+    different `blocks` semantic (per-batch encoder length, not per-sequence
+    split positions), so the shared cache doesn't apply to SED. SED gets its
+    masks rebuilt per batch — the variable-length encoder padding makes
+    caching across batches mostly useless anyway.
+    """
     import models.double_decoder as dd
-    import models.standard_enc_dec as sed
     dd.create_masks = _cached_create_masks
-    sed.create_masks = _cached_create_masks
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -288,11 +296,22 @@ def build_scheduler(optimizer, total_steps):
 
 # ── Auto-tune batch size ────────────────────────────────────────────────────
 
-def _probe_step(model, batch_size, vocab_size, seq_len, device, needs_blocks):
+def _probe_step(model, batch_size, vocab_size, seq_len, device, needs_blocks,
+                model_type="dd"):
     """Run one forward+backward+sync at the given batch size. Raises OOM
-    or returns successfully — caller catches OOM and shrinks."""
+    or returns successfully — caller catches OOM and shrinks.
+
+    `blocks` shape depends on model type post-Asher-merge: DD wants a 1D
+    array of split positions; SED's create_masks_ED wants per-batch encoder
+    lengths of shape [batch_size]. We use a [batch_size] tensor of full-length
+    values, which DD handles fine (bucketizes to one big block) and SED reads
+    as "no padding".
+    """
     dummy_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-    dummy_blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:4] + 1)[0]
+    if model_type == "sed":
+        dummy_blocks = torch.full((batch_size,), seq_len, device=device, dtype=torch.long)
+    else:
+        dummy_blocks = torch.sort(torch.randperm(seq_len - 2, device=device)[:4] + 1)[0]
     batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
              "blocks": dummy_blocks, "sft": False}
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -305,7 +324,7 @@ def _probe_step(model, batch_size, vocab_size, seq_len, device, needs_blocks):
 
 
 def auto_tune_batch_size(model, vocab_size, seq_len, device, needs_blocks,
-                         max_bs=128, candidates=None):
+                         max_bs=128, candidates=None, model_type="dd"):
     """Probe descending batch sizes; return largest that fits, with one
     safety step below as headroom for activation spikes mid-training."""
     if candidates is None:
@@ -314,7 +333,8 @@ def auto_tune_batch_size(model, vocab_size, seq_len, device, needs_blocks,
     largest_ok = None
     for bs in candidates:
         try:
-            _probe_step(model, bs, vocab_size, seq_len, device, needs_blocks)
+            _probe_step(model, bs, vocab_size, seq_len, device, needs_blocks,
+                        model_type=model_type)
             largest_ok = bs
             torch.cuda.empty_cache()
             break
@@ -372,15 +392,40 @@ def eval_model(model, eval_loader, device, max_batches, needs_blocks):
 
 def build_sft_collator(model_type, tokenizer, seq_len):
     """Pick the right SFT collator for the model type.
-    DD/SED use BasicSFTCollator (encoder + decoder split with cross-attn block_masks).
+    DD uses DDSFTCollator (encoder + decoder split with cross-attn block_masks).
+    SED uses EDSFTCollator (T5-style enc/dec split with per-batch encoder lengths).
     DecoderOnly uses DecoderSFTCollator (single sequence with masked-context labels).
     """
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
     pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
-    cls = DecoderSFTCollator if model_type == "dec" else BasicSFTCollator
+    cls = {"dec": DecoderSFTCollator, "sed": EDSFTCollator, "dd": DDSFTCollator}[model_type]
     return cls(bos_token_id=bos_id, eos_token_id=eos_id,
                pad_token_id=pad_id, max_seq_len=seq_len)
+
+
+def build_pretrain_collator(model_type, bos_id, eos_id, pad_id, seq_len, global_seed=None):
+    """Pick the right pretrain collator for the model type.
+    DD uses DDPretrainCollator (block-decomposed prefix-LM).
+    SED uses EDPretrainCollator (T5-style span corruption).
+    DecoderOnly uses DecoderPretrainCollator (single causal stream).
+    """
+    if model_type == "dd":
+        return DDPretrainCollator(
+            bos_token_id=bos_id, eos_token_id=eos_id, max_seq_len=seq_len,
+            global_seed=global_seed)
+    if model_type == "sed":
+        # sentinel_start_id=6 matches the post-merge tokenizer where the
+        # first 6 special tokens occupy ids 0..5 and <sentinel_0..14> sit at 6..20.
+        return EDPretrainCollator(
+            max_seq_len=seq_len, pad_token_id=pad_id,
+            bos_token_id=bos_id, eos_token_id=eos_id,
+            sentinel_start_id=6, num_sentinel_tokens=15,
+            global_seed=global_seed)
+    if model_type == "dec":
+        return DecoderPretrainCollator(
+            bos_token_id=bos_id, eos_token_id=eos_id, max_seq_len=seq_len)
+    raise ValueError(f"Unknown model_type: {model_type}")
 
 
 def build_sft_optimizer(model, dim, base_lr):
@@ -484,7 +529,7 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
 # ── Training one token budget ───────────────────────────────────────────────
 
 def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accum,
-                     train_loader, eval_loader, device, gpu_tflops, eval_batches,
+                     train_loaders, eval_loaders, device, gpu_tflops, eval_batches,
                      output_dir, mid_eval_points=0,
                      run_full_eval=True, eval_suite="paper", eval_max_examples=500,
                      eval_data_file="data/Pretrain/slimpajama_eval_packed.jsonl",
@@ -529,18 +574,22 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
     for t in trainers:
         t["model"].train()
         t["opt"].zero_grad(set_to_none=True)
+        # Per-model-type iterator: each trainer's collator produces a different
+        # batch shape (DD blocks vs SED T5-corruption vs DEC single-stream).
+        t["_train_iter"] = iter(train_loaders[t["model_type"]])
 
     t0 = time.time()
 
-    for batch_idx, raw_batch in enumerate(train_loader):
-        if batch_idx >= total_micro:
-            break
-
-        batch = {k: v.to(device, non_blocking=True)
-                 if isinstance(v, torch.Tensor) else v
-                 for k, v in raw_batch.items()}
-
+    for batch_idx in range(total_micro):
         for t in trainers:
+            try:
+                raw_batch = next(t["_train_iter"])
+            except StopIteration:
+                t["_train_iter"] = iter(train_loaders[t["model_type"]])
+                raw_batch = next(t["_train_iter"])
+            batch = {k: v.to(device, non_blocking=True)
+                     if isinstance(v, torch.Tensor) else v
+                     for k, v in raw_batch.items()}
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = model_forward(t["model"], batch, t["needs_blocks"])
                 loss = out["loss"]
@@ -571,8 +620,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             eval_interval = max(1, total_steps // mid_eval_points)
             if current_step > 0 and is_step_boundary and current_step % eval_interval == 0:
                 for t in trainers:
-                    eval_loss, _ = eval_model(t["model"], eval_loader, device,
-                                              eval_batches, t["needs_blocks"])
+                    eval_loss, _ = eval_model(t["model"], eval_loaders[t["model_type"]],
+                                              device, eval_batches, t["needs_blocks"])
                     t["eval_curve"].append((t["step"], t["tokens_seen"], round(eval_loss, 4)))
 
         # Log progress
@@ -608,8 +657,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
 
     results = {}
     for t in trainers:
-        avg_loss, ppl = eval_model(t["model"], eval_loader, device,
-                                   eval_batches, t["needs_blocks"])
+        avg_loss, ppl = eval_model(t["model"], eval_loaders[t["model_type"]],
+                                   device, eval_batches, t["needs_blocks"])
         print(f"      {t['display']:>12}: eval_loss={avg_loss:.4f}  ppl={ppl:.1f}")
 
         arch = t["arch"]
@@ -985,10 +1034,16 @@ def main():
     print(f"Tokenizer: vocab_size={vocab_size}")
 
     print("Loading data...")
-    # BasicPretrainCollator produces blocks — works for all model types.
-    # DecoderOnly models just ignore blocks in their forward().
-    collator = BasicPretrainCollator(
-        bos_token_id=bos_token_id, eos_token_id=eos_token_id, max_seq_len=SEQ_LEN)
+    pad_token_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+    # Per-model-type collators: DD does block-decomposed prefix-LM, SED does
+    # T5-style span corruption, DEC does single-stream causal. Each gets its
+    # own DataLoader so batch shapes don't have to match.
+    collators = {
+        mt: build_pretrain_collator(mt, bos_token_id, eos_token_id,
+                                    pad_token_id, SEQ_LEN,
+                                    global_seed=42 + i)
+        for i, mt in enumerate(MODEL_TYPES)
+    }
 
     train_ds = load_dataset(
         "json", data_files=str(PROJECT_ROOT / args.train_file),
@@ -997,10 +1052,16 @@ def main():
         "json", data_files=str(PROJECT_ROOT / args.eval_file),
         split="train")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              collate_fn=collator, drop_last=True)
-    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
-                             collate_fn=collator, drop_last=True)
+    train_loaders = {
+        mt: DataLoader(train_ds, batch_size=args.batch_size,
+                       collate_fn=collators[mt], drop_last=True)
+        for mt in MODEL_TYPES
+    }
+    eval_loaders = {
+        mt: DataLoader(eval_ds, batch_size=args.batch_size,
+                       collate_fn=collators[mt], drop_last=True)
+        for mt in MODEL_TYPES
+    }
 
     # ── Dry-run: plan-only summary ─────────────────────────────────────────
     if args.dry_run:
@@ -1061,10 +1122,14 @@ def main():
             print(f"  Compiling...")
             compile_t0 = time.time()
             dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
-            dummy_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
-            dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
-                           "blocks": dummy_blocks, "sft": False}
+            # SED's create_masks_ED indexes blocks per-batch, so it needs
+            # blocks shape [batch_size]; DD wants split positions (1D).
+            dd_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
+            sed_blocks = torch.full((args.batch_size,), SEQ_LEN, device=device, dtype=torch.long)
             for m in models_info:
+                blocks = sed_blocks if m["model_type"] == "sed" else dd_blocks
+                dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
+                               "blocks": blocks, "sft": False}
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     out = model_forward(m["model"], dummy_batch, m["needs_blocks"])
                 out["loss"].backward()
@@ -1083,7 +1148,8 @@ def main():
             for m in models_info:
                 bs = auto_tune_batch_size(
                     m["model"], vocab_size, SEQ_LEN, device,
-                    m["needs_blocks"], max_bs=args.max_batch_size)
+                    m["needs_blocks"], max_bs=args.max_batch_size,
+                    model_type=m["model_type"])
                 # Same arch+model_type may appear multiple times across model
                 # types in outer loop; we want the min across all 3 types,
                 # but inside this `for mt` we only see one. Track per (arch).
@@ -1107,10 +1173,18 @@ def main():
             for m in models_info:
                 bs = per_arch_bs[m["name"]]
                 ga = grad_accum_for(bs, args.target_effective_batch)
-                arch_loader = DataLoader(train_ds, batch_size=bs,
-                                         collate_fn=collator, drop_last=True)
-                arch_eval_loader = DataLoader(eval_ds, batch_size=bs,
-                                              collate_fn=collator, drop_last=True)
+                # Only this model_type's loader is needed (single-trainer path),
+                # but train_one_budget expects the full dict, so build it.
+                arch_loaders = {
+                    mt_: DataLoader(train_ds, batch_size=bs,
+                                    collate_fn=collators[mt_], drop_last=True)
+                    for mt_ in MODEL_TYPES
+                }
+                arch_eval_loaders = {
+                    mt_: DataLoader(eval_ds, batch_size=bs,
+                                    collate_fn=collators[mt_], drop_last=True)
+                    for mt_ in MODEL_TYPES
+                }
                 for tok_label, total_tokens in budgets:
                     tok_per_step = bs * ga * SEQ_LEN
                     total_steps = max(1, total_tokens // tok_per_step)
@@ -1120,7 +1194,7 @@ def main():
                     print(f"  {'='*66}\n")
                     results = train_one_budget(
                         [m], tok_label, total_tokens, bs, ga,
-                        arch_loader, arch_eval_loader, device, gpu_tflops,
+                        arch_loaders, arch_eval_loaders, device, gpu_tflops,
                         args.eval_batches,
                         output_dir=args.output_dir,
                         mid_eval_points=args.mid_eval_points,
@@ -1148,12 +1222,20 @@ def main():
             tokens_per_step = bs * ga * SEQ_LEN
             print(f"\n  Co-resident batch: bs={bs} ga={ga}  "
                   f"{tokens_per_step:,} tok/step")
-            run_loader = (DataLoader(train_ds, batch_size=bs,
-                                     collate_fn=collator, drop_last=True)
-                          if args.auto_batch_size else train_loader)
-            run_eval_loader = (DataLoader(eval_ds, batch_size=bs,
-                                          collate_fn=collator, drop_last=True)
-                               if args.auto_batch_size else eval_loader)
+            if args.auto_batch_size:
+                run_loaders = {
+                    mt_: DataLoader(train_ds, batch_size=bs,
+                                    collate_fn=collators[mt_], drop_last=True)
+                    for mt_ in MODEL_TYPES
+                }
+                run_eval_loaders = {
+                    mt_: DataLoader(eval_ds, batch_size=bs,
+                                    collate_fn=collators[mt_], drop_last=True)
+                    for mt_ in MODEL_TYPES
+                }
+            else:
+                run_loaders = train_loaders
+                run_eval_loaders = eval_loaders
             for tok_label, total_tokens in budgets:
                 total_steps = max(1, total_tokens // tokens_per_step)
                 total_micro = total_steps * ga
@@ -1163,7 +1245,7 @@ def main():
                 print(f"  {'='*66}\n")
                 results = train_one_budget(
                     models_info, tok_label, total_tokens, bs, ga,
-                    run_loader, run_eval_loader, device, gpu_tflops,
+                    run_loaders, run_eval_loaders, device, gpu_tflops,
                     args.eval_batches,
                     output_dir=args.output_dir,
                     mid_eval_points=args.mid_eval_points,

@@ -15,7 +15,7 @@ def create_tokenizer(vocab_size=8192, corpus_file="data/Pretrain/slimpajama.json
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
 
     special_tokens = ["<unk>", "<s>", "</s>",
-        "<user>", "<assistant>", "<pad>"
+        "<user>", "<assistant>", "<pad>", *[f"<sentinel_{i}>" for i in range(15)]
     ]
 
     # 4) Trainer

@@ -13,7 +13,7 @@ init_strategy: "xavier_uniform"
 gradient_checkpointing: true
 use_compile: false
 
-collator_cls: "BasicPretrainCollator"
+collator_cls: "DDPretrainCollator"
 train_file: "data/Pretrain/slimpajama_6b_packed.jsonl"
 eval_file: "data/Pretrain/slimpajama_6b_eval_packed.jsonl"
 tokenizer_file: "tokenizer/tokenizer_32k.json"

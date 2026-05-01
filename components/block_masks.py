@@ -95,3 +95,25 @@ def create_masks(batch_size, blocks, device, input_ids, encoder_input_ids, decod
         return create_sft_masks(batch_size, blocks, device, encoder_input_ids.shape[1], decoder_input_ids.shape[1])
     else:
         return create_pretrain_masks(blocks, input_ids.shape[1], device)
+
+
+#---- BLOCKS FOR ED (T5-style) ----
+# blocks[b] is a per-batch encoder length, NOT the per-sequence split positions
+# used by create_pretrain_masks. The mask only needs to gate out padded encoder
+# positions on both encoder-self and decoder-cross paths.
+@torch.compiler.disable()
+def create_masks_ED(batch_size, blocks, device, encoder_input_ids, decoder_input_ids):
+    enc_lens = blocks  # captured by closure below
+
+    def mask(b, h, q_idx, kv_idx):
+        return kv_idx < enc_lens[b]
+
+    enc_mask_block = create_block_mask(mask,
+        B=batch_size, H=None, Q_LEN=encoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device, _compile=True
+    )
+    cross_mask_block = create_block_mask(mask,
+        B=batch_size, H=None, Q_LEN=decoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device, _compile=True
+    )
+    # Returns a tuple of two single-key dicts to match StandardEncDec.forward's
+    # `causal_mask, cross_mask = create_masks_ED(...)` unpacking.
+    return {"self_mask": enc_mask_block}, {"cross_mask": cross_mask_block}

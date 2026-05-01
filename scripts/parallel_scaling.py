@@ -492,6 +492,26 @@ def grad_accum_for(batch_size, target_effective):
     return max(1, target_effective // max(1, batch_size))
 
 
+def target_effective_batch_for(non_emb_params):
+    """Auto-scale effective batch (in sequences) with model size.
+
+    Critical batch grows with model capacity (McCandlish et al. 2018).
+    A fixed 512 across the whole sweep is sized for the 300M end and
+    starves small models of optimizer steps: at 5M params, 500M tokens
+    with effective_batch=512 gives only ~477 steps (24 of warmup), and
+    end loss floors well above where the model could actually reach.
+
+    Power-law fit B(N) = 96 · (N / 5M)^0.4 anchored at user-validated
+    points (5M → 96 seqs, 300M → 512 seqs). Interpolates to:
+      25M → 192,  50M → 256,  150M → 384.
+    Rounded up to a multiple of 32 (FP / SDPA tile-friendly), clamped
+    to [32, 1024].
+    """
+    raw = 96.0 * (max(1, non_emb_params) / 5e6) ** 0.4
+    raw = max(32.0, min(1024.0, raw))
+    return int(math.ceil(raw / 32) * 32)
+
+
 def model_forward(model, batch, needs_blocks):
     """Dispatch forward based on model type."""
     if needs_blocks:
@@ -1162,9 +1182,13 @@ def main():
                         help="Probe largest fitting batch size per (arch, gpu) "
                              "and derive grad_accum from --target-effective-batch")
     parser.add_argument("--target-effective-batch", type=int,
-                        default=TARGET_EFFECTIVE_BATCH,
-                        help=f"Effective batch (seqs) for grad_accum derivation "
-                             f"(default {TARGET_EFFECTIVE_BATCH})")
+                        default=None,
+                        help=f"Effective batch (seqs) for grad_accum derivation. "
+                             f"Default: AUTO — scales with model size via "
+                             f"target_effective_batch_for(non_emb_params), "
+                             f"giving 96 seqs for 5M up to 512 for 300M. "
+                             f"Pass an int to override (legacy fixed-batch "
+                             f"behaviour was {TARGET_EFFECTIVE_BATCH}).")
     # Optimizer / μP toggles (pretrain only; SFT path is unaffected)
     parser.add_argument("--no-mup", action="store_true",
                         help="Disable μP entirely. With --no-mup, models are "
@@ -1335,7 +1359,8 @@ def main():
     print(f"Token set: {args.token_set}  budgets: {[l for l,_ in budgets]}")
     print(f"Model types: {model_types}")
     print(f"Auto batch size: {'ON' if args.auto_batch_size else 'OFF'}  "
-          f"target effective batch: {args.target_effective_batch}")
+          f"target effective batch: "
+          f"{args.target_effective_batch if args.target_effective_batch is not None else 'AUTO (per-arch from non_emb_params)'}")
     print(f"Mid-training eval points: {args.mid_eval_points}  |  "
           f"Full eval suite: {'OFF' if args.skip_full_eval else args.eval_suite}")
     if args.run_sft:
@@ -1510,10 +1535,20 @@ def main():
                 # but inside this `for mt` we only see one. Track per (arch).
                 prior = per_arch_bs.get(m["name"])
                 per_arch_bs[m["name"]] = bs if prior is None else min(prior, bs)
+            # Per-arch effective batch: explicit CLI value wins; otherwise
+            # auto-scale from each model's non-emb param count so small
+            # models don't get starved of optimizer steps by the 300M-sized
+            # default. Build a {arch_name: ne} lookup from models_info.
+            arch_ne = {m["name"]: m["ne"] for m in models_info}
             for name, bs in per_arch_bs.items():
-                ga = grad_accum_for(bs, args.target_effective_batch)
+                tgt = (args.target_effective_batch
+                       if args.target_effective_batch is not None
+                       else target_effective_batch_for(arch_ne[name]))
+                ga = grad_accum_for(bs, tgt)
+                src = "CLI" if args.target_effective_batch is not None else "auto"
                 print(f"    {name:>6}: batch_size={bs:>3}  grad_accum={ga:>3}  "
-                      f"effective={bs*ga} seqs = {bs*ga*SEQ_LEN:,} tok/step")
+                      f"effective={bs*ga} seqs = {bs*ga*SEQ_LEN:,} tok/step  "
+                      f"(target={tgt} {src})")
         else:
             for name, _ in arch_list:
                 per_arch_bs[name] = args.batch_size
@@ -1527,7 +1562,10 @@ def main():
             # Per-arch loop: re-create dataloader at each arch's batch size.
             for m in models_info:
                 bs = per_arch_bs[m["name"]]
-                ga = grad_accum_for(bs, args.target_effective_batch)
+                tgt = (args.target_effective_batch
+                       if args.target_effective_batch is not None
+                       else target_effective_batch_for(m["ne"]))
+                ga = grad_accum_for(bs, tgt)
                 # Only this model_type's loader is needed (single-trainer path),
                 # but train_one_budget expects the full dict, so build it.
                 arch_loaders = {
@@ -1598,8 +1636,19 @@ def main():
             # All archs share one batch size — co-resident path (faster).
             # Use the min so the smallest-tolerated arch sets the shape.
             bs = min(per_arch_bs.values()) if per_arch_bs else args.batch_size
-            ga = (grad_accum_for(bs, args.target_effective_batch)
-                  if args.auto_batch_size else args.grad_accum)
+            # Co-resident: one effective batch for the whole group. Pick the
+            # max of per-arch auto targets so the largest model still gets a
+            # reasonable batch (smaller models tolerate larger batches and
+            # just lose a bit of step granularity). Override wins as before.
+            if args.auto_batch_size:
+                if args.target_effective_batch is not None:
+                    tgt = args.target_effective_batch
+                else:
+                    tgt = max(target_effective_batch_for(m["ne"])
+                              for m in models_info)
+                ga = grad_accum_for(bs, tgt)
+            else:
+                ga = args.grad_accum
             tokens_per_step = bs * ga * SEQ_LEN
             print(f"\n  Co-resident batch: bs={bs} ga={ga}  "
                   f"{tokens_per_step:,} tok/step")

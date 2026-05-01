@@ -317,6 +317,20 @@ def install_fast_masks():
     import models.double_decoder as dd
     dd.create_masks = _cached_create_masks
 
+    # Workaround: FxGraphCache.prepare_key hashes every graph input ≤8 elems
+    # via .tolist(), which errors on tensors with unallocated storage. DD's
+    # FlexAttention BlockMask carries optional fields (full_kv_num_blocks etc.)
+    # that PyTorch builds lazily — they reach the cache hasher unmaterialized
+    # and crash with "tolist() shouldn't be called on a tensor with unallocated
+    # storage". DEC's graph doesn't include BlockMask inputs so it isn't hit.
+    # Disabling fx_graph_cache skips only the cross-process graph hash; in-
+    # process Dynamo caching still works and runtime is unaffected (~30s extra
+    # on each first-compile of a new shape).
+    import torch._inductor.config as _ic
+    _ic.fx_graph_cache = False
+    if hasattr(_ic, "fx_graph_remote_cache"):
+        _ic.fx_graph_remote_cache = False
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 

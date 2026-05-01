@@ -30,6 +30,40 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.decoder import DecoderOnlyModel  # noqa: E402
 
+TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
+# Search order: canonical 32K first, then legacy 8K. Auto-pick still verifies
+# vocab matches the checkpoint, so order is just a tiebreaker.
+TOKENIZER_CANDIDATES = [
+    TOKENIZER_DIR / "tokenizer_32k.json",
+    TOKENIZER_DIR / "tokenizer.json",
+]
+
+
+def pick_tokenizer(explicit: Path | None, model_vocab: int) -> Path:
+    """Resolve which tokenizer file to load. If --tokenizer was passed, honor it
+    (and validate vocab below). Otherwise scan known locations and pick the one
+    whose vocab exactly matches the model — this turns the old silent garbage-
+    output bug into a hard, obvious error."""
+    if explicit is not None:
+        return explicit
+    found = [p for p in TOKENIZER_CANDIDATES if p.exists()]
+    if not found:
+        raise FileNotFoundError(
+            f"No tokenizer found. Looked for: {[str(p) for p in TOKENIZER_CANDIDATES]}. "
+            f"Run scripts/2_data.sh or pass --tokenizer."
+        )
+    for p in found:
+        tk = PreTrainedTokenizerFast(tokenizer_file=str(p))
+        if tk.vocab_size == model_vocab:
+            return p
+    raise RuntimeError(
+        f"Model expects vocab={model_vocab} but no tokenizer in {TOKENIZER_DIR} "
+        f"matches. Available: "
+        + ", ".join(f"{p.name}(vocab={PreTrainedTokenizerFast(tokenizer_file=str(p)).vocab_size})"
+                    for p in found)
+        + ". Pass --tokenizer to point at the correct file."
+    )
+
 
 def load_model(ckpt_path: Path, device: torch.device):
     """Reconstruct DecoderOnlyModel from a parallel_scaling.py or pretrain.py
@@ -111,8 +145,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True, type=Path,
                     help="Trained .pt (e.g. checkpoints/parallel_scaling/dec_5M_500Mtok.pt)")
-    ap.add_argument("--tokenizer", default=PROJECT_ROOT / "tokenizer" / "tokenizer.json",
-                    type=Path)
+    ap.add_argument("--tokenizer", default=None, type=Path,
+                    help="Tokenizer JSON. If omitted, auto-pick one in tokenizer/ "
+                         "whose vocab matches the checkpoint.")
     ap.add_argument("--max-new", type=int, default=128,
                     help="Max new tokens to generate per turn.")
     ap.add_argument("--temperature", type=float, default=0.8)
@@ -132,12 +167,18 @@ def main():
     model, hparams, vocab_size = load_model(args.ckpt, device)
     seq_len = args.max_context or hparams.get("seq_len", 2048)
 
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(args.tokenizer))
+    tokenizer_path = pick_tokenizer(args.tokenizer, vocab_size)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_path))
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
     if tokenizer.vocab_size != vocab_size:
-        print(f"[warn] tokenizer vocab={tokenizer.vocab_size} but model "
-              f"vocab={vocab_size} — make sure --tokenizer matches the run.")
+        # User passed --tokenizer explicitly; respect it but refuse to produce
+        # garbage. This used to be a silent warning.
+        raise SystemExit(
+            f"[fatal] tokenizer vocab={tokenizer.vocab_size} but model "
+            f"vocab={vocab_size}. Mismatch produces garbage output."
+        )
+    print(f"  Tokenizer: {tokenizer_path.name} (vocab={tokenizer.vocab_size})")
 
     n_layers = (hparams.get("num_layers")
                 or hparams.get("num_encoder_layers", 0)

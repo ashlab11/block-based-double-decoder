@@ -149,7 +149,7 @@ def build_packed_dataset(in_path, out_path, tokenizer, ctx_len):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer", type=str, default="tokenizer/tokenizer.json")
+    parser.add_argument("--tokenizer", type=str, default="tokenizer/tokenizer_32k.json")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--input", type=str, default="data/Pretrain/slimpajama.jsonl")
     parser.add_argument("--output", type=str, default="data/Pretrain/slimpajama_packed.jsonl")

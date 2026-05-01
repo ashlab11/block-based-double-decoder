@@ -4,7 +4,7 @@ import os
 import argparse
 
 
-def create_tokenizer(vocab_size=8192, corpus_file="data/Pretrain/slimpajama.jsonl", output_file="tokenizer/tokenizer.json"):
+def create_tokenizer(vocab_size=32768, corpus_file="data/Pretrain/slimpajama.jsonl", output_file="tokenizer/tokenizer_32k.json"):
     # 1) Initialize a BPE tokenizer with an unk token
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
 
@@ -48,9 +48,9 @@ def test_tokenizer(tokenizer):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--vocab-size", type=int, default=8192)
+    parser.add_argument("--vocab-size", type=int, default=32768)
     parser.add_argument("--corpus", type=str, default="data/Pretrain/slimpajama.jsonl")
-    parser.add_argument("--output", type=str, default="tokenizer/tokenizer.json")
+    parser.add_argument("--output", type=str, default="tokenizer/tokenizer_32k.json")
     args = parser.parse_args()
 
     tokenizer = create_tokenizer(

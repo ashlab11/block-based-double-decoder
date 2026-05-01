@@ -82,7 +82,8 @@ def _arch_to_dim_layers(arch_label):
     }.get(arch_label, (64, 4, 2))
 
 
-def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False):
+def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False,
+               use_compile=True):
     """Train a single (model_type, dim, lr) point.
 
     Reuses parallel_scaling's build_model + build_optimizer + train_one_budget
@@ -120,7 +121,7 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False):
     try:
         arch = {"dim": dim, "num_encoder_layers": enc, "num_decoder_layers": dec}
         model = ps.build_model(model_type, arch, vocab_size, device,
-                               use_compile=False)
+                               use_compile=use_compile)
         ne = ps.non_emb_param_count(model)
         info = [{"name": run_tag, "model_type": model_type, "arch": arch,
                  "model": model, "ne": ne,
@@ -198,18 +199,20 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False):
         ps.TUNED_LRS = saved_tuned
 
 
-def _phase1(archs, dim, enc, dec, tokens, lrs, dry_run=False):
+def _phase1(archs, dim, enc, dec, tokens, lrs, dry_run=False, use_compile=True):
     """Sweep LR at base width per arch. Returns list of result dicts."""
     plan = [(mt, lr) for mt in archs for lr in lrs]
     print(f"\n{'═'*60}\n  Phase 1: LR sweep at base "
           f"(dim={dim}, enc={enc}, dec={dec}, tokens={tokens:,})\n"
-          f"  {len(plan)} runs ({len(archs)} archs × {len(lrs)} LRs)\n{'═'*60}")
+          f"  {len(plan)} runs ({len(archs)} archs × {len(lrs)} LRs)  "
+          f"compile={use_compile}\n{'═'*60}")
     results = []
     for i, (mt, lr) in enumerate(plan, 1):
         run_tag = f"p1_{mt}_dim{dim}_lr{lr:.0e}"
         print(f"\n[{i}/{len(plan)}] {run_tag}")
         t0 = time.time()
-        r = _train_one(mt, dim, enc, dec, tokens, lr, run_tag, dry_run=dry_run)
+        r = _train_one(mt, dim, enc, dec, tokens, lr, run_tag,
+                       dry_run=dry_run, use_compile=use_compile)
         r["phase"] = 1
         r["run_tag"] = run_tag
         results.append(r)
@@ -243,7 +246,8 @@ def _best_lr_per_arch(phase1_results):
     return out
 
 
-def _phase2(archs, lrs_per_arch, dims, enc, dec, tokens, dry_run=False):
+def _phase2(archs, lrs_per_arch, dims, enc, dec, tokens, dry_run=False,
+            use_compile=True):
     """Verify LR transfer across widths. For each arch, train at each (dim, lr)
     near the phase-1 optimum. Returns list of result dicts."""
     plan = []
@@ -259,13 +263,14 @@ def _phase2(archs, lrs_per_arch, dims, enc, dec, tokens, dry_run=False):
                 plan.append((mt, d, lr))
     print(f"\n{'═'*60}\n  Phase 2: LR transfer across widths "
           f"(dims={dims}, enc={enc}, dec={dec}, tokens={tokens:,})\n"
-          f"  {len(plan)} runs\n{'═'*60}")
+          f"  {len(plan)} runs  compile={use_compile}\n{'═'*60}")
     results = []
     for i, (mt, d, lr) in enumerate(plan, 1):
         run_tag = f"p2_{mt}_dim{d}_lr{lr:.0e}"
         print(f"\n[{i}/{len(plan)}] {run_tag}")
         t0 = time.time()
-        r = _train_one(mt, d, enc, dec, tokens, lr, run_tag, dry_run=dry_run)
+        r = _train_one(mt, d, enc, dec, tokens, lr, run_tag,
+                       dry_run=dry_run, use_compile=use_compile)
         r["phase"] = 2
         r["run_tag"] = run_tag
         results.append(r)
@@ -394,7 +399,11 @@ def main():
                         help="Plan only; don't train")
     parser.add_argument("--plot-only", action="store_true",
                         help="Re-render plots from existing results.json; no training")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (default: compile on). Use as "
+                             "an escape hatch if compile breaks for some arch.")
     args = parser.parse_args()
+    use_compile = not args.no_compile
 
     archs = [a.strip() for a in args.archs.split(",")]
     lrs = ([float(x) for x in args.lrs.split(",")] if args.lrs else DEFAULT_LRS)
@@ -420,7 +429,7 @@ def main():
 
     # Phase 1
     p1 = _phase1(archs, args.phase1_dim, args.phase1_enc, args.phase1_dec,
-                 args.tokens, lrs, dry_run=args.dry_run)
+                 args.tokens, lrs, dry_run=args.dry_run, use_compile=use_compile)
     all_results.extend(p1)
     if not args.dry_run:
         results_path.write_text(json.dumps(all_results, indent=2))
@@ -432,7 +441,7 @@ def main():
     # Phase 2 (optional)
     if args.verify_transfer:
         p2 = _phase2(archs, best, phase2_dims, args.phase1_enc, args.phase1_dec,
-                     phase2_tokens, dry_run=args.dry_run)
+                     phase2_tokens, dry_run=args.dry_run, use_compile=use_compile)
         all_results.extend(p2)
         if not args.dry_run:
             results_path.write_text(json.dumps(all_results, indent=2))

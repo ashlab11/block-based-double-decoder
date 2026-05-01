@@ -59,13 +59,14 @@ from transformers import PreTrainedTokenizerFast
 from models.double_decoder import Double_Decoder
 from models.standard_enc_dec import StandardEncDec
 from models.decoder import DecoderOnlyModel
-from collators.double_decoder.pretrain import DDPretrainCollator
+from collators.double_decoder.pretrain import DDPretrainCollator, BOUNDARY_STRATEGIES
 from collators.double_decoder.sft import DDSFTCollator
 from collators.encoder_decoder.pretrain import EDPretrainCollator
 from collators.encoder_decoder.sft import EDSFTCollator
 from collators.decoder.sft import DecoderSFTCollator
 from collators.decoder.pretrain import DecoderPretrainCollator
 from components.initialization import initialize_model
+from configs.scaling import compute_flops_arch, arch_flop_multiplier
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -78,43 +79,9 @@ MODEL_TYPE_NAMES = {"dd": "Double_Decoder", "sed": "StandardEncDec", "dec": "Dec
 FIXED_ENC_LAYERS = 8
 FIXED_DEC_LAYERS = 4
 
-# enc=8, dec=4: non-emb ≈ 144·dim². So dim choices target user-stated param sizes:
-#   d=64  → 0.59M    d=128 → 2.4M     d=192 → 5.3M     d=320 → 14.7M    d=448 → 28.9M
-#   d=576 → 47.8M    d=1024→ 150.9M   d=1408→ 285.3M
-# "5M" / "25M" / "50M" / "150M" / "300M" labels are user-facing rounded names.
-ARCH_SETS = {
-    "small": [
-        ("0.6M",  dict(dim=64,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("2.4M",  dict(dim=128, num_encoder_layers=8, num_decoder_layers=4)),
-        ("5.3M",  dict(dim=192, num_encoder_layers=8, num_decoder_layers=4)),
-        ("14.7M", dict(dim=320, num_encoder_layers=8, num_decoder_layers=4)),
-        ("28.9M", dict(dim=448, num_encoder_layers=8, num_decoder_layers=4)),
-    ],
-    "large": [
-        ("5M",    dict(dim=192,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("25M",   dict(dim=448,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("50M",   dict(dim=576,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("150M",  dict(dim=1024, num_encoder_layers=8, num_decoder_layers=4)),
-        ("300M",  dict(dim=1408, num_encoder_layers=8, num_decoder_layers=4)),
-    ],
-}
-
-TOKEN_SETS = {
-    "small": [
-        ("10M",  10_000_000),
-        ("50M",  50_000_000),
-        ("100M", 100_000_000),
-        ("300M", 300_000_000),
-        ("600M", 600_000_000),
-    ],
-    "large": [
-        ("100M", 100_000_000),
-        ("500M", 500_000_000),
-        ("1B",   1_000_000_000),
-        ("3B",   3_000_000_000),
-        ("6B",   6_000_000_000),
-    ],
-}
+# Sweep grids live in configs/scaling.py so light-weight planning scripts
+# (e.g. flop_matched_sweep.py) can import them without pulling in PyTorch.
+from configs.scaling import ARCH_SETS, TOKEN_SETS  # noqa: E402
 
 # Backward-compat aliases (kept so external callers / tests still work).
 ARCHITECTURES = ARCH_SETS["small"]
@@ -122,8 +89,44 @@ TOKEN_BUDGETS = TOKEN_SETS["small"]
 
 SEQ_LEN = 2048
 MUP_BASE_DIM = 64
-BASE_LR = 0.002
+BASE_LR = 0.002  # fallback default; overridden per-arch from configs/mup_tuned.json
 TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 tok = 1.05M tok/step
+
+# ── μP-tuned per-arch base LRs ──────────────────────────────────────────────
+# Populated from configs/mup_tuned.json (written by scripts/mup_base_sweep.py).
+# Falls back to BASE_LR when the file is absent so smoke tests don't break
+# before the sweep has been run. Re-read once at startup; Python module-level
+# state is fine since each parallel_scaling.py invocation is single-process.
+
+MUP_TUNED_PATH = PROJECT_ROOT / "configs" / "mup_tuned.json"
+TUNED_LRS = {}  # filled by _load_tuned_lrs()
+
+
+def _load_tuned_lrs():
+    """Read configs/mup_tuned.json and populate TUNED_LRS. Silently no-ops
+    if the file is missing — callers fall back to BASE_LR. The file format is:
+        {"dd": {"base_lr": 0.002, ...}, "sed": {...}, "dec": {...}}
+    Only base_lr is consumed today; other fields are reserved for later
+    expansion (warmup, beta2, init scale)."""
+    global TUNED_LRS
+    if not MUP_TUNED_PATH.exists():
+        return
+    try:
+        with open(MUP_TUNED_PATH) as f:
+            data = json.load(f)
+        TUNED_LRS = {k: v for k, v in data.items() if isinstance(v, dict)}
+        print(f"[μP] loaded tuned LRs from {MUP_TUNED_PATH.name}: "
+              + ", ".join(f"{k}={v.get('base_lr', '?')}" for k, v in TUNED_LRS.items()))
+    except Exception as e:
+        print(f"[μP] WARNING: failed to read {MUP_TUNED_PATH}: {e}; "
+              f"falling back to BASE_LR={BASE_LR}")
+        TUNED_LRS = {}
+
+
+def base_lr_for(model_type):
+    """Return the μP-tuned base LR for a model type, or BASE_LR if untuned."""
+    return TUNED_LRS.get(model_type, {}).get("base_lr", BASE_LR)
+
 
 GPU_PEAK_TFLOPS = {
     "H100": 990, "H200": 990, "A100": 312, "A100-SXM": 624,
@@ -262,7 +265,12 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
     return model
 
 
-def build_optimizer(model, dim):
+def build_optimizer(model, dim, model_type=None):
+    """Build μP-aware AdamW. If model_type is given, picks the per-arch tuned
+    base LR from configs/mup_tuned.json (falls back to BASE_LR otherwise).
+    The model_type=None branch preserves the pre-#3 behavior so any unrelated
+    callers don't break."""
+    base_lr = base_lr_for(model_type) if model_type else BASE_LR
     mup_mult = MUP_BASE_DIM / dim
     embed_params, hidden_decay, no_decay = [], [], []
     for name, p in model.named_parameters():
@@ -278,9 +286,9 @@ def build_optimizer(model, dim):
         else:
             hidden_decay.append(p)
     return AdamW([
-        {"params": embed_params, "lr": BASE_LR, "weight_decay": 0.1},
-        {"params": hidden_decay, "lr": BASE_LR * mup_mult, "weight_decay": 0.1},
-        {"params": no_decay, "lr": BASE_LR, "weight_decay": 0.0},
+        {"params": embed_params, "lr": base_lr, "weight_decay": 0.1},
+        {"params": hidden_decay, "lr": base_lr * mup_mult, "weight_decay": 0.1},
+        {"params": no_decay, "lr": base_lr, "weight_decay": 0.0},
     ], betas=(0.9, 0.95), eps=1e-8, fused=True)
 
 
@@ -404,16 +412,22 @@ def build_sft_collator(model_type, tokenizer, seq_len):
                pad_token_id=pad_id, max_seq_len=seq_len)
 
 
-def build_pretrain_collator(model_type, bos_id, eos_id, pad_id, seq_len, global_seed=None):
+def build_pretrain_collator(model_type, bos_id, eos_id, pad_id, seq_len,
+                            global_seed=None, boundary_strategy="random_uniform"):
     """Pick the right pretrain collator for the model type.
     DD uses DDPretrainCollator (block-decomposed prefix-LM).
     SED uses EDPretrainCollator (T5-style span corruption).
     DecoderOnly uses DecoderPretrainCollator (single causal stream).
+
+    `boundary_strategy` only affects DD; SED and DEC ignore it. See
+    collators/double_decoder/pretrain.py:BOUNDARY_STRATEGIES for the
+    supported values.
     """
     if model_type == "dd":
         return DDPretrainCollator(
             bos_token_id=bos_id, eos_token_id=eos_id, max_seq_len=seq_len,
-            global_seed=global_seed)
+            global_seed=global_seed,
+            boundary_strategy=boundary_strategy)
     if model_type == "sed":
         # sentinel_start_id=6 matches the post-merge tokenizer where the
         # first 6 special tokens occupy ids 0..5 and <sentinel_0..14> sit at 6..20.
@@ -428,10 +442,15 @@ def build_pretrain_collator(model_type, bos_id, eos_id, pad_id, seq_len, global_
     raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def build_sft_optimizer(model, dim, base_lr):
+def build_sft_optimizer(model, dim, base_lr, model_type=None):
     """SFT optimizer: same μP-aware param groups as pretrain but with the
     much smaller SFT base LR (e.g. 2e-5). Embedding + output projection get
-    base_lr; hidden weights get base_lr × (mup_base_dim / dim)."""
+    base_lr; hidden weights get base_lr × (mup_base_dim / dim).
+
+    `model_type` is accepted but currently unused — the SFT LR is passed in
+    explicitly from CLI (--sft-lr) rather than read from configs/mup_tuned.json
+    since SFT is fine-tuning, not pretraining. Kept in the signature so future
+    "tune SFT LR per arch" work can plug in without touching call sites."""
     mup_mult = MUP_BASE_DIM / dim
     embed_params, hidden_decay, no_decay = [], [], []
     for name, p in model.named_parameters():
@@ -509,7 +528,16 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
                 elapsed = time.time() - t0
                 mfu_str = ""
                 if track_mfu:
-                    flops = 6 * trainer["ne"] * micro * tokens_per_micro
+                    # SFT uses arch-aware FLOPs too — the per-arch multiplier
+                    # is the same as pretrain since the model topology is
+                    # identical. tokens_per_micro is the per-step input-token
+                    # count (bs × seq_len).
+                    arch = trainer["arch"]
+                    flops = compute_flops_arch(
+                        trainer["model_type"], trainer["ne"],
+                        micro * tokens_per_micro,
+                        enc=arch["num_encoder_layers"],
+                        dec=arch["num_decoder_layers"])
                     mfu = flops / (max(elapsed, 1e-6) * gpu_tflops * 1e12) * 100
                     mfu_str = f"  MFU={mfu:.1f}%"
                 print(f"      [sft {trainer['display']}] step {step}/{total_steps}  "
@@ -518,7 +546,12 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
     train_time = time.time() - t0
     final_mfu = 0.0
     if track_mfu and micro > 0:
-        flops = 6 * trainer["ne"] * micro * tokens_per_micro
+        arch = trainer["arch"]
+        flops = compute_flops_arch(
+            trainer["model_type"], trainer["ne"],
+            micro * tokens_per_micro,
+            enc=arch["num_encoder_layers"],
+            dec=arch["num_decoder_layers"])
         final_mfu = flops / (max(train_time, 1e-6) * gpu_tflops * 1e12) * 100
     # Average of last 10% of losses gives a stable end-of-training number.
     tail = max(1, len(losses) // 10)
@@ -560,7 +593,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
     for m in models_info:
         eager = getattr(m["model"], "_orig_mod", m["model"])
         initialize_model(eager, "xavier_uniform")
-        opt = build_optimizer(m["model"], m["arch"]["dim"])
+        opt = build_optimizer(m["model"], m["arch"]["dim"], model_type=m["model_type"])
         sched = build_scheduler(opt, total_steps)
         trainers.append({
             "name": m["name"], "model_type": m["model_type"],
@@ -627,7 +660,14 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         # Log progress
         if current_step > 0 and current_step % log_interval == 0 and is_step_boundary:
             elapsed = time.time() - t0
-            total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
+            # Arch-aware FLOPs: DD's combo cross-attn and SED's sparse decoder
+            # output mean the universal 6NT understates DD by ~1.33× and
+            # overstates SED by ~0.81×. See configs/scaling.compute_flops_arch.
+            total_flops = sum(
+                compute_flops_arch(t["model_type"], t["ne"], t["tokens_seen"],
+                                   enc=t["arch"]["num_encoder_layers"],
+                                   dec=t["arch"]["num_decoder_layers"])
+                for t in trainers)
             mfu = total_flops / (elapsed * gpu_tflops * 1e12) * 100
             print(f"    step {current_step:>5}/{total_steps}  "
                   f"[{elapsed:6.1f}s]  MFU={mfu:.1f}%")
@@ -640,7 +680,11 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
 
     torch.cuda.synchronize()
     train_time = time.time() - t0
-    total_flops = sum(6 * t["ne"] * t["tokens_seen"] for t in trainers)
+    total_flops = sum(
+        compute_flops_arch(t["model_type"], t["ne"], t["tokens_seen"],
+                           enc=t["arch"]["num_encoder_layers"],
+                           dec=t["arch"]["num_decoder_layers"])
+        for t in trainers)
     agg_mfu = total_flops / (train_time * gpu_tflops * 1e12) * 100
     print(f"    Done in {train_time:.1f}s  MFU={agg_mfu:.1f}%")
 
@@ -670,6 +714,15 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         if not eval_curve or eval_curve[-1][0] != t["step"]:
             eval_curve.append(final_eval)
 
+        # Arch-aware FLOPs + per-arch tuned LR snapshot. Both fields are new
+        # in the post-Item-#1/#3 JSON schema. recompute_flops.py back-fills
+        # `flops_arch` on older runs that only logged `non_emb_params` and
+        # `tokens_seen`.
+        flops_arch = compute_flops_arch(
+            t["model_type"], t["ne"], t["tokens_seen"],
+            enc=arch["num_encoder_layers"], dec=arch["num_decoder_layers"])
+        actual_base_lr = base_lr_for(t["model_type"])
+
         run_result = {
             "final_eval_loss": round(avg_loss, 4),
             "final_eval_ppl": round(ppl, 2),
@@ -679,6 +732,12 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "non_emb_params": t["ne"],
             "training_time_sec": round(train_time, 2),
             "model_type": t["model_type"],
+            "flops_arch": flops_arch,
+            "flops_naive_6NT": 6 * t["ne"] * t["tokens_seen"],
+            "flop_arch_multiplier": arch_flop_multiplier(
+                t["model_type"],
+                enc=arch["num_encoder_layers"],
+                dec=arch["num_decoder_layers"]),
             "hparams": {
                 "model_cls": MODEL_TYPE_NAMES[t["model_type"]],
                 "dim": arch["dim"],
@@ -687,10 +746,14 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 "num_heads": arch["dim"] // 64,
                 "seq_len": SEQ_LEN,
                 "mup_base_dim": MUP_BASE_DIM,
-                "lr": BASE_LR,
+                "lr": actual_base_lr,
+                "lr_source": "configs/mup_tuned.json" if t["model_type"] in TUNED_LRS else "BASE_LR fallback",
                 "batch_size": batch_size,
                 "grad_accum_steps": grad_accum,
                 "total_tokens": total_tokens,
+                "boundary_strategy": getattr(
+                    train_loaders[t["model_type"]].collate_fn,
+                    "boundary_strategy", None),
             },
             # Curves: each entry is [step, tokens_seen, loss]
             "train_curve": t["train_curve"],
@@ -940,6 +1003,14 @@ def main():
     parser.add_argument("--sft-grad-accum", type=int, default=4,
                         help="SFT grad-accum steps. Effective batch is "
                              "batch_size * sft_grad_accum.")
+    # Item #2: block boundary ablation. DD-only; SED/DEC ignore the flag.
+    parser.add_argument("--boundary-strategy", type=str, default="random_uniform",
+                        choices=list(BOUNDARY_STRATEGIES),
+                        help="DD pretrain block-boundary distribution. "
+                             "'random_uniform' (default) keeps existing behavior; "
+                             "'prompt_style' samples from the SFT prompt-length "
+                             "histogram (build with data/SFT/build_prompt_hist.py); "
+                             "'single_middle' / 'logspace' for ablation controls.")
     # I/O + misc
     parser.add_argument("--output-dir", type=str, default="checkpoints/parallel_scaling")
     parser.add_argument("--no-compile", action="store_true")
@@ -952,6 +1023,10 @@ def main():
     parser.add_argument("--tokenizer-file", type=str,
                         default="tokenizer/tokenizer_32k.json")
     args = parser.parse_args()
+
+    # Pick up per-arch tuned LRs from configs/mup_tuned.json (silent no-op if
+    # the file doesn't exist yet — happens until you've run mup_base_sweep).
+    _load_tuned_lrs()
 
     # Resolve arch + token grid
     arch_list = ARCH_SETS[args.arch_set]
@@ -1024,6 +1099,16 @@ def main():
         print(f"SFT: OFF (use --run-sft to enable)")
     print(f"torch.compile: {'ON' if use_compile else 'OFF'}  |  matmul precision: TF32")
     print(f"Output dir: {args.output_dir}  |  arch tag: {arch_tag}")
+    # Surface the two new knobs prominently so users can audit them in logs
+    # and so any unexpected default doesn't slip through silently.
+    print(f"DD boundary strategy: {args.boundary_strategy}  "
+          f"({'OK' if args.boundary_strategy == 'random_uniform' else 'NON-DEFAULT'})")
+    if TUNED_LRS:
+        lr_summary = "  ".join(
+            f"{mt}={base_lr_for(mt):.2e}" for mt in MODEL_TYPES if mt in model_types)
+        print(f"μP tuned base LRs: {lr_summary}")
+    else:
+        print(f"μP tuned base LRs: (none — using BASE_LR={BASE_LR} for all archs)")
 
     # ── Tokenizer + Data ────────────────────────────────────────────────────
     tokenizer = PreTrainedTokenizerFast(
@@ -1041,7 +1126,8 @@ def main():
     collators = {
         mt: build_pretrain_collator(mt, bos_token_id, eos_token_id,
                                     pad_token_id, SEQ_LEN,
-                                    global_seed=42 + i)
+                                    global_seed=42 + i,
+                                    boundary_strategy=args.boundary_strategy)
         for i, mt in enumerate(MODEL_TYPES)
     }
 
@@ -1071,11 +1157,20 @@ def main():
         for name, arch in arch_list:
             ne = (arch["num_encoder_layers"] + arch["num_decoder_layers"]) * 12 * arch["dim"] ** 2
             for tok_label, total_tokens in budgets:
-                # Assume 35% MFU as a planning heuristic; co-resident 3 models.
-                flops = 6 * ne * total_tokens * len(model_types)
-                est_sec = flops / (gpu_tflops * 1e12 * 0.35)
+                # Per-arch FLOPs sum: each model_type has its own multiplier
+                # (DD=1.33×, SED=0.81×, DEC=1.0×). The naive 6NT line is kept
+                # for comparison so users can see the magnitude of the bias
+                # they would have had under the old logging.
+                arch_flops = sum(
+                    compute_flops_arch(mt, ne, total_tokens,
+                                       enc=arch["num_encoder_layers"],
+                                       dec=arch["num_decoder_layers"])
+                    for mt in model_types)
+                naive_flops = 6 * ne * total_tokens * len(model_types)
+                est_sec = arch_flops / (gpu_tflops * 1e12 * 0.35)
                 print(f"  {name:>5} × {tok_label:>5}: "
-                      f"non_emb={ne:>11,}  total_FLOPs={flops:.2e}  "
+                      f"non_emb={ne:>11,}  arch_FLOPs={arch_flops:.2e}  "
+                      f"(naive 6NT: {naive_flops:.2e})  "
                       f"est={est_sec/3600:.2f}h @35% MFU")
         return
 

@@ -14,6 +14,20 @@ try:
 except ImportError:
     HAS_FLASH_ATTN = False
 
+# Inductor config — required when compiling any function that takes a
+# BlockMask as input. BlockMask carries lazily-allocated kv_indices /
+# kv_num_blocks buffers; FxGraphCache.prepare_key serializes graph inputs
+# by calling .tolist() on them, which raises "tolist() shouldn't be called
+# on a tensor with unallocated storage". always_keep_tensor_constants
+# stops inductor from constant-folding these (which would also call .item()
+# on 0-dim attrs). This is a known upstream limitation, not a workaround
+# for our model — any flex_attention + torch.compile setup needs it.
+import torch._inductor.config as _ic
+_ic.fx_graph_cache = False
+if hasattr(_ic, "fx_graph_remote_cache"):
+    _ic.fx_graph_remote_cache = False
+_ic.always_keep_tensor_constants = True
+
 # flex_attention's eager fallback is a slow Python reference impl; the docs
 # treat compile as the supported path. We compile at import time with
 # dynamic=True so one graph covers all (B, H, L) shapes — this is the right

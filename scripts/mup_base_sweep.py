@@ -45,6 +45,7 @@ Usage:
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -84,32 +85,54 @@ def _arch_to_dim_layers(arch_label):
 
 def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False,
                use_compile=True):
-    """Train a single (model_type, dim, lr) point.
+    """Train a single (model_type, dim, lr) point in an isolated subprocess.
 
-    Reuses parallel_scaling's build_model + build_optimizer + train_one_budget
-    (the path that already supports all 3 archs and μP correctly), but with a
-    single trainer and a single token budget. Lazy import so this script can
-    be planned in CPU-only environments (no torch needed for --dry-run).
+    Process isolation is the only reliable way to keep torch.compile state
+    (dynamo cache, inductor PyCodeCache, async-compile workers, FlexAttention
+    HOP closures, allocator fragmentation) from accumulating across runs.
+    Each subprocess imports torch fresh, compiles one model, writes its
+    result JSON, and exits — the OS reclaims everything. ~5–8s startup
+    overhead per run is well under 10% of a 50M-token training run.
     """
     if dry_run:
         return {"model_type": model_type, "dim": dim, "lr": lr,
                 "tokens": tokens, "final_eval_loss": None, "dry_run": True}
 
+    result_path = OUT_DIR / run_tag / "result.json"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    if result_path.exists():
+        result_path.unlink()  # avoid reading a stale result if subprocess dies
+
+    cmd = [sys.executable, str(Path(__file__).resolve()),
+           "--single-run",
+           "--single-mt", model_type,
+           "--single-dim", str(dim),
+           "--single-enc", str(enc),
+           "--single-dec", str(dec),
+           "--single-lr", repr(lr),
+           "--single-tokens", str(tokens),
+           "--single-run-tag", run_tag,
+           "--single-result-path", str(result_path)]
+    if not use_compile:
+        cmd.append("--no-compile")
+
+    print(f"  → subprocess: {model_type} dim={dim} lr={lr:.2e} tokens={tokens:,}")
+    subprocess.run(cmd, check=True)
+    return json.loads(result_path.read_text())
+
+
+def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
+                           result_path, use_compile=True):
+    """Body of a single training run, executed inside the subprocess spawned
+    by _train_one. No cross-run hygiene is needed here: process exit handles
+    cache flushing, allocator reclamation, and reference cleanup automatically.
+    """
     import torch
     from torch.utils.data import DataLoader
     from datasets import load_dataset
     from transformers import PreTrainedTokenizerFast
 
-    # Import the heavy module here so --dry-run / --plot-only don't pull torch
     import scripts.parallel_scaling as ps
-
-    # Mirror parallel_scaling.main() — without this, the per-iteration
-    # torch.compile pattern (new wrapper every _train_one call) saturates
-    # dynamo's frame cache (default 8) after a handful of runs and starts
-    # evicting entries while their inductor-side buffers are still live,
-    # which is the proximate cause of the "non-zero elements but data not
-    # allocated" crash mid-sweep.
-    torch._dynamo.config.cache_size_limit = 256
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = PreTrainedTokenizerFast(
@@ -119,92 +142,77 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False,
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
     pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
 
-    # Override BASE_LR for this single run. parallel_scaling.build_optimizer
-    # reads base_lr_for(model_type), which falls back to BASE_LR — so we just
-    # mutate the module-global once. Restored at function exit.
-    saved_base = ps.BASE_LR
-    saved_tuned = ps.TUNED_LRS.copy()
+    # Override BASE_LR for this run. No restore needed — the process exits
+    # right after train_one_budget returns.
     ps.BASE_LR = lr
     ps.TUNED_LRS = {model_type: {"base_lr": lr}}
-    try:
-        arch = {"dim": dim, "num_encoder_layers": enc, "num_decoder_layers": dec}
-        model = ps.build_model(model_type, arch, vocab_size, device,
-                               use_compile=use_compile)
-        ne = ps.non_emb_param_count(model)
-        info = [{"name": run_tag, "model_type": model_type, "arch": arch,
-                 "model": model, "ne": ne,
-                 "needs_blocks": model_type in ("dd", "sed")}]
 
-        # Single-trainer batches: stay tiny so dim=64 runs in <1 min each.
-        bs = 8
-        ga = 4  # effective batch 32 — small but adequate for LR optima search
-        collator = ps.build_pretrain_collator(
-            model_type, bos_id, eos_id, pad_id, ps.SEQ_LEN, global_seed=42)
+    arch = {"dim": dim, "num_encoder_layers": enc, "num_decoder_layers": dec}
+    model = ps.build_model(model_type, arch, vocab_size, device,
+                           use_compile=use_compile)
+    ne = ps.non_emb_param_count(model)
+    info = [{"name": run_tag, "model_type": model_type, "arch": arch,
+             "model": model, "ne": ne,
+             "needs_blocks": model_type in ("dd", "sed")}]
 
-        train_ds = load_dataset(
-            "json",
-            data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_packed.jsonl"),
-            split="train", streaming=True)
-        eval_ds = load_dataset(
-            "json",
-            data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_eval_packed.jsonl"),
-            split="train")
+    # Single-trainer batches: stay tiny so dim=64 runs in <1 min each.
+    bs = 8
+    ga = 4  # effective batch 32 — small but adequate for LR optima search
 
-        # Per-MODEL_TYPE loaders dict (only the one used here actually matters)
-        loaders = {
-            mt: DataLoader(train_ds, batch_size=bs,
-                           collate_fn=ps.build_pretrain_collator(
-                               mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
-                               global_seed=42),
-                           drop_last=True)
-            for mt in ps.MODEL_TYPES
-        }
-        eval_loaders = {
-            mt: DataLoader(eval_ds, batch_size=bs,
-                           collate_fn=ps.build_pretrain_collator(
-                               mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
-                               global_seed=42),
-                           drop_last=True)
-            for mt in ps.MODEL_TYPES
-        }
+    train_ds = load_dataset(
+        "json",
+        data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_packed.jsonl"),
+        split="train", streaming=True)
+    eval_ds = load_dataset(
+        "json",
+        data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_eval_packed.jsonl"),
+        split="train")
 
-        gpu_tflops = ps.detect_gpu_tflops()
-        ps.install_fast_masks()
+    loaders = {
+        mt: DataLoader(train_ds, batch_size=bs,
+                       collate_fn=ps.build_pretrain_collator(
+                           mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
+                           global_seed=42),
+                       drop_last=True)
+        for mt in ps.MODEL_TYPES
+    }
+    eval_loaders = {
+        mt: DataLoader(eval_ds, batch_size=bs,
+                       collate_fn=ps.build_pretrain_collator(
+                           mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
+                           global_seed=42),
+                       drop_last=True)
+        for mt in ps.MODEL_TYPES
+    }
 
-        out_subdir = OUT_DIR / run_tag
-        results = ps.train_one_budget(
-            info, tok_label="phase", total_tokens=tokens,
-            batch_size=bs, grad_accum=ga,
-            train_loaders=loaders, eval_loaders=eval_loaders,
-            device=device, gpu_tflops=gpu_tflops,
-            eval_batches=10,
-            output_dir=str(out_subdir),
-            mid_eval_points=0,
-            run_full_eval=False,  # cheap LR sweep — skip benchmark suite
-            tokenizer=tokenizer,
-            run_sft=False)
+    gpu_tflops = ps.detect_gpu_tflops()
+    ps.install_fast_masks()
 
-        # results is keyed "{model_type}_{name}"
-        key = f"{model_type}_{run_tag}"
-        run = results.get(key, {})
+    out_subdir = OUT_DIR / run_tag
+    results = ps.train_one_budget(
+        info, tok_label="phase", total_tokens=tokens,
+        batch_size=bs, grad_accum=ga,
+        train_loaders=loaders, eval_loaders=eval_loaders,
+        device=device, gpu_tflops=gpu_tflops,
+        eval_batches=10,
+        output_dir=str(out_subdir),
+        mid_eval_points=0,
+        run_full_eval=False,
+        tokenizer=tokenizer,
+        run_sft=False)
 
-        # Free model + caches before returning so the next sweep cell starts clean
-        del model, info, loaders, eval_loaders
-        ps._reset_compile_caches()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    key = f"{model_type}_{run_tag}"
+    run = results.get(key, {})
 
-        return {
-            "model_type": model_type, "dim": dim, "enc": enc, "dec": dec,
-            "lr": lr, "tokens": tokens,
-            "final_eval_loss": run.get("final_eval_loss"),
-            "final_eval_ppl": run.get("final_eval_ppl"),
-            "non_emb_params": run.get("non_emb_params"),
-            "training_time_sec": run.get("training_time_sec"),
-        }
-    finally:
-        ps.BASE_LR = saved_base
-        ps.TUNED_LRS = saved_tuned
+    result = {
+        "model_type": model_type, "dim": dim, "enc": enc, "dec": dec,
+        "lr": lr, "tokens": tokens,
+        "final_eval_loss": run.get("final_eval_loss"),
+        "final_eval_ppl": run.get("final_eval_ppl"),
+        "non_emb_params": run.get("non_emb_params"),
+        "training_time_sec": run.get("training_time_sec"),
+    }
+    Path(result_path).write_text(json.dumps(result, indent=2))
 
 
 def _phase1(archs, dim, enc, dec, tokens, lrs, dry_run=False, use_compile=True):
@@ -410,8 +418,39 @@ def main():
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile (default: compile on). Use as "
                              "an escape hatch if compile breaks for some arch.")
+
+    # --single-run: internal subprocess entrypoint invoked by _train_one for
+    # one (model_type, dim, lr) point. Not for direct human use; it exists so
+    # each training run gets its own clean torch process (no compile-cache or
+    # allocator state inherited from prior runs).
+    parser.add_argument("--single-run", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-mt", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-dim", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-enc", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-dec", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-lr", type=float, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-tokens", type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-run-tag", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--single-result-path", default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
     use_compile = not args.no_compile
+
+    if args.single_run:
+        _run_single_in_process(
+            model_type=args.single_mt, dim=args.single_dim,
+            enc=args.single_enc, dec=args.single_dec,
+            tokens=args.single_tokens, lr=args.single_lr,
+            run_tag=args.single_run_tag,
+            result_path=args.single_result_path,
+            use_compile=use_compile)
+        return
 
     archs = [a.strip() for a in args.archs.split(",")]
     lrs = ([float(x) for x in args.lrs.split(",")] if args.lrs else DEFAULT_LRS)

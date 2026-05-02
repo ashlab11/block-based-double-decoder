@@ -343,38 +343,24 @@ def install_fast_masks():
     import models.double_decoder as dd
     dd.create_masks = _cached_create_masks
 
-    # Workaround for two related upstream torch.compile crashes on DD/SED
-    # (anything that routes a FlexAttention BlockMask through a torch.compile'd
-    # forward). Inductor has two paths that try to materialize small graph
-    # constants by reading their data:
-    #   (1) FxGraphCache.prepare_key → .tolist() on graph inputs ≤8 elements
-    #   (2) Graph.get_attr → .item() on 0-dim tensor attributes
-    # Both crash with "tensor has a non-zero number of elements but its data is
-    # not allocated yet" when the value is a FakeTensor / lazily-allocated
-    # buffer originating inside the FlexAttention HOP. DEC has no flex_attention
-    # in its graph and isn't affected.
-    #
-    # always_keep_tensor_constants=True forces every tensor constant through
-    # Graph.add_tensor_constant, which only inspects metadata
-    # (device/dtype/shape/stride/identity-hash) — never .item()/.tolist() — so
-    # it sidesteps both crashes. The cost is disabling a small-tensor inlining
-    # micro-optimization (constants loaded from memory instead of inlined as
-    # immediates in generated kernels); negligible for matmul/attention-bound
-    # training. fx_graph_cache=False is kept as defense-in-depth for path (1).
+    # FlexAttention BlockMask creates lazily-allocated / FakeTensor buffers
+    # that crash inductor when it tries to read their data. Three crash sites:
+    #   (1) FxGraphCache.prepare_key → .tolist() on small constants
+    #   (2) Graph.get_attr → .item() on 0-dim attributes
+    #   (3) allocate_non_dup_const_name → is_same_tensor → .data_ptr()
+    # always_keep_tensor_constants bypasses (1) and (2); patching is_same_tensor
+    # fixes (3). DEC is unaffected (no FlexAttention in its graph).
     import torch._inductor.config as _ic
     _ic.always_keep_tensor_constants = True
     _ic.fx_graph_cache = False
     if hasattr(_ic, "fx_graph_remote_cache"):
         _ic.fx_graph_remote_cache = False
 
-    # Workaround for a third crash path: always_keep_tensor_constants routes
-    # every constant through Graph.add_tensor_constant → allocate_non_dup_const_name,
-    # which calls is_same_tensor() to deduplicate. is_same_tensor() reads
-    # .untyped_storage().data_ptr(), which crashes on FlexAttention's
-    # lazily-allocated/fake-tensor buffers with "Attempted to access the data
-    # pointer on an invalid python storage". Patching is_same_tensor to catch
-    # the RuntimeError is safe: invalid storage ⇒ definitely not the same tensor.
+    # Patch is_same_tensor where it's actually called: graph.py imports it via
+    # `from .utils import is_same_tensor`, so we must patch the graph module's
+    # reference, not just utils.
     import torch._inductor.utils as _iu
+    import torch._inductor.graph as _ig
     _orig_is_same = _iu.is_same_tensor
     def _safe_is_same_tensor(a, b):
         try:
@@ -382,6 +368,7 @@ def install_fast_masks():
         except RuntimeError:
             return False
     _iu.is_same_tensor = _safe_is_same_tensor
+    _ig.is_same_tensor = _safe_is_same_tensor
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

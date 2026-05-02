@@ -367,6 +367,22 @@ def install_fast_masks():
     if hasattr(_ic, "fx_graph_remote_cache"):
         _ic.fx_graph_remote_cache = False
 
+    # Workaround for a third crash path: always_keep_tensor_constants routes
+    # every constant through Graph.add_tensor_constant → allocate_non_dup_const_name,
+    # which calls is_same_tensor() to deduplicate. is_same_tensor() reads
+    # .untyped_storage().data_ptr(), which crashes on FlexAttention's
+    # lazily-allocated/fake-tensor buffers with "Attempted to access the data
+    # pointer on an invalid python storage". Patching is_same_tensor to catch
+    # the RuntimeError is safe: invalid storage ⇒ definitely not the same tensor.
+    import torch._inductor.utils as _iu
+    _orig_is_same = _iu.is_same_tensor
+    def _safe_is_same_tensor(a, b):
+        try:
+            return _orig_is_same(a, b)
+        except RuntimeError:
+            return False
+    _iu.is_same_tensor = _safe_is_same_tensor
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 

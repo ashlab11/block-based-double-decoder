@@ -205,6 +205,7 @@ MUP_BASE_DIM = 64
 # under that protocol so attention transfers properly. Tensor Programs V §B.
 MUP_BASE_HEAD_DIM = 64
 BASE_LR = 0.002  # fallback default; overridden per-arch from configs/mup_tuned.json
+BASE_WD = 0.1   # fallback default; overridden per-arch from configs/wd_tuned.json
 TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 tok = 1.05M tok/step
 
 # CLI-driven toggles set by main() after argparse. Module-level so build_optimizer
@@ -213,6 +214,7 @@ TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 to
 # configs/mup_tuned.json for the pretrain optimizer only.
 MUP_ENABLED = True
 LR_OVERRIDE = None
+WD_OVERRIDE = None  # set by scripts/wd_sweep.py per cell; bypasses TUNED_WDS/BASE_WD
 
 # ── μP-tuned per-arch base LRs ──────────────────────────────────────────────
 # Populated from configs/mup_tuned.json (written by scripts/mup_base_sweep.py).
@@ -248,6 +250,41 @@ def _load_tuned_lrs():
 def base_lr_for(model_type):
     """Return the μP-tuned base LR for a model type, or BASE_LR if untuned."""
     return TUNED_LRS.get(model_type, {}).get("base_lr", BASE_LR)
+
+
+# ── Per-arch tuned weight decay ─────────────────────────────────────────────
+# Populated from configs/wd_tuned.json (written by scripts/wd_sweep.py). Same
+# fall-back contract as TUNED_LRS: file absent → callers use BASE_WD. WD has no
+# μP transfer claim — the sweep runs at base width only and the resulting WD is
+# reused at every scale, mirroring the standard practice for AdamW WD.
+
+MUP_TUNED_WD_PATH = PROJECT_ROOT / "configs" / "wd_tuned.json"
+TUNED_WDS = {}  # filled by _load_tuned_wds()
+
+
+def _load_tuned_wds():
+    """Read configs/wd_tuned.json and populate TUNED_WDS. File format:
+        {"dd": {"weight_decay": 0.05, ...}, "sed": {...}, "dec": {...}}
+    Silently no-ops if the file is missing — callers fall back to BASE_WD."""
+    global TUNED_WDS
+    if not MUP_TUNED_WD_PATH.exists():
+        return
+    try:
+        with open(MUP_TUNED_WD_PATH) as f:
+            data = json.load(f)
+        TUNED_WDS = {k: v for k, v in data.items() if isinstance(v, dict)}
+        print(f"[μP] loaded tuned WDs from {MUP_TUNED_WD_PATH.name}: "
+              + ", ".join(f"{k}={v.get('weight_decay', '?')}"
+                          for k, v in TUNED_WDS.items()))
+    except Exception as e:
+        print(f"[μP] WARNING: failed to read {MUP_TUNED_WD_PATH}: {e}; "
+              f"falling back to BASE_WD={BASE_WD}")
+        TUNED_WDS = {}
+
+
+def base_wd_for(model_type):
+    """Return the per-arch tuned WD for a model type, or BASE_WD if untuned."""
+    return TUNED_WDS.get(model_type, {}).get("weight_decay", BASE_WD)
 
 
 GPU_PEAK_TFLOPS = {
@@ -344,6 +381,10 @@ def build_optimizer(model, dim, model_type=None):
         base_lr = LR_OVERRIDE
     else:
         base_lr = base_lr_for(model_type) if model_type else BASE_LR
+    if WD_OVERRIDE is not None:
+        wd = WD_OVERRIDE
+    else:
+        wd = base_wd_for(model_type) if model_type else BASE_WD
     mup_mult = (MUP_BASE_DIM / dim) if MUP_ENABLED else 1.0
     embed_params, hidden_decay, no_decay = [], [], []
     for name, p in model.named_parameters():
@@ -359,8 +400,8 @@ def build_optimizer(model, dim, model_type=None):
         else:
             hidden_decay.append(p)
     return AdamW([
-        {"params": embed_params, "lr": base_lr, "weight_decay": 0.1},
-        {"params": hidden_decay, "lr": base_lr * mup_mult, "weight_decay": 0.1},
+        {"params": embed_params, "lr": base_lr, "weight_decay": wd},
+        {"params": hidden_decay, "lr": base_lr * mup_mult, "weight_decay": wd},
         {"params": no_decay, "lr": base_lr, "weight_decay": 0.0},
     ], betas=(0.9, 0.95), eps=1e-8, fused=True)
 
@@ -1272,6 +1313,9 @@ def main():
     # Pick up per-arch tuned LRs from configs/mup_tuned.json (silent no-op if
     # the file doesn't exist yet — happens until you've run mup_base_sweep).
     _load_tuned_lrs()
+    # Same for per-arch tuned WDs from configs/wd_tuned.json (written by
+    # scripts/wd_sweep.py, run after mup_base_sweep so each arch's LR is tuned).
+    _load_tuned_wds()
 
     # Apply --no-mup / --peak-lr to the module globals consumed by
     # build_optimizer. We do this after _load_tuned_lrs so --peak-lr cleanly

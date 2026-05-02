@@ -14,16 +14,7 @@ import torch.nn as nn
 import numpy as np
 from torchtune.modules import RotaryPositionalEmbeddings
 
-# Unrelated to flex_attention / our refactor: PyTorch 2.6.x's inductor
-# quantization pattern matcher mis-matches SDPA calls during *inference*
-# compile (is_inference=True post-grad passes) and crashes on
-# match.kwargs["scales"].meta["val"] when scale= is a Python float —
-# AttributeError: 'float' object has no attribute 'meta'. The training
-# compile path doesn't run this matcher and is unaffected. We disable it
-# globally here so eval-mode compile paths (run_evals, benchmark_efficiency,
-# sanity checks, post-training eval in parallel_scaling) don't trip on it.
-# Safe to leave on always — we don't use quantization, and core inductor
-# fusion / triton codegen is unaffected.
+
 import torch._inductor.config as _ic
 _ic.pattern_matcher = False
 
@@ -56,14 +47,6 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
-        # μP attention scale: √base_head_dim / head_dim. Collapses to standard
-        # 1/√head_dim when base_head_dim == head_dim (head_dim held constant
-        # across widths) — so existing base-width LR tunings transfer untouched.
-        # When head_dim grows past base_head_dim, the extra 1/√head_dim damping
-        # is what canonical μP requires for stable softmax across widths.
-        # Tensor Programs V (Yang & Hu 2022) §B. Falls back to SDPA's default
-        # 1/√head_dim when base_head_dim=0 (μP off, the safe default that also
-        # avoids sqrt(0) via short-circuit).
         if base_head_dim:
             self.attn_scale = np.sqrt(base_head_dim) / self.head_dim
         else:

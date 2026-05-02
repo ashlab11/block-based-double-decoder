@@ -317,16 +317,26 @@ def install_fast_masks():
     import models.double_decoder as dd
     dd.create_masks = _cached_create_masks
 
-    # Workaround: FxGraphCache.prepare_key hashes every graph input ≤8 elems
-    # via .tolist(), which errors on tensors with unallocated storage. DD's
-    # FlexAttention BlockMask carries optional fields (full_kv_num_blocks etc.)
-    # that PyTorch builds lazily — they reach the cache hasher unmaterialized
-    # and crash with "tolist() shouldn't be called on a tensor with unallocated
-    # storage". DEC's graph doesn't include BlockMask inputs so it isn't hit.
-    # Disabling fx_graph_cache skips only the cross-process graph hash; in-
-    # process Dynamo caching still works and runtime is unaffected (~30s extra
-    # on each first-compile of a new shape).
+    # Workaround for two related upstream torch.compile crashes on DD/SED
+    # (anything that routes a FlexAttention BlockMask through a torch.compile'd
+    # forward). Inductor has two paths that try to materialize small graph
+    # constants by reading their data:
+    #   (1) FxGraphCache.prepare_key → .tolist() on graph inputs ≤8 elements
+    #   (2) Graph.get_attr → .item() on 0-dim tensor attributes
+    # Both crash with "tensor has a non-zero number of elements but its data is
+    # not allocated yet" when the value is a FakeTensor / lazily-allocated
+    # buffer originating inside the FlexAttention HOP. DEC has no flex_attention
+    # in its graph and isn't affected.
+    #
+    # always_keep_tensor_constants=True forces every tensor constant through
+    # Graph.add_tensor_constant, which only inspects metadata
+    # (device/dtype/shape/stride/identity-hash) — never .item()/.tolist() — so
+    # it sidesteps both crashes. The cost is disabling a small-tensor inlining
+    # micro-optimization (constants loaded from memory instead of inlined as
+    # immediates in generated kernels); negligible for matmul/attention-bound
+    # training. fx_graph_cache=False is kept as defense-in-depth for path (1).
     import torch._inductor.config as _ic
+    _ic.always_keep_tensor_constants = True
     _ic.fx_graph_cache = False
     if hasattr(_ic, "fx_graph_remote_cache"):
         _ic.fx_graph_remote_cache = False

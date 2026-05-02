@@ -103,6 +103,14 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False,
     # Import the heavy module here so --dry-run / --plot-only don't pull torch
     import scripts.parallel_scaling as ps
 
+    # Mirror parallel_scaling.main() — without this, the per-iteration
+    # torch.compile pattern (new wrapper every _train_one call) saturates
+    # dynamo's frame cache (default 8) after a handful of runs and starts
+    # evicting entries while their inductor-side buffers are still live,
+    # which is the proximate cause of the "non-zero elements but data not
+    # allocated" crash mid-sweep.
+    torch._dynamo.config.cache_size_limit = 256
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=str(PROJECT_ROOT / "tokenizer" / "tokenizer_32k.json"))

@@ -286,21 +286,38 @@ def _cached_create_masks(batch_size, blocks, device, input_ids,
 def _reset_compile_caches():
     """Flush all compile-/mask-related caches between distinct training phases.
 
-    Crossing a phase boundary (e.g. SFT → post-SFT eval) is the highest-risk
-    moment for stale-guard CUDA IMAs: the compiled-frame cache holds graphs
-    captured against tensors whose Python ids may have been GC'd and reused,
-    and our local _mask_cache_* still points at BlockMasks whose closures
-    captured device tensors that are no longer the current ones.
+    Crossing a phase boundary (e.g. SFT → post-SFT eval, or one sweep cell to
+    the next in mup_base_sweep) is the highest-risk moment for stale-guard
+    CUDA IMAs and the FlexAttention "data not allocated" inductor crash:
+    dynamo's frame cache holds graphs captured against tensors whose Python
+    ids may have been GC'd and reused; inductor's in-memory FxGraphCache
+    holds compiled FX graphs whose constant-tensor refs can outlive the
+    underlying buffers; the async-compile worker pool keeps closures alive
+    until GC sweeps; and our local _mask_cache_* still points at BlockMasks
+    whose closures captured device tensors that are no longer the current
+    ones.
 
-    This wipes:
+    This wipes (in order of importance for the FlexAttention crash):
       • our local cached BlockMasks (drops closure-captured block_ids)
       • dynamo's compiled-frame cache (forces re-trace with fresh guards)
+      • inductor's FxGraphCache in-memory tier (drops stale FakeTensor refs;
+        fx_graph_cache=False only disables the *disk* tier in some versions)
+      • Python GC (releases compiled-callable closures still held by the
+        inductor async-compile worker pool)
       • CUDA's allocator cache (best-effort hygiene, not strictly required)
     """
     global _mask_cache_key, _mask_cache_result
     _mask_cache_key = None
     _mask_cache_result = None
     torch._dynamo.reset()
+    # FxGraphCache exists in torch >= 2.4; tolerate older installs.
+    try:
+        from torch._inductor.codecache import FxGraphCache
+        FxGraphCache.clear()
+    except Exception:
+        pass
+    import gc
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

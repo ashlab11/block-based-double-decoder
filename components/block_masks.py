@@ -50,11 +50,19 @@ def create_pretrain_masks(blocks, seq_len, device):
         in_past_block = kv_block < q_block
         return in_past_block | first_token
 
+    # NOTE: _compile=True is deprecated upstream and breaks torch.compile of the
+    # outer model: it internally calls torch.compile(create_block_mask), which
+    # builds BlockMask tensors under fake-tensor mode. Those fake/lazy fields
+    # leak into the parent compile graph and crash inductor's get_attr→.item()
+    # constant-folding path with "tensor has a non-zero number of elements but
+    # its data is not allocated yet". Eager construction is fast enough here
+    # (each unique (blocks, seq_len) is built once and cached via
+    # parallel_scaling._cached_create_masks).
     self_mask_block = create_block_mask(pt_self_mask,
-        B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device, _compile=True
+        B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
     )
     cross_mask_block = create_block_mask(pt_cross_mask,
-        B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device, _compile=True
+        B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
     )
     return {"self_mask": self_mask_block, "cross_mask": cross_mask_block}
 
@@ -68,10 +76,10 @@ def create_sft_masks(batch_size, blocks, device, enc_len, dec_len):
         return kv < sft_block_ids[b]
 
     causal_mask_block = create_block_mask(causal_all_mask,
-        B=batch_size, H=None, Q_LEN=dec_len, KV_LEN=dec_len, device=device, _compile=True
+        B=batch_size, H=None, Q_LEN=dec_len, KV_LEN=dec_len, device=device,
     )
     cross_mask_block = create_block_mask(sft_cross_mask,
-        B=batch_size, H=None, Q_LEN=dec_len, KV_LEN=enc_len, device=device, _compile=True
+        B=batch_size, H=None, Q_LEN=dec_len, KV_LEN=enc_len, device=device,
     )
     return {"self_mask": causal_mask_block, "cross_mask": cross_mask_block}
 
@@ -80,10 +88,10 @@ def create_sft_masks(batch_size, blocks, device, enc_len, dec_len):
 @torch.compiler.disable()
 def create_inference_masks(device, enc_len, dec_len):
     causal_mask_block = create_block_mask(causal_all_mask,
-        B=None, H=None, Q_LEN=dec_len, KV_LEN=dec_len, device=device, _compile=True
+        B=None, H=None, Q_LEN=dec_len, KV_LEN=dec_len, device=device,
     )
     allow_mask_block = create_block_mask(allow_all_mask,
-        B=None, H=None, Q_LEN=dec_len, KV_LEN=enc_len, device=device, _compile=True
+        B=None, H=None, Q_LEN=dec_len, KV_LEN=enc_len, device=device,
     )
     return {"self_mask": causal_mask_block, "cross_mask": allow_mask_block}
 
@@ -109,10 +117,10 @@ def create_masks_ED(batch_size, blocks, device, encoder_input_ids, decoder_input
         return kv_idx < enc_lens[b]
 
     enc_mask_block = create_block_mask(mask,
-        B=batch_size, H=None, Q_LEN=encoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device, _compile=True
+        B=batch_size, H=None, Q_LEN=encoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device,
     )
     cross_mask_block = create_block_mask(mask,
-        B=batch_size, H=None, Q_LEN=decoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device, _compile=True
+        B=batch_size, H=None, Q_LEN=decoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device,
     )
     # Returns a tuple of two single-key dicts to match StandardEncDec.forward's
     # `causal_mask, cross_mask = create_masks_ED(...)` unpacking.

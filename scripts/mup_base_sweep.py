@@ -186,7 +186,6 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
     }
 
     gpu_tflops = ps.detect_gpu_tflops()
-    ps.install_fast_masks()
 
     out_subdir = OUT_DIR / run_tag
     results = ps.train_one_budget(

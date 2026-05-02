@@ -16,9 +16,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-# Workaround for PyTorch 2.6.0 inductor bug (see training/pretrain.py)
-import torch._inductor.config as _inductor_config
-_inductor_config.pattern_matcher = False
 import torch.nn as nn
 import numpy as np
 
@@ -403,37 +400,41 @@ def check_config_validation():
     return ok
 
 
-# ── Check 11: Compile Compatibility ─────────────────────────────────────────
+# ── Check 11: flex_attention is compiled at module level ──────────────────
 
 def check_compile_compat():
-    print("\n── Check 11: Compile Compatibility ──")
+    print("\n── Check 11: flex_attention compile ──")
     if not torch.cuda.is_available():
-        print("  [SKIP] No GPU available (torch.compile needs CUDA)")
+        print("  [SKIP] No GPU available (flex_attention needs CUDA)")
         return True
+
+    # The intended pattern is: compile flex_attention once at import time,
+    # leave the surrounding model in eager. Verify the import-time wrap is
+    # in place and that a forward pass through the model produces a finite
+    # loss (which exercises the compiled kernel via attention.py).
+    from components import attention as _attn
+
+    ok = True
+    ok &= _print_result(
+        "components.attention.flex_attention is compiled",
+        hasattr(_attn.flex_attention, "_torchdynamo_orig_callable")
+        or hasattr(_attn.flex_attention, "_orig_mod")
+        or callable(getattr(_attn.flex_attention, "compile_fn", None))
+        or _attn.flex_attention is not _attn._flex_attention_eager,
+    )
 
     device = "cuda"
     model = _build_model(device)
     batch = _random_batch(batch_size=2, device=device)
-
-    # Eager forward
     model.eval()
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        eager_out = model(**batch)
-    eager_loss = eager_out["loss"].item()
+        out = model(**batch)
+    loss = out["loss"].item()
+    ok &= _print_result("Forward through compiled flex_attention runs",
+                        torch.isfinite(torch.tensor(loss)),
+                        f"loss={loss:.4f}")
 
-    # Compiled forward
-    compiled = torch.compile(model, fullgraph=False, dynamic=False)
-    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        compiled_out = compiled(**batch)
-    compiled_loss = compiled_out["loss"].item()
-
-    ok = True
-    ok &= _print_result("Compiled model runs", True)
-    ok &= _print_result("Loss matches eager (within tolerance)",
-                        abs(eager_loss - compiled_loss) < 0.1,
-                        f"eager={eager_loss:.4f}, compiled={compiled_loss:.4f}")
-
-    del model, compiled
+    del model
     torch.cuda.empty_cache()
     return ok
 

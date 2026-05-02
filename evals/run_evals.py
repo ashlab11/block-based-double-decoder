@@ -25,10 +25,6 @@ import json
 import time
 import torch
 
-# Workaround for PyTorch inductor bug
-import torch._inductor.config as _inductor_config
-_inductor_config.pattern_matcher = False
-
 from evals.utils import load_model
 
 
@@ -252,11 +248,9 @@ def main():
     print(f"  Model type: {model_type}")
     print(f"  Parameters: {param_count / 1e6:.1f}M")
 
-    # torch.compile for faster forward passes
-    if device.type == "cuda" and not args.no_compile:
-        print(f"  Compiling model with torch.compile...")
-        model = torch.compile(model, fullgraph=False, dynamic=False)
-        print(f"  Compiled (first forward will be slower due to tracing)")
+    # Outer-model compile removed; flex_attention is compiled at module level
+    # in components/attention.py. --no-compile is preserved as a no-op for
+    # backwards compatibility with existing scripts.
     print()
 
     eval_results = run_evals_on_model(

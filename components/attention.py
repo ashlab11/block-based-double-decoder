@@ -7,12 +7,20 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torchtune.modules import RotaryPositionalEmbeddings
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention_eager
 try:
     from flash_attn import flash_attn_func
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
+
+# flex_attention's eager fallback is a slow Python reference impl; the docs
+# treat compile as the supported path. We compile at import time with
+# dynamic=True so one graph covers all (B, H, L) shapes — this is the right
+# granularity for compile in this codebase: the kernel is the smallest stable
+# unit, while the surrounding model has data-dependent control flow that
+# should stay in eager.
+flex_attention = torch.compile(_flex_attention_eager, dynamic=True)
 
 class CrossAttention(nn.Module):
     """Standard cross-attention: Q from decoder, K/V from encoder output."""

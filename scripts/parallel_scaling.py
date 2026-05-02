@@ -47,7 +47,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch._dynamo
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -257,120 +256,6 @@ GPU_PEAK_TFLOPS = {
 }
 
 
-# ── Monkey-patch: cache block masks across models ───────────────────────────
-
-_mask_cache_key = None
-_mask_cache_result = None
-
-@torch.compiler.disable()  # mirror create_masks in components/block_masks.py;
-# without this, Inductor traces the cache lookup, builds dynamo guards that
-# hold refs to `blocks`, and recompiles every time `blocks` is GC'd.
-def _cached_create_masks(batch_size, blocks, device, input_ids,
-                         encoder_input_ids, decoder_input_ids, sft):
-    global _mask_cache_key, _mask_cache_result
-    # Cache key MUST include seq_len: Python id() can be reused across
-    # GC'd tensors of different shapes, so id(blocks) alone returns stale
-    # block_masks during eval where seq_len varies per batch (e.g. lambada).
-    if sft:
-        seq_len_key = (encoder_input_ids.shape[1], decoder_input_ids.shape[1])
-        bs_key = batch_size
-    else:
-        seq_len_key = input_ids.shape[1]
-        bs_key = None
-    cache_key = (id(blocks), seq_len_key, sft, bs_key)
-
-    if cache_key != _mask_cache_key:
-        _mask_cache_key = cache_key
-        from components.block_masks import create_pretrain_masks, create_sft_masks
-        if sft:
-            _mask_cache_result = create_sft_masks(
-                batch_size, blocks, device,
-                encoder_input_ids.shape[1], decoder_input_ids.shape[1])
-        else:
-            _mask_cache_result = create_pretrain_masks(
-                blocks, input_ids.shape[1], device)
-    return _mask_cache_result
-
-
-def _reset_compile_caches():
-    """Flush all compile-/mask-related caches between distinct training phases.
-
-    Crossing a phase boundary (e.g. SFT → post-SFT eval, or one sweep cell to
-    the next in mup_base_sweep) is the highest-risk moment for stale-guard
-    CUDA IMAs and the FlexAttention "data not allocated" inductor crash:
-    dynamo's frame cache holds graphs captured against tensors whose Python
-    ids may have been GC'd and reused; inductor's in-memory FxGraphCache
-    holds compiled FX graphs whose constant-tensor refs can outlive the
-    underlying buffers; the async-compile worker pool keeps closures alive
-    until GC sweeps; and our local _mask_cache_* still points at BlockMasks
-    whose closures captured device tensors that are no longer the current
-    ones.
-
-    This wipes (in order of importance for the FlexAttention crash):
-      • our local cached BlockMasks (drops closure-captured block_ids)
-      • dynamo's compiled-frame cache (forces re-trace with fresh guards)
-      • inductor's FxGraphCache in-memory tier (drops stale FakeTensor refs;
-        fx_graph_cache=False only disables the *disk* tier in some versions)
-      • Python GC (releases compiled-callable closures still held by the
-        inductor async-compile worker pool)
-      • CUDA's allocator cache (best-effort hygiene, not strictly required)
-    """
-    global _mask_cache_key, _mask_cache_result
-    _mask_cache_key = None
-    _mask_cache_result = None
-    torch._dynamo.reset()
-    # FxGraphCache exists in torch >= 2.4; tolerate older installs.
-    try:
-        from torch._inductor.codecache import FxGraphCache
-        FxGraphCache.clear()
-    except Exception:
-        pass
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def install_fast_masks():
-    """Monkey-patch DD's create_masks with a cached version.
-
-    Post-Asher-merge, StandardEncDec calls create_masks_ED directly with a
-    different `blocks` semantic (per-batch encoder length, not per-sequence
-    split positions), so the shared cache doesn't apply to SED. SED gets its
-    masks rebuilt per batch — the variable-length encoder padding makes
-    caching across batches mostly useless anyway.
-    """
-    import models.double_decoder as dd
-    dd.create_masks = _cached_create_masks
-
-    # FlexAttention BlockMask creates lazily-allocated / FakeTensor buffers
-    # that crash inductor when it tries to read their data. Three crash sites:
-    #   (1) FxGraphCache.prepare_key → .tolist() on small constants
-    #   (2) Graph.get_attr → .item() on 0-dim attributes
-    #   (3) allocate_non_dup_const_name → is_same_tensor → .data_ptr()
-    # always_keep_tensor_constants bypasses (1) and (2); patching is_same_tensor
-    # fixes (3). DEC is unaffected (no FlexAttention in its graph).
-    import torch._inductor.config as _ic
-    _ic.always_keep_tensor_constants = True
-    _ic.fx_graph_cache = False
-    if hasattr(_ic, "fx_graph_remote_cache"):
-        _ic.fx_graph_remote_cache = False
-
-    # Patch is_same_tensor where it's actually called: graph.py imports it via
-    # `from .utils import is_same_tensor`, so we must patch the graph module's
-    # reference, not just utils.
-    import torch._inductor.utils as _iu
-    import torch._inductor.graph as _ig
-    _orig_is_same = _iu.is_same_tensor
-    def _safe_is_same_tensor(a, b):
-        try:
-            return _orig_is_same(a, b)
-        except RuntimeError:
-            return False
-    _iu.is_same_tensor = _safe_is_same_tensor
-    _ig.is_same_tensor = _safe_is_same_tensor
-
-
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def detect_gpu_tflops():
@@ -440,8 +325,9 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
             mup_base_dim=mup_base, mup_base_head_dim=mup_base_head)
 
     model = model.to(device)
-    if use_compile:
-        model = torch.compile(model)
+    # Outer-model compile removed; flex_attention is compiled at module level
+    # in components/attention.py. use_compile is accepted as a no-op to keep
+    # callers compatible.
     return model
 
 
@@ -1192,11 +1078,6 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             if eval_names and "sft_error" not in run_result:
                 eager = getattr(t["model"], "_orig_mod", t["model"])
                 is_enc_dec = t["model_type"] in ("dd", "sed")
-                # Cross-phase boundary — flush every compile/mask cache before
-                # post-SFT eval. Without this, BlockMasks built during SFT (with
-                # SFT-shaped block_ids in their closure) leak into the eval path
-                # and cause IMAs when seq_len differs.
-                _reset_compile_caches()
                 eval_t0 = time.time()
                 print(f"      [sft-eval] running {len(eval_names)} evals on "
                       f"SFT'd {t['display']} (max_examples={eval_max_examples})...")
@@ -1374,8 +1255,9 @@ def main():
                         help="Optional prefix for wandb run names "
                              "(useful for namespacing related sweeps).")
     # Internal: subprocess isolation entrypoint. When set, this process trains
-    # only the specified model type and exits. Spawned by the parent process to
-    # get a clean torch.compile / dynamo / inductor state per model type.
+    # only the specified model type and exits. Spawned by the parent process so
+    # CUDA allocator state and any latent compiled-kernel caches don't bleed
+    # across model types in long sweeps.
     parser.add_argument("--_subprocess-mt", dest="_subprocess_mt", default=None,
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1439,14 +1321,6 @@ def main():
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     use_compile = not args.no_compile
-    install_fast_masks()
-
-    # 15 models × multiple inner functions × varying eval seq_lens easily blow
-    # past the default 8. Empirically a 22-eval suite generates 400+ traced
-    # frames per model; 64 was tight enough that mid-eval evictions were
-    # leaving stale guards. Raise the ceiling so frames stick around for the
-    # full eval pass instead of churning.
-    torch._dynamo.config.cache_size_limit = 256
 
     gpu_tflops = detect_gpu_tflops()
     gpu_name = torch.cuda.get_device_name(0)
@@ -1557,13 +1431,10 @@ def main():
         return
 
     # ── Run each model type in an isolated subprocess ────────────────────
-    # Process isolation is the only reliable way to keep torch.compile state
-    # (dynamo cache, inductor PyCodeCache, async-compile workers, FlexAttention
-    # HOP closures, allocator fragmentation) from accumulating across model
-    # types. Each subprocess imports torch fresh, compiles one model type's
-    # models, trains all budgets, writes result JSONs, and exits — the OS
-    # reclaims everything. ~5-8s startup overhead per model type is negligible
-    # compared to training time. See mup_base_sweep.py for the same pattern.
+    # Each subprocess imports torch fresh, trains one model type's models
+    # across all budgets, writes result JSONs, and exits — the OS reclaims
+    # the CUDA allocator and any compiled-kernel caches. ~5-8s startup
+    # overhead per model type is negligible compared to training time.
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_results = {}
@@ -1862,7 +1733,6 @@ def main():
                         json.dump(all_results[tok_label], f, indent=2)
 
             del models_info
-            _reset_compile_caches()
 
     # ── Summary ─────────────────────────────────────────────────────────────
     sweep_time = time.time() - sweep_t0

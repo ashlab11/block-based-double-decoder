@@ -10,11 +10,6 @@ from torch.optim import AdamW
 from transformers import get_polynomial_decay_schedule_with_warmup, PreTrainedTokenizerFast
 import torch
 torch.set_float32_matmul_precision('high')
-# Workaround for PyTorch 2.6.0 inductor bug: quantization pattern matcher
-# crashes on non-quantized models. Disabling it is safe — we don't use quantization,
-# and core inductor optimizations (kernel fusion, triton codegen) still apply.
-import torch._inductor.config as _inductor_config
-_inductor_config.pattern_matcher = False
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
@@ -262,8 +257,11 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     assert (cfg.grad_accum_steps % world_size == 0) and (cfg.grad_accum_steps >= world_size), \
         "grad_accum_steps must be divisible by and geq than world_size"
 
-    if cfg.use_compile:
-        model = torch.compile(model, fullgraph=False, dynamic=False)
+    # We no longer wrap the whole model in torch.compile. flex_attention is
+    # compiled at module level in components/attention.py — that's the kernel
+    # that actually benefits, and keeping the outer model in eager avoids the
+    # FakeTensor / dynamo-guard pathologies that plagued the nested-compile path.
+    # cfg.use_compile is retained as a no-op for config-file backwards compat.
 
     # ── Data loading ─────────────────────────────────────────────────────
     use_streaming = cfg.total_tokens > 0

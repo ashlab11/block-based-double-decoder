@@ -26,10 +26,6 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evals.utils import load_model
 
-# Workaround for PyTorch inductor bug
-import torch._inductor.config as _inductor_config
-_inductor_config.pattern_matcher = False
-
 
 def _warmup(model, tokenizer, device, is_enc_dec, n=3):
     """Run a few forward passes to warm up CUDA and torch.compile."""
@@ -282,9 +278,9 @@ def benchmark_all(checkpoints, labels, prompts, device, num_gen_tokens=64,
         }
         print(f"    {np.mean(throughputs):.1f} ± {np.std(throughputs):.1f} tok/s")
 
-        # Peak memory — use shorter generation to avoid flex_attention recompile issues
+        # Peak memory measurement
         print(f"  Measuring peak memory...")
-        peak_mb = _measure_memory(model, tokenizer, device, is_enc_dec, prompts[-1], min(num_gen_tokens, 16))
+        peak_mb = _measure_memory(model, tokenizer, device, is_enc_dec, prompts[-1], num_gen_tokens)
         result["peak_memory_mb"] = peak_mb
         print(f"    Peak: {peak_mb:.0f} MB")
 

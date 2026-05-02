@@ -16,13 +16,24 @@ except ImportError:
 
 class CrossAttention(nn.Module):
     """Standard cross-attention: Q from decoder, K/V from encoder output."""
-    def __init__(self, dim, num_heads, seq_len=1024, mup=False):
+    def __init__(self, dim, num_heads, seq_len=1024, base_head_dim=0):
         super(CrossAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
-        self.attn_scale = 1.0 / np.sqrt(self.head_dim) if mup else None
+        # μP attention scale: √base_head_dim / head_dim. Collapses to standard
+        # 1/√head_dim when base_head_dim == head_dim (head_dim held constant
+        # across widths) — so existing base-width LR tunings transfer untouched.
+        # When head_dim grows past base_head_dim, the extra 1/√head_dim damping
+        # is what canonical μP requires for stable softmax across widths.
+        # Tensor Programs V (Yang & Hu 2022) §B. Falls back to SDPA's default
+        # 1/√head_dim when base_head_dim=0 (μP off, the safe default that also
+        # avoids sqrt(0) via short-circuit).
+        if base_head_dim:
+            self.attn_scale = np.sqrt(base_head_dim) / self.head_dim
+        else:
+            self.attn_scale = None
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)
@@ -60,7 +71,8 @@ class CrossAttention(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, seq_len = 1024, gating = False, mup = False, causal=True):
+    def __init__(self, dim, num_heads, seq_len = 1024, gating = False, causal=True,
+                 base_head_dim=0):
         super(SelfAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -69,7 +81,11 @@ class SelfAttention(nn.Module):
         self.seq_len = seq_len
         self.causal = causal #Causal only affects when block masks are NOT used
         self.gating = gating
-        self.attn_scale = 1.0 / np.sqrt(self.head_dim) if mup else None
+        # See CrossAttention.__init__ for the μP attention scale rationale.
+        if base_head_dim:
+            self.attn_scale = np.sqrt(base_head_dim) / self.head_dim
+        else:
+            self.attn_scale = None
         if self.gating:
             self.gater = nn.Sequential(nn.Linear(dim, dim), nn.Sigmoid()) 
         
@@ -114,7 +130,8 @@ class SelfAttention(nn.Module):
         return output
         
 class ComboAttention(nn.Module):
-    def __init__(self, dim, num_heads, seq_len = 1024, shared = True, logit_biases = False, mup = False):
+    def __init__(self, dim, num_heads, seq_len = 1024, shared = True, logit_biases = False,
+                 base_head_dim=0):
         super(ComboAttention, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -123,7 +140,11 @@ class ComboAttention(nn.Module):
         self.seq_len = seq_len
         self.shared = shared
         self.logit_biases = logit_biases
-        self.attn_scale = 1.0 / np.sqrt(self.head_dim) if mup else None
+        # See CrossAttention.__init__ for the μP attention scale rationale.
+        if base_head_dim:
+            self.attn_scale = np.sqrt(base_head_dim) / self.head_dim
+        else:
+            self.attn_scale = None
         
         if shared:
             self.kv_proj = nn.Linear(dim, 2 * dim, bias=False)

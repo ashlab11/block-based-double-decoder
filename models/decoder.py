@@ -17,12 +17,14 @@ class DecoderOnlyModel(nn.Module):
         label_pad_token_id: int = -100,
         init_strategy = "xavier_uniform",
         mup_base_dim: int = 0,
+        mup_base_head_dim: int = 0,
         **kwargs
     ):
         super(DecoderOnlyModel, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
         self.mup_base_dim = mup_base_dim
+        self.mup_base_head_dim = mup_base_head_dim
         mup = mup_base_dim > 0
         self.mup_mult = mup_base_dim / dim if mup else 1.0
         # With tied embedding (constant std init), readout grows like √dim from
@@ -34,7 +36,8 @@ class DecoderOnlyModel(nn.Module):
 
         # Encoder
         self.layers = nn.ModuleList([
-            BasicLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len, mup=mup, causal=True)
+            BasicLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len, causal=True,
+                       base_head_dim=mup_base_head_dim)
             for _ in range(num_layers)
         ])
         

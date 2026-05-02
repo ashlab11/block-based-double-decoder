@@ -22,12 +22,14 @@ class Double_Decoder(nn.Module):
         init_strategy = "xavier_uniform",
         gradient_checkpointing = False,
         mup_base_dim: int = 0,
+        mup_base_head_dim: int = 0,
         **kwargs
     ):
         super(Double_Decoder, self).__init__()
         self.dim = dim
         self.label_pad_token_id = label_pad_token_id
         self.mup_base_dim = mup_base_dim
+        self.mup_base_head_dim = mup_base_head_dim
         mup = mup_base_dim > 0
         self.mup_mult = mup_base_dim / dim if mup else 1.0
         # With tied embedding (constant std init), readout grows like √dim from
@@ -41,7 +43,8 @@ class Double_Decoder(nn.Module):
         # Encoder
         self.encoder_layers = nn.ModuleList([
             BasicLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
-                        use_checkpoint=gradient_checkpointing, mup=mup, causal=True)
+                        use_checkpoint=gradient_checkpointing, causal=True,
+                        base_head_dim=mup_base_head_dim)
             for _ in range(num_encoder_layers)
         ])
 
@@ -49,7 +52,8 @@ class Double_Decoder(nn.Module):
         self.decoder_layers = nn.ModuleList([
             ComboDecoderLayer(dim=dim, num_heads=num_heads, seq_len=seq_len, mlp_dim=mlp_dim,
                               shared=shared, logit_biases=logit_biases,
-                              use_checkpoint=gradient_checkpointing, mup=mup)
+                              use_checkpoint=gradient_checkpointing,
+                              base_head_dim=mup_base_head_dim)
             for _ in range(num_decoder_layers)
         ])
         

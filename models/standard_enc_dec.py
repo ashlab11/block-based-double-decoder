@@ -29,6 +29,7 @@ class StandardEncDec(nn.Module):
         init_strategy: str = "xavier_uniform",
         gradient_checkpointing: bool = False,
         mup_base_dim: int = 0,
+        mup_base_head_dim: int = 0,
         **kwargs  # absorb DD-specific args like shared, logit_biases
     ):
         super(StandardEncDec, self).__init__()
@@ -36,6 +37,7 @@ class StandardEncDec(nn.Module):
         self.label_pad_token_id = label_pad_token_id
         self.seq_len = seq_len
         self.mup_base_dim = mup_base_dim
+        self.mup_base_head_dim = mup_base_head_dim
         mup = mup_base_dim > 0
         self.mup_mult = mup_base_dim / dim if mup else 1.0
         # With tied embedding (constant std init), readout grows like √dim from
@@ -49,14 +51,16 @@ class StandardEncDec(nn.Module):
         # Encoder (standard causal self-attention)
         self.encoder_layers = nn.ModuleList([
             BasicLayer(dim=dim, num_heads=num_heads, mlp_dim=mlp_dim, seq_len=seq_len,
-                        use_checkpoint=gradient_checkpointing, mup=mup, causal=False)
+                        use_checkpoint=gradient_checkpointing, causal=False,
+                        base_head_dim=mup_base_head_dim)
             for _ in range(num_encoder_layers)
         ])
 
         # Decoder (standard self-attn + cross-attn + MLP)
         self.decoder_layers = nn.ModuleList([
             StandardDecoderLayer(dim=dim, num_heads=num_heads, seq_len=seq_len,
-                                mlp_dim=mlp_dim, use_checkpoint=gradient_checkpointing, mup=mup)
+                                mlp_dim=mlp_dim, use_checkpoint=gradient_checkpointing,
+                                base_head_dim=mup_base_head_dim)
             for _ in range(num_decoder_layers)
         ])
 

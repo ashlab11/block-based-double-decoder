@@ -42,6 +42,7 @@ import math
 import time
 import json
 import argparse
+import subprocess
 from pathlib import Path
 
 import torch
@@ -196,6 +197,14 @@ def _flatten_evals(evals_dict, prefix):
             flat[f"{prefix}/{eval_name}"] = metrics
     return flat
 MUP_BASE_DIM = 64
+# head_dim at base width. Under the current `num_heads = dim // 64` convention
+# (build_model below), head_dim = dim/num_heads = 64 at every width — so the μP
+# attention scale (√base_head_dim/head_dim, in components/attention.py) collapses
+# to standard 1/√head_dim and base-width tuning transfers untouched. If the
+# scaling protocol ever changes to widen heads instead of adding them (e.g.
+# fixed num_heads), set this to the head_dim that the model has at MUP_BASE_DIM
+# under that protocol so attention transfers properly. Tensor Programs V §B.
+MUP_BASE_HEAD_DIM = 64
 BASE_LR = 0.002  # fallback default; overridden per-arch from configs/mup_tuned.json
 TARGET_EFFECTIVE_BATCH = 512  # match configs/scaling.py — 512 seqs × 2048 tok = 1.05M tok/step
 
@@ -390,13 +399,16 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
     if grad_ckpt is None:
         grad_ckpt = dim >= 320
 
-    # When --no-mup is set, also drop the model's μP forward-pass multipliers
+    # When --no-mup is set, drop the model's μP forward-pass multipliers
     # (readout mult, μP attention scale) so the model trains as a vanilla
     # transformer at this width. mup_base_dim=0 makes mup=False inside each
     # model, which sets mup_readout_mult=1.0 and attn_scale=None (SDPA falls
-    # back to the standard 1/√head_dim — identical to the μP-on value, so
-    # only the readout changes).
+    # back to the standard 1/√head_dim). When MUP_ENABLED, mup_base_head_dim
+    # also flows through so the attention scale uses √base_head_dim/head_dim
+    # (the canonical μP form — identical to standard at base, providing the
+    # extra 1/√head_dim damping when head_dim grows past base_head_dim).
     mup_base = MUP_BASE_DIM if MUP_ENABLED else 0
+    mup_base_head = MUP_BASE_HEAD_DIM if MUP_ENABLED else 0
 
     if model_type == "dd":
         model = Double_Decoder(
@@ -404,7 +416,7 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
             num_encoder_layers=enc, num_decoder_layers=dec,
             seq_len=SEQ_LEN, shared=True, logit_biases=False,
             init_strategy="xavier_uniform", gradient_checkpointing=grad_ckpt,
-            mup_base_dim=mup_base)
+            mup_base_dim=mup_base, mup_base_head_dim=mup_base_head)
     elif model_type == "sed":
         # StandardDecoder layers are 16d² (self+cross+MLP) vs DD's 12d².
         # Use fewer decoder layers to match DD/Dec param count at same width:
@@ -415,12 +427,14 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_encoder_layers=enc, num_decoder_layers=sed_dec,
             seq_len=SEQ_LEN, init_strategy="xavier_uniform",
-            gradient_checkpointing=grad_ckpt, mup_base_dim=mup_base)
+            gradient_checkpointing=grad_ckpt,
+            mup_base_dim=mup_base, mup_base_head_dim=mup_base_head)
     elif model_type == "dec":
         model = DecoderOnlyModel(
             vocab_size=vocab_size, dim=dim, num_heads=num_heads,
             num_layers=enc + dec, seq_len=SEQ_LEN,
-            init_strategy="xavier_uniform", mup_base_dim=mup_base)
+            init_strategy="xavier_uniform",
+            mup_base_dim=mup_base, mup_base_head_dim=mup_base_head)
 
     model = model.to(device)
     if use_compile:
@@ -1356,6 +1370,11 @@ def main():
     parser.add_argument("--wandb-run-name-prefix", type=str, default=None,
                         help="Optional prefix for wandb run names "
                              "(useful for namespacing related sweeps).")
+    # Internal: subprocess isolation entrypoint. When set, this process trains
+    # only the specified model type and exits. Spawned by the parent process to
+    # get a clean torch.compile / dynamo / inductor state per model type.
+    parser.add_argument("--_subprocess-mt", dest="_subprocess_mt", default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.wandb_project:
@@ -1534,148 +1553,268 @@ def main():
                       f"est={est_sec/3600:.2f}h @35% MFU")
         return
 
-    # ── Run each model type sequentially ───────────────────────────────────
-    # Build/compile N models per type, train all budgets, then tear down.
-    # This keeps only N models in memory and in the compile cache at a time,
-    # avoiding the cache thrashing that kills MFU with all interleaved models.
+    # ── Run each model type in an isolated subprocess ────────────────────
+    # Process isolation is the only reliable way to keep torch.compile state
+    # (dynamo cache, inductor PyCodeCache, async-compile workers, FlexAttention
+    # HOP closures, allocator fragmentation) from accumulating across model
+    # types. Each subprocess imports torch fresh, compiles one model type's
+    # models, trains all budgets, writes result JSONs, and exits — the OS
+    # reclaims everything. ~5-8s startup overhead per model type is negligible
+    # compared to training time. See mup_base_sweep.py for the same pattern.
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     all_results = {}
     sweep_t0 = time.time()
 
-    # We need to know per-arch batch size before compile warmup if we want
-    # the warmup to use the same shape as training. Auto-tune is per-arch and
-    # per-model-type, but the dataloader is shared across the 3 model types
-    # within an arch — so we tune each model and take the *min* batch size.
-    # Result: one (batch_size, grad_accum) pair per (arch, all-3-types).
+    # If we are inside a subprocess (--_subprocess-mt set), run just that one
+    # model type directly (no further subprocess spawning).
+    if args._subprocess_mt is not None:
+        model_types = [args._subprocess_mt]
 
-    for mt in model_types:
-        needs_blocks = mt in ("dd", "sed")
-        print(f"\n{'#'*70}")
-        print(f"  Model type: {MODEL_TYPE_NAMES[mt]} ({mt})")
-        print(f"{'#'*70}")
+    # Spawn subprocesses when: compile is ON and we're in the parent process.
+    # No-compile mode is safe in-process (no dynamo state accumulation).
+    _use_subprocess = (use_compile and args._subprocess_mt is None)
 
-        # Build and compile models for this type
-        print(f"\n  Building {len(arch_list)} models:")
-        models_info = []
-        for name, arch in arch_list:
-            model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
-            ne = non_emb_param_count(model)
-            print(f"    {name:>6}: dim={arch['dim']:>4}  non_emb={ne:>11,}  "
-                  f"grad_ckpt={arch['dim'] >= 320}")
-            models_info.append({
-                "name": name, "model_type": mt, "arch": arch,
-                "model": model, "ne": ne, "needs_blocks": needs_blocks,
-            })
+    if _use_subprocess:
+        for mt in model_types:
+            print(f"\n{'#'*70}")
+            print(f"  Spawning subprocess: {MODEL_TYPE_NAMES[mt]} ({mt})")
+            print(f"{'#'*70}\n")
+            # Re-invoke this script with all original args plus --_subprocess-mt.
+            # Filter out --model-types and --_subprocess-mt from argv, we override.
+            cmd = [sys.executable, str(Path(__file__).resolve())]
+            i = 1
+            skip_next = False
+            while i < len(sys.argv):
+                arg = sys.argv[i]
+                if skip_next:
+                    skip_next = False
+                    i += 1
+                    continue
+                if arg in ("--model-types", "--_subprocess-mt"):
+                    skip_next = True
+                    i += 1
+                    continue
+                cmd.append(arg)
+                i += 1
+            cmd.extend(["--model-types", mt, "--_subprocess-mt", mt])
 
-        # Compile warmup (uses initial --batch-size; actual training batch is
-        # set per-arch below). torch.compile re-traces if shapes change, but
-        # with dynamic=False in eval and inductor's shape specialization, the
-        # warmup at one shape still pays off because backward graph + key
-        # kernels get cached.
-        if use_compile:
-            print(f"  Compiling...")
-            compile_t0 = time.time()
-            dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
-            # SED's create_masks_ED indexes blocks per-batch, so it needs
-            # blocks shape [batch_size]; DD wants split positions (1D).
-            dd_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
-            sed_blocks = torch.full((args.batch_size,), SEQ_LEN, device=device, dtype=torch.long)
-            for m in models_info:
-                blocks = sed_blocks if m["model_type"] == "sed" else dd_blocks
-                dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
-                               "blocks": blocks, "sft": False}
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    out = model_forward(m["model"], dummy_batch, m["needs_blocks"])
-                out["loss"].backward()
-                for p in m["model"].parameters():
-                    if p.grad is not None:
-                        p.grad = None
-            torch.cuda.synchronize()
-            print(f"  Compiled in {time.time() - compile_t0:.1f}s")
+            t0 = time.time()
+            result = subprocess.run(cmd)
+            elapsed = time.time() - t0
+            if result.returncode != 0:
+                print(f"\n  ERROR: subprocess for {mt} exited with code "
+                      f"{result.returncode} after {elapsed:.0f}s")
+                sys.exit(result.returncode)
+            print(f"\n  Subprocess {mt} completed in {elapsed/60:.1f} min")
 
-        # Per-arch batch sizing. We auto-tune once per arch (probing all
-        # model types, taking min) and store on the models_info entry so
-        # train_one_budget uses the right batch_size.
-        per_arch_bs = {}  # arch_name -> (batch_size, grad_accum)
-        if args.auto_batch_size:
-            print(f"\n  Auto-tuning batch size per arch (max={args.max_batch_size}):")
-            for m in models_info:
-                bs = auto_tune_batch_size(
-                    m["model"], vocab_size, SEQ_LEN, device,
-                    m["needs_blocks"], max_bs=args.max_batch_size,
-                    model_type=m["model_type"])
-                # Same arch+model_type may appear multiple times across model
-                # types in outer loop; we want the min across all 3 types,
-                # but inside this `for mt` we only see one. Track per (arch).
-                prior = per_arch_bs.get(m["name"])
-                per_arch_bs[m["name"]] = bs if prior is None else min(prior, bs)
-            # Per-arch effective batch: explicit CLI value wins; otherwise
-            # auto-scale from each model's non-emb param count so small
-            # models don't get starved of optimizer steps by the 300M-sized
-            # default. Build a {arch_name: ne} lookup from models_info. Only
-            # the N-cap is shown here — the actual target also gets a per-cell
-            # T-cap (--min-optimizer-steps) applied inside the budget loop,
-            # so cells with small total_tokens may end up with a lower target
-            # than printed below.
-            arch_ne = {m["name"]: m["ne"] for m in models_info}
-            for name, bs in per_arch_bs.items():
-                tgt = (args.target_effective_batch
-                       if args.target_effective_batch is not None
-                       else target_effective_batch_for(arch_ne[name]))
-                ga = grad_accum_for(bs, tgt)
-                src = "CLI" if args.target_effective_batch is not None else "auto/N-cap"
-                print(f"    {name:>6}: batch_size={bs:>3}  grad_accum={ga:>3}  "
-                      f"effective={bs*ga} seqs = {bs*ga*SEQ_LEN:,} tok/step  "
-                      f"(target={tgt} {src})")
-        else:
-            for name, _ in arch_list:
-                per_arch_bs[name] = args.batch_size
+            # Collect results written by the subprocess.
+            for tok_label, _ in budgets:
+                result_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
+                if result_path.exists():
+                    with open(result_path) as f:
+                        all_results.setdefault(tok_label, {}).update(json.load(f))
 
-        # Train all token budgets for this model type, per-arch.
-        # We can't co-resident-train models with different batch sizes through
-        # a single shared train_loader (loader yields one batch shape). So
-        # when auto-tuning produces different batch sizes per arch, we run
-        # one arch at a time inside this model_type loop.
-        if args.auto_batch_size and len(set(per_arch_bs.values())) > 1:
-            # Per-arch loop: re-create dataloader at each arch's batch size.
-            for m in models_info:
-                bs = per_arch_bs[m["name"]]
-                # Only this model_type's loader is needed (single-trainer path),
-                # but train_one_budget expects the full dict, so build it.
-                arch_loaders = {
-                    mt_: DataLoader(train_ds, batch_size=bs,
-                                    collate_fn=collators[mt_], drop_last=True)
-                    for mt_ in MODEL_TYPES
-                }
-                arch_eval_loaders = {
-                    mt_: DataLoader(eval_ds, batch_size=bs,
-                                    collate_fn=collators[mt_], drop_last=True)
-                    for mt_ in MODEL_TYPES
-                }
-                for tok_label, total_tokens in budgets:
-                    # Per-cell target: N-cap (critical batch) ∧ T-cap (step floor).
-                    # Has to be inside the budget loop because the T-cap
-                    # depends on this cell's total_tokens.
-                    if args.target_effective_batch is not None:
-                        tgt = args.target_effective_batch
-                    else:
-                        tgt = min(target_effective_batch_for(m["ne"]),
-                                  step_floor_cap(total_tokens, SEQ_LEN,
-                                                 args.min_optimizer_steps))
+    else:
+        # In-process path: either inside a subprocess (single model type) or
+        # compile is off (no dynamo state accumulation risk).
+
+        # We need to know per-arch batch size before compile warmup if we want
+        # the warmup to use the same shape as training. Auto-tune is per-arch
+        # and per-model-type, but the dataloader is shared across model types
+        # within an arch — so we tune each model and take the *min* batch size.
+        for mt in model_types:
+            needs_blocks = mt in ("dd", "sed")
+            print(f"\n{'#'*70}")
+            print(f"  Model type: {MODEL_TYPE_NAMES[mt]} ({mt})")
+            print(f"{'#'*70}")
+
+            # Build and compile models for this type
+            print(f"\n  Building {len(arch_list)} models:")
+            models_info = []
+            for name, arch in arch_list:
+                model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
+                ne = non_emb_param_count(model)
+                print(f"    {name:>6}: dim={arch['dim']:>4}  non_emb={ne:>11,}  "
+                      f"grad_ckpt={arch['dim'] >= 320}")
+                models_info.append({
+                    "name": name, "model_type": mt, "arch": arch,
+                    "model": model, "ne": ne, "needs_blocks": needs_blocks,
+                })
+
+            # Compile warmup (uses initial --batch-size; actual training batch is
+            # set per-arch below). torch.compile re-traces if shapes change, but
+            # with dynamic=False in eval and inductor's shape specialization, the
+            # warmup at one shape still pays off because backward graph + key
+            # kernels get cached.
+            if use_compile:
+                print(f"  Compiling...")
+                compile_t0 = time.time()
+                dummy_ids = torch.randint(0, vocab_size, (args.batch_size, SEQ_LEN), device=device)
+                # SED's create_masks_ED indexes blocks per-batch, so it needs
+                # blocks shape [batch_size]; DD wants split positions (1D).
+                dd_blocks = torch.sort(torch.randperm(SEQ_LEN - 2, device=device)[:4] + 1)[0]
+                sed_blocks = torch.full((args.batch_size,), SEQ_LEN, device=device, dtype=torch.long)
+                for m in models_info:
+                    blocks = sed_blocks if m["model_type"] == "sed" else dd_blocks
+                    dummy_batch = {"input_ids": dummy_ids, "labels": dummy_ids.clone(),
+                                   "blocks": blocks, "sft": False}
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        out = model_forward(m["model"], dummy_batch, m["needs_blocks"])
+                    out["loss"].backward()
+                    for p in m["model"].parameters():
+                        if p.grad is not None:
+                            p.grad = None
+                torch.cuda.synchronize()
+                print(f"  Compiled in {time.time() - compile_t0:.1f}s")
+
+            # Per-arch batch sizing. We auto-tune once per arch (probing all
+            # model types, taking min) and store on the models_info entry so
+            # train_one_budget uses the right batch_size.
+            per_arch_bs = {}  # arch_name -> (batch_size, grad_accum)
+            if args.auto_batch_size:
+                print(f"\n  Auto-tuning batch size per arch (max={args.max_batch_size}):")
+                for m in models_info:
+                    bs = auto_tune_batch_size(
+                        m["model"], vocab_size, SEQ_LEN, device,
+                        m["needs_blocks"], max_bs=args.max_batch_size,
+                        model_type=m["model_type"])
+                    prior = per_arch_bs.get(m["name"])
+                    per_arch_bs[m["name"]] = bs if prior is None else min(prior, bs)
+                arch_ne = {m["name"]: m["ne"] for m in models_info}
+                for name, bs in per_arch_bs.items():
+                    tgt = (args.target_effective_batch
+                           if args.target_effective_batch is not None
+                           else target_effective_batch_for(arch_ne[name]))
                     ga = grad_accum_for(bs, tgt)
-                    tok_per_step = bs * ga * SEQ_LEN
-                    total_steps = max(1, total_tokens // tok_per_step)
+                    src = "CLI" if args.target_effective_batch is not None else "auto/N-cap"
+                    print(f"    {name:>6}: batch_size={bs:>3}  grad_accum={ga:>3}  "
+                          f"effective={bs*ga} seqs = {bs*ga*SEQ_LEN:,} tok/step  "
+                          f"(target={tgt} {src})")
+            else:
+                for name, _ in arch_list:
+                    per_arch_bs[name] = args.batch_size
+
+            # Train all token budgets for this model type, per-arch.
+            if args.auto_batch_size and len(set(per_arch_bs.values())) > 1:
+                # Per-arch loop: re-create dataloader at each arch's batch size.
+                for m in models_info:
+                    bs = per_arch_bs[m["name"]]
+                    arch_loaders = {
+                        mt_: DataLoader(train_ds, batch_size=bs,
+                                        collate_fn=collators[mt_], drop_last=True)
+                        for mt_ in MODEL_TYPES
+                    }
+                    arch_eval_loaders = {
+                        mt_: DataLoader(eval_ds, batch_size=bs,
+                                        collate_fn=collators[mt_], drop_last=True)
+                        for mt_ in MODEL_TYPES
+                    }
+                    for tok_label, total_tokens in budgets:
+                        if args.target_effective_batch is not None:
+                            tgt = args.target_effective_batch
+                        else:
+                            tgt = min(target_effective_batch_for(m["ne"]),
+                                      step_floor_cap(total_tokens, SEQ_LEN,
+                                                     args.min_optimizer_steps))
+                        ga = grad_accum_for(bs, tgt)
+                        tok_per_step = bs * ga * SEQ_LEN
+                        total_steps = max(1, total_tokens // tok_per_step)
+                        print(f"\n  {'='*66}")
+                        print(f"    {mt} × {m['name']} × {tok_label} tokens  |  "
+                              f"{total_steps} steps  |  bs={bs} ga={ga} (target={tgt})")
+                        print(f"  {'='*66}\n")
+                        base_cfg = {
+                            "arch_set": args.arch_set, "token_set": args.token_set,
+                            "boundary_strategy": args.boundary_strategy,
+                            "batch_size": bs, "grad_accum": ga,
+                            "total_tokens": total_tokens,
+                            "tokens_per_step": tok_per_step,
+                            "total_steps": total_steps,
+                            "compile": use_compile,
+                            "auto_batch_size": args.auto_batch_size,
+                            "lr": (LR_OVERRIDE if LR_OVERRIDE is not None
+                                   else base_lr_for(mt)),
+                            "lr_source": ("CLI --peak-lr" if LR_OVERRIDE is not None
+                                          else "configs/mup_tuned.json"
+                                          if mt in TUNED_LRS else "BASE_LR fallback"),
+                            "run_sft": args.run_sft,
+                            "sft_tokens": args.sft_tokens if args.run_sft else None,
+                            "eval_suite": args.eval_suite,
+                            "mup_base_dim": MUP_BASE_DIM,
+                            "mup_enabled": MUP_ENABLED,
+                        }
+                        wandb_runs = _init_wandb_runs(mt, [m], tok_label, base_cfg)
+                        try:
+                            results = train_one_budget(
+                                [m], tok_label, total_tokens, bs, ga,
+                                arch_loaders, arch_eval_loaders, device, gpu_tflops,
+                                args.eval_batches,
+                                output_dir=args.output_dir,
+                                mid_eval_points=args.mid_eval_points,
+                                run_full_eval=not args.skip_full_eval,
+                                eval_suite=args.eval_suite,
+                                eval_max_examples=args.eval_max_examples,
+                                eval_data_file=args.eval_data_file,
+                                tokenizer=tokenizer,
+                                run_sft=args.run_sft,
+                                sft_train_file=args.sft_train_file,
+                                sft_eval_file=args.sft_eval_file,
+                                sft_tokens=args.sft_tokens,
+                                sft_lr=args.sft_lr,
+                                sft_grad_accum=args.sft_grad_accum,
+                                wandb_runs=wandb_runs,
+                                save_checkpoints=args.save_checkpoints)
+                        finally:
+                            _finish_wandb_runs(wandb_runs)
+                        all_results.setdefault(tok_label, {}).update(results)
+                        out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
+                        with open(out_path, "w") as f:
+                            json.dump(all_results[tok_label], f, indent=2)
+            else:
+                # All archs share one batch size — co-resident path (faster).
+                bs = min(per_arch_bs.values()) if per_arch_bs else args.batch_size
+                if args.auto_batch_size:
+                    run_loaders = {
+                        mt_: DataLoader(train_ds, batch_size=bs,
+                                        collate_fn=collators[mt_], drop_last=True)
+                        for mt_ in MODEL_TYPES
+                    }
+                    run_eval_loaders = {
+                        mt_: DataLoader(eval_ds, batch_size=bs,
+                                        collate_fn=collators[mt_], drop_last=True)
+                        for mt_ in MODEL_TYPES
+                    }
+                else:
+                    run_loaders = train_loaders
+                    run_eval_loaders = eval_loaders
+                for tok_label, total_tokens in budgets:
+                    if args.auto_batch_size:
+                        if args.target_effective_batch is not None:
+                            tgt = args.target_effective_batch
+                        else:
+                            n_cap = max(target_effective_batch_for(m["ne"])
+                                        for m in models_info)
+                            tgt = min(n_cap, step_floor_cap(total_tokens, SEQ_LEN,
+                                                            args.min_optimizer_steps))
+                        ga = grad_accum_for(bs, tgt)
+                    else:
+                        ga = args.grad_accum
+                        tgt = bs * ga
+                    tokens_per_step = bs * ga * SEQ_LEN
+                    total_steps = max(1, total_tokens // tokens_per_step)
+                    total_micro = total_steps * ga
                     print(f"\n  {'='*66}")
-                    print(f"    {mt} × {m['name']} × {tok_label} tokens  |  "
-                          f"{total_steps} steps  |  bs={bs} ga={ga} (target={tgt})")
+                    print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
+                          f"{total_micro} micro-batches  |  bs={bs} ga={ga} "
+                          f"(target={tgt})")
                     print(f"  {'='*66}\n")
                     base_cfg = {
                         "arch_set": args.arch_set, "token_set": args.token_set,
                         "boundary_strategy": args.boundary_strategy,
                         "batch_size": bs, "grad_accum": ga,
                         "total_tokens": total_tokens,
-                        "tokens_per_step": tok_per_step,
+                        "tokens_per_step": tokens_per_step,
                         "total_steps": total_steps,
                         "compile": use_compile,
                         "auto_batch_size": args.auto_batch_size,
@@ -1689,12 +1828,13 @@ def main():
                         "eval_suite": args.eval_suite,
                         "mup_base_dim": MUP_BASE_DIM,
                         "mup_enabled": MUP_ENABLED,
+                        "co_resident": True,
                     }
-                    wandb_runs = _init_wandb_runs(mt, [m], tok_label, base_cfg)
+                    wandb_runs = _init_wandb_runs(mt, models_info, tok_label, base_cfg)
                     try:
                         results = train_one_budget(
-                            [m], tok_label, total_tokens, bs, ga,
-                            arch_loaders, arch_eval_loaders, device, gpu_tflops,
+                            models_info, tok_label, total_tokens, bs, ga,
+                            run_loaders, run_eval_loaders, device, gpu_tflops,
                             args.eval_batches,
                             output_dir=args.output_dir,
                             mid_eval_points=args.mid_eval_points,
@@ -1717,111 +1857,9 @@ def main():
                     out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
                     with open(out_path, "w") as f:
                         json.dump(all_results[tok_label], f, indent=2)
-        else:
-            # All archs share one batch size — co-resident path (faster).
-            # Use the min so the smallest-tolerated arch sets the shape.
-            bs = min(per_arch_bs.values()) if per_arch_bs else args.batch_size
-            if args.auto_batch_size:
-                run_loaders = {
-                    mt_: DataLoader(train_ds, batch_size=bs,
-                                    collate_fn=collators[mt_], drop_last=True)
-                    for mt_ in MODEL_TYPES
-                }
-                run_eval_loaders = {
-                    mt_: DataLoader(eval_ds, batch_size=bs,
-                                    collate_fn=collators[mt_], drop_last=True)
-                    for mt_ in MODEL_TYPES
-                }
-            else:
-                run_loaders = train_loaders
-                run_eval_loaders = eval_loaders
-            for tok_label, total_tokens in budgets:
-                # Co-resident: one effective batch for the whole co-resident
-                # group. Take max of per-arch N-caps (so the largest model
-                # still gets a reasonable batch — smaller co-resident models
-                # tolerate the larger batch with a bit of step-count loss),
-                # then apply the T-cap floor for THIS cell so the LR schedule
-                # still has room. Per-cell because T-cap depends on this
-                # cell's total_tokens.
-                if args.auto_batch_size:
-                    if args.target_effective_batch is not None:
-                        tgt = args.target_effective_batch
-                    else:
-                        n_cap = max(target_effective_batch_for(m["ne"])
-                                    for m in models_info)
-                        tgt = min(n_cap, step_floor_cap(total_tokens, SEQ_LEN,
-                                                        args.min_optimizer_steps))
-                    ga = grad_accum_for(bs, tgt)
-                else:
-                    ga = args.grad_accum
-                    tgt = bs * ga
-                tokens_per_step = bs * ga * SEQ_LEN
-                total_steps = max(1, total_tokens // tokens_per_step)
-                total_micro = total_steps * ga
-                print(f"\n  {'='*66}")
-                print(f"    {mt} × {tok_label} tokens  |  {total_steps} steps  |  "
-                      f"{total_micro} micro-batches  |  bs={bs} ga={ga} "
-                      f"(target={tgt})")
-                print(f"  {'='*66}\n")
-                base_cfg = {
-                    "arch_set": args.arch_set, "token_set": args.token_set,
-                    "boundary_strategy": args.boundary_strategy,
-                    "batch_size": bs, "grad_accum": ga,
-                    "total_tokens": total_tokens,
-                    "tokens_per_step": tokens_per_step,
-                    "total_steps": total_steps,
-                    "compile": use_compile,
-                    "auto_batch_size": args.auto_batch_size,
-                    "lr": (LR_OVERRIDE if LR_OVERRIDE is not None
-                           else base_lr_for(mt)),
-                    "lr_source": ("CLI --peak-lr" if LR_OVERRIDE is not None
-                                  else "configs/mup_tuned.json"
-                                  if mt in TUNED_LRS else "BASE_LR fallback"),
-                    "run_sft": args.run_sft,
-                    "sft_tokens": args.sft_tokens if args.run_sft else None,
-                    "eval_suite": args.eval_suite,
-                    "mup_base_dim": MUP_BASE_DIM,
-                    "mup_enabled": MUP_ENABLED,
-                    "co_resident": True,
-                }
-                wandb_runs = _init_wandb_runs(mt, models_info, tok_label, base_cfg)
-                try:
-                    results = train_one_budget(
-                        models_info, tok_label, total_tokens, bs, ga,
-                        run_loaders, run_eval_loaders, device, gpu_tflops,
-                        args.eval_batches,
-                        output_dir=args.output_dir,
-                        mid_eval_points=args.mid_eval_points,
-                        run_full_eval=not args.skip_full_eval,
-                        eval_suite=args.eval_suite,
-                        eval_max_examples=args.eval_max_examples,
-                        eval_data_file=args.eval_data_file,
-                        tokenizer=tokenizer,
-                        run_sft=args.run_sft,
-                        sft_train_file=args.sft_train_file,
-                        sft_eval_file=args.sft_eval_file,
-                        sft_tokens=args.sft_tokens,
-                        sft_lr=args.sft_lr,
-                        sft_grad_accum=args.sft_grad_accum,
-                        wandb_runs=wandb_runs,
-                        save_checkpoints=args.save_checkpoints)
-                finally:
-                    _finish_wandb_runs(wandb_runs)
-                all_results.setdefault(tok_label, {}).update(results)
-                out_path = out_dir / f"parallel_{tok_label}tok_{arch_tag}_results.json"
-                with open(out_path, "w") as f:
-                    json.dump(all_results[tok_label], f, indent=2)
 
-        # Wipe compile/mask caches before the next model type. Without
-        # this, DD's compiled flex_attention HOP graphs (with closure
-        # cells holding DD-era block_ids tensors) sit in dynamo's cache
-        # and can match guards on SED's first variable-shape eval call,
-        # producing a stale-tensor-reference CUDA IMA. Observed
-        # concretely as SED bpb crashing right after DD's full cycle
-        # finished. The reset costs ~one recompile on SED's first
-        # batch, much cheaper than a debug rerun.
-        del models_info
-        _reset_compile_caches()
+            del models_info
+            _reset_compile_caches()
 
     # ── Summary ─────────────────────────────────────────────────────────────
     sweep_time = time.time() - sweep_t0

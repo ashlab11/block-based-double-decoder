@@ -257,11 +257,8 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
     assert (cfg.grad_accum_steps % world_size == 0) and (cfg.grad_accum_steps >= world_size), \
         "grad_accum_steps must be divisible by and geq than world_size"
 
-    # We no longer wrap the whole model in torch.compile. flex_attention is
-    # compiled at module level in components/attention.py — that's the kernel
-    # that actually benefits, and keeping the outer model in eager avoids the
-    # FakeTensor / dynamo-guard pathologies that plagued the nested-compile path.
-    # cfg.use_compile is retained as a no-op for config-file backwards compat.
+    if cfg.use_compile:
+        model = torch.compile(model, fullgraph=False, dynamic=False)
 
     # ── Data loading ─────────────────────────────────────────────────────
     use_streaming = cfg.total_tokens > 0

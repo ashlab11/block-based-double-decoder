@@ -97,12 +97,12 @@ def eval_attention_weights(model, tokenizer, device, is_enc_dec,
                 enc_key = enc_key.transpose(1, 2)
                 enc_value = enc_value.transpose(1, 2)
 
-                from torch.nn.attention.flex_attention import flex_attention
                 try:
                     from flash_attn import flash_attn_func
                     has_flash = True
                 except ImportError:
                     has_flash = False
+                from components.attention import _to_attn_mask
 
                 use_flash = block_masks is None and has_flash
                 if use_flash:
@@ -114,8 +114,10 @@ def eval_attention_weights(model, tokenizer, device, is_enc_dec,
                 elif block_masks is not None:
                     self_mask = block_masks.get("self_mask")
                     cross_mask = block_masks.get("cross_mask")
-                    dec_output, dec_lse = flex_attention(query, dec_key, dec_value, block_mask=self_mask, return_lse=True)
-                    enc_output, enc_lse = flex_attention(query, enc_key, enc_value, block_mask=cross_mask, return_lse=True)
+                    dec_output, dec_lse = combo_attn._attn_with_lse(
+                        query, dec_key, dec_value, _to_attn_mask(self_mask), default_causal=True)
+                    enc_output, enc_lse = combo_attn._attn_with_lse(
+                        query, enc_key, enc_value, _to_attn_mask(cross_mask), default_causal=False)
                 else:
                     return original_fn(x, encoder_inputs, block_masks, decoder_input_positions)
 

@@ -575,7 +575,7 @@ def _gen_enc_dec(model, tokenizer, prompt, max_new_tokens, device, temperature, 
 
     # masks=None routes through the layer's flash-attn (or manual SDPA) inference
     # branch, which natively computes causal-self + full-cross — same semantics as
-    # create_inference_masks but without rebuilding a BlockMask every decode step.
+    # create_inference_masks but without rebuilding a mask every decode step.
     for _ in range(max_new_tokens):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits = model.decode(dec_ids, enc_out, None, dec_pos)

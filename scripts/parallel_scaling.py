@@ -325,9 +325,8 @@ def build_model(model_type, arch, vocab_size, device, use_compile=False,
             mup_base_dim=mup_base, mup_base_head_dim=mup_base_head)
 
     model = model.to(device)
-    # Outer-model compile removed; flex_attention is compiled at module level
-    # in components/attention.py. use_compile is accepted as a no-op to keep
-    # callers compatible.
+    if use_compile:
+        model = torch.compile(model)
     return model
 
 

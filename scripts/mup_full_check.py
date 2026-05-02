@@ -46,13 +46,13 @@ QK_STD_OK = (0.5, 5.0)
 ENTROPY_NEAR_UNIFORM_FRAC = 0.85
 
 
-# ── AttnProbe: patch SDPA + flex_attention to log pre-softmax stats ─────────
+# ── AttnProbe: patch SDPA + ComboAttention's manual path to log pre-softmax stats ─
 
 class AttnProbe:
     def __init__(self):
         self.qk_stds, self.qk_means, self.entropies, self.scales = [], [], [], []
         self._orig_sdpa = None
-        self._orig_flex = None
+        self._orig_attn_with_lse = None
 
     def reset(self):
         self.qk_stds.clear(); self.qk_means.clear()
@@ -69,6 +69,8 @@ class AttnProbe:
                 qk = qk.masked_fill(m, float('-inf'))
             elif attn_mask is not None and attn_mask.dtype != torch.bool:
                 qk = qk + attn_mask
+            elif attn_mask is not None and attn_mask.dtype == torch.bool:
+                qk = qk.masked_fill(~attn_mask, float('-inf'))
             finite = qk[qk.isfinite()]
             if finite.numel():
                 self.qk_stds.append(finite.std().item())
@@ -86,25 +88,28 @@ class AttnProbe:
         return self._orig_sdpa(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
                                is_causal=is_causal, scale=scale, **kw)
 
-    def _flex_wrap(self, q, k, v, score_mod=None, block_mask=None,
-                   scale=None, return_lse=False, **kw):
-        self._record(q, k, scale, is_causal=False)
-        return self._orig_flex(q, k, v, score_mod=score_mod, block_mask=block_mask,
-                               scale=scale, return_lse=return_lse, **kw)
+    def _attn_with_lse_wrap(probe_self):
+        # ComboAttention._attn_with_lse is a bound method; wrap it so we can
+        # capture stats from the manual matmul path that bypasses SDPA.
+        def wrapped(self, query, key, value, mask, default_causal):
+            scale = self.attn_scale
+            probe_self._record(query, key, scale, is_causal=(mask is None and default_causal), attn_mask=mask)
+            return probe_self._orig_attn_with_lse(self, query, key, value, mask, default_causal)
+        return wrapped
 
     def __enter__(self):
         self.reset()
         self._orig_sdpa = F.scaled_dot_product_attention
         F.scaled_dot_product_attention = self._sdpa_wrap
-        import components.attention as ca
-        self._orig_flex = ca.flex_attention
-        ca.flex_attention = self._flex_wrap
+        from components.attention import ComboAttention
+        self._orig_attn_with_lse = ComboAttention._attn_with_lse
+        ComboAttention._attn_with_lse = self._attn_with_lse_wrap()
         return self
 
     def __exit__(self, *exc):
         F.scaled_dot_product_attention = self._orig_sdpa
-        import components.attention as ca
-        ca.flex_attention = self._orig_flex
+        from components.attention import ComboAttention
+        ComboAttention._attn_with_lse = self._orig_attn_with_lse
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

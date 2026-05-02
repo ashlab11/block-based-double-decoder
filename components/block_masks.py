@@ -1,68 +1,70 @@
+"""Dense boolean attention masks for SDPA.
+
+Each builder returns a dict of bool tensors where True = "attend to this
+position". Shapes are chosen so they broadcast cleanly to the [B, H, L_q, L_kv]
+shape SDPA's `attn_mask` expects:
+
+  - [L_q, L_kv]              shared across batch and heads
+  - [B, L_q, L_kv]           per-batch, shared across heads (unsqueeze H in caller)
+
+Cross-attention adds a sink at kv=0 to avoid all-False rows (which would
+produce -inf softmax). This only matters for the first cross-attn block of
+the decoder, which never actually occurs in SFT/Inference (there is always
+context).
+"""
+
 import torch
-from torch.nn.attention.flex_attention import create_block_mask
-
-# To avoid -inf rows (a token that attends to nothing) the cross mask always
-# admits the first token. Only matters for the very first cross-attn block of
-# the decoder, which never actually occurs in SFT/Inference (there is always
-# context).
 
 
-def _precompute_block_ids(blocks, seq_len, device):
+def _block_ids(blocks, seq_len, device):
     blocks = blocks.to(device=device, dtype=torch.int64)
     pos = torch.arange(seq_len, device=device, dtype=torch.int64)
     return torch.bucketize(pos, blocks, right=True)
 
 
-def causal_all_mask(b, h, q_idx, kv_idx):
-    return kv_idx <= q_idx
-
-
-def allow_all_mask(b, h, q_idx, kv_idx):
-    return torch.ones_like(q_idx, dtype=torch.bool)
-
-
 def create_pretrain_masks(blocks, seq_len, device):
-    block_ids = _precompute_block_ids(blocks, seq_len, device)
+    """DD pretraining: per-token block boundaries shared across the batch.
+    self_mask: causal AND same-block.
+    cross_mask: kv in a strictly earlier block (with kv=0 sink).
+    Both [L, L]."""
+    block_ids = _block_ids(blocks, seq_len, device)
+    q_idx = torch.arange(seq_len, device=device).unsqueeze(1)
+    kv_idx = torch.arange(seq_len, device=device).unsqueeze(0)
 
-    def pt_self_mask(b, h, q, kv):
-        return (q >= kv) & (block_ids[q] == block_ids[kv])
+    causal = q_idx >= kv_idx
+    same_blk = block_ids.unsqueeze(1) == block_ids.unsqueeze(0)
+    self_mask = causal & same_blk
 
-    def pt_cross_mask(b, h, q, kv):
-        first_token = kv == 0
-        return (block_ids[kv] < block_ids[q]) | first_token
+    in_past_block = block_ids.unsqueeze(0) < block_ids.unsqueeze(1)
+    first_token = (kv_idx == 0).expand(seq_len, seq_len)
+    cross_mask = in_past_block | first_token
 
-    self_mask = create_block_mask(
-        pt_self_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
-    )
-    cross_mask = create_block_mask(
-        pt_cross_mask, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device,
-    )
     return {"self_mask": self_mask, "cross_mask": cross_mask}
 
 
 def create_sft_masks(batch_size, blocks, device, enc_len, dec_len):
-    sft_block_ids = blocks
+    """DD SFT: causal self-attention + per-batch context-length cross gate.
+    self_mask: [L_dec, L_dec] causal.
+    cross_mask: [B, L_dec, L_enc]."""
+    blocks = blocks.to(device=device, dtype=torch.int64)
+    q_dec = torch.arange(dec_len, device=device).unsqueeze(1)
+    kv_dec = torch.arange(dec_len, device=device).unsqueeze(0)
+    self_mask = kv_dec <= q_dec
 
-    def sft_cross_mask(b, h, q, kv):
-        return kv < sft_block_ids[b]
+    kv_enc = torch.arange(enc_len, device=device).unsqueeze(0)
+    pad_per_batch = kv_enc < blocks.unsqueeze(1)
+    cross_mask = pad_per_batch.unsqueeze(1).expand(batch_size, dec_len, enc_len)
 
-    causal_mask = create_block_mask(
-        causal_all_mask, B=batch_size, H=None, Q_LEN=dec_len, KV_LEN=dec_len, device=device,
-    )
-    cross_mask = create_block_mask(
-        sft_cross_mask, B=batch_size, H=None, Q_LEN=dec_len, KV_LEN=enc_len, device=device,
-    )
-    return {"self_mask": causal_mask, "cross_mask": cross_mask}
+    return {"self_mask": self_mask, "cross_mask": cross_mask}
 
 
 def create_inference_masks(device, enc_len, dec_len):
-    causal_mask = create_block_mask(
-        causal_all_mask, B=None, H=None, Q_LEN=dec_len, KV_LEN=dec_len, device=device,
-    )
-    allow_mask = create_block_mask(
-        allow_all_mask, B=None, H=None, Q_LEN=dec_len, KV_LEN=enc_len, device=device,
-    )
-    return {"self_mask": causal_mask, "cross_mask": allow_mask}
+    """Inference-time: causal self, full cross. Both [L_q, L_kv]."""
+    q_idx = torch.arange(dec_len, device=device).unsqueeze(1)
+    kv_idx = torch.arange(dec_len, device=device).unsqueeze(0)
+    self_mask = kv_idx <= q_idx
+    cross_mask = torch.ones(dec_len, enc_len, device=device, dtype=torch.bool)
+    return {"self_mask": self_mask, "cross_mask": cross_mask}
 
 
 def create_masks(batch_size, blocks, device, input_ids, encoder_input_ids, decoder_input_ids, sft):
@@ -74,21 +76,19 @@ def create_masks(batch_size, blocks, device, input_ids, encoder_input_ids, decod
     return create_pretrain_masks(blocks, input_ids.shape[1], device)
 
 
-# blocks[b] is a per-batch encoder length here (not per-sequence split positions
-# as in create_pretrain_masks). The mask only needs to gate out padded encoder
-# positions on both encoder-self and decoder-cross paths.
 def create_masks_ED(batch_size, blocks, device, encoder_input_ids, decoder_input_ids):
-    enc_lens = blocks
+    """SED (T5-style): blocks[b] is a per-batch encoder length. Both encoder
+    self-attention and decoder cross-attention just gate out padded encoder
+    positions. Returns ({'self_mask'}, {'cross_mask'}) to match SED.forward's
+    unpacking — the encoder dict only carries 'self_mask', the decoder dict
+    only 'cross_mask'."""
+    enc_lens = blocks.to(device=device, dtype=torch.int64)
+    enc_len = encoder_input_ids.shape[1]
+    dec_len = decoder_input_ids.shape[1]
+    kv_idx = torch.arange(enc_len, device=device).unsqueeze(0)
+    pad_mask = kv_idx < enc_lens.unsqueeze(1)  # [B, L_enc]
 
-    def mask(b, h, q_idx, kv_idx):
-        return kv_idx < enc_lens[b]
+    enc_self = pad_mask.unsqueeze(1).expand(batch_size, enc_len, enc_len)
+    cross = pad_mask.unsqueeze(1).expand(batch_size, dec_len, enc_len)
 
-    enc_mask = create_block_mask(
-        mask, B=batch_size, H=None,
-        Q_LEN=encoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device,
-    )
-    cross_mask = create_block_mask(
-        mask, B=batch_size, H=None,
-        Q_LEN=decoder_input_ids.shape[1], KV_LEN=encoder_input_ids.shape[1], device=device,
-    )
-    return {"self_mask": enc_mask}, {"cross_mask": cross_mask}
+    return {"self_mask": enc_self}, {"cross_mask": cross}

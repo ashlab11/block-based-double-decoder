@@ -248,9 +248,10 @@ def main():
     print(f"  Model type: {model_type}")
     print(f"  Parameters: {param_count / 1e6:.1f}M")
 
-    # Outer-model compile removed; flex_attention is compiled at module level
-    # in components/attention.py. --no-compile is preserved as a no-op for
-    # backwards compatibility with existing scripts.
+    if device.type == "cuda" and not args.no_compile:
+        print(f"  Compiling model with torch.compile...")
+        model = torch.compile(model, fullgraph=False, dynamic=False)
+        print(f"  Compiled (first forward will be slower due to tracing)")
     print()
 
     eval_results = run_evals_on_model(

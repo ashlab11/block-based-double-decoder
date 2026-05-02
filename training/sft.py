@@ -68,8 +68,7 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
         model, hparams = build_model(cfg, tokenizer.vocab_size)
 
     model = model.to(device)
-    # Outer-model compile removed; flex_attention is compiled at the kernel
-    # level in components/attention.py instead.
+    model = torch.compile(model, fullgraph=False, dynamic=False)
     ds = load_dataset("json", data_files=cfg.train_file, split="train")
     eval_ds = load_dataset("json", data_files=cfg.eval_file, split="train")
 

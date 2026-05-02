@@ -13,6 +13,20 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torchtune.modules import RotaryPositionalEmbeddings
+
+# Unrelated to flex_attention / our refactor: PyTorch 2.6.x's inductor
+# quantization pattern matcher mis-matches SDPA calls during *inference*
+# compile (is_inference=True post-grad passes) and crashes on
+# match.kwargs["scales"].meta["val"] when scale= is a Python float —
+# AttributeError: 'float' object has no attribute 'meta'. The training
+# compile path doesn't run this matcher and is unaffected. We disable it
+# globally here so eval-mode compile paths (run_evals, benchmark_efficiency,
+# sanity checks, post-training eval in parallel_scaling) don't trip on it.
+# Safe to leave on always — we don't use quantization, and core inductor
+# fusion / triton codegen is unaffected.
+import torch._inductor.config as _ic
+_ic.pattern_matcher = False
+
 try:
     from flash_attn import flash_attn_func
     HAS_FLASH_ATTN = True

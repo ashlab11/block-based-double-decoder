@@ -33,11 +33,12 @@ override the per-arch WD. Format:
      "dec": {...}}
 
 Usage:
-    # Default sweep (5 WDs × 3 archs = 15 cells; ~1 hr on one GPU):
+    # Default sweep (5 WDs × 3 archs × 2 seeds = 30 cells):
     python scripts/wd_sweep.py --archs dd,sed,dec
 
-    # Subset / debug:
-    python scripts/wd_sweep.py --archs dd --wds 0.0,0.05,0.1 --tokens 10000000
+    # Single-seed quick run (debug / smoke test):
+    python scripts/wd_sweep.py --archs dd --wds 0.0,0.05,0.1 \
+        --seeds 0 --tokens 10000000
 
     # Dry-run (planning only, no training):
     python scripts/wd_sweep.py --dry-run
@@ -70,6 +71,11 @@ DEFAULT_TOKENS = 50_000_000
 # the LR sweep's compute budget over again.
 DEFAULT_WDS = [0.0, 0.01, 0.05, 0.1, 0.2]
 
+# Two seeds matches mup_base_sweep.DEFAULT_SEEDS so each (arch, wd) cell is
+# averaged over the same noise budget the LR sweep used. The argmin operates
+# on seed-mean loss rather than any single-seed loss.
+DEFAULT_SEEDS = [0, 1]
+
 OUT_DIR = PROJECT_ROOT / "checkpoints" / "wd_sweep"
 TUNED_LR_PATH = PROJECT_ROOT / "configs" / "mup_tuned.json"
 TUNED_WD_PATH = PROJECT_ROOT / "configs" / "wd_tuned.json"
@@ -100,9 +106,9 @@ def _load_tuned_lrs():
     return out
 
 
-def _train_one(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
+def _train_one(model_type, dim, enc, dec, tokens, lr, wd, seed, run_tag,
                dry_run=False, use_compile=True):
-    """Train a single (model_type, wd) cell in an isolated subprocess.
+    """Train a single (model_type, wd, seed) cell in an isolated subprocess.
 
     Same process-isolation rationale as mup_base_sweep._train_one: torch.compile
     state, FlexAttention HOP closures, and inductor caches accumulate across
@@ -110,7 +116,8 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
     """
     if dry_run:
         return {"model_type": model_type, "dim": dim, "lr": lr, "wd": wd,
-                "tokens": tokens, "final_eval_loss": None, "dry_run": True}
+                "seed": seed, "tokens": tokens,
+                "final_eval_loss": None, "dry_run": True}
 
     result_path = OUT_DIR / run_tag / "result.json"
     result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +132,7 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
            "--single-dec", str(dec),
            "--single-lr", repr(lr),
            "--single-wd", repr(wd),
+           "--single-seed", str(seed),
            "--single-tokens", str(tokens),
            "--single-run-tag", run_tag,
            "--single-result-path", str(result_path)]
@@ -132,13 +140,13 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
         cmd.append("--no-compile")
 
     print(f"  → subprocess: {model_type} dim={dim} lr={lr:.2e} wd={wd:.3g} "
-          f"tokens={tokens:,}")
+          f"seed={seed} tokens={tokens:,}")
     subprocess.run(cmd, check=True)
     return json.loads(result_path.read_text())
 
 
-def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
-                           result_path, use_compile=True):
+def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, seed,
+                           run_tag, result_path, use_compile=True):
     """Subprocess body. Sets parallel_scaling module globals for this single
     cell, builds the model, runs train_one_budget, writes result JSON, exits.
     """
@@ -148,6 +156,12 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
     from transformers import PreTrainedTokenizerFast
 
     import scripts.parallel_scaling as ps
+
+    # Match mup_base_sweep._run_single_in_process seeding so seed=0/1 here
+    # produce comparable noise to the LR sweep cells averaged into mup_tuned.json.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = PreTrainedTokenizerFast(
@@ -182,16 +196,19 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
         "json",
         data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_packed.jsonl"),
         split="train", streaming=True)
+    # Per-seed shuffle so seed=0 and seed=1 see different token orderings.
+    train_ds = train_ds.shuffle(seed=seed, buffer_size=10_000)
     eval_ds = load_dataset(
         "json",
         data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_eval_packed.jsonl"),
         split="train")
 
+    collator_seed = 42 + seed * 10_000
     loaders = {
         mt: DataLoader(train_ds, batch_size=bs,
                        collate_fn=ps.build_pretrain_collator(
                            mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
-                           global_seed=42),
+                           global_seed=collator_seed),
                        drop_last=True)
         for mt in ps.MODEL_TYPES
     }
@@ -199,7 +216,7 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
         mt: DataLoader(eval_ds, batch_size=bs,
                        collate_fn=ps.build_pretrain_collator(
                            mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
-                           global_seed=42),
+                           global_seed=collator_seed),
                        drop_last=True)
         for mt in ps.MODEL_TYPES
     }
@@ -224,7 +241,7 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
 
     result = {
         "model_type": model_type, "dim": dim, "enc": enc, "dec": dec,
-        "lr": lr, "wd": wd, "tokens": tokens,
+        "lr": lr, "wd": wd, "seed": seed, "tokens": tokens,
         "final_eval_loss": run.get("final_eval_loss"),
         "final_eval_ppl": run.get("final_eval_ppl"),
         "non_emb_params": run.get("non_emb_params"),
@@ -233,28 +250,37 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, wd, run_tag,
     Path(result_path).write_text(json.dumps(result, indent=2))
 
 
-def _sweep(archs, tuned_lrs, wds, dim, enc, dec, tokens, dry_run=False,
-           use_compile=True):
-    """Sweep WD per arch at the per-arch tuned LR. Returns list of result dicts."""
-    plan = [(mt, wd) for mt in archs for wd in wds]
+def _sweep(archs, tuned_lrs, wds, seeds, dim, enc, dec, tokens, dry_run=False,
+           use_compile=True, existing_results=None):
+    """Sweep WD × seed per arch at the per-arch tuned LR. Skip cells already in
+    `existing_results` so resume works at (arch, wd, seed) granularity.
+    Old single-seed results without a `seed` field are treated as seed=0."""
+    done = {(r["model_type"], r["wd"], r.get("seed", 0))
+            for r in (existing_results or [])
+            if r.get("final_eval_loss") is not None}
+
+    plan = [(mt, wd, s) for mt in archs for wd in wds for s in seeds
+            if (mt, wd, s) not in done]
+    skipped = (len(archs) * len(wds) * len(seeds)) - len(plan)
     print(f"\n{'═'*60}\n  WD sweep at base width "
           f"(dim={dim}, enc={enc}, dec={dec}, tokens={tokens:,})\n"
-          f"  {len(plan)} runs ({len(archs)} archs × {len(wds)} WDs)  "
+          f"  {len(plan)} runs to do  ({skipped} cached)  "
+          f"{len(archs)} archs × {len(wds)} WDs × {len(seeds)} seeds  "
           f"compile={use_compile}\n"
           f"  Per-arch LRs (from configs/mup_tuned.json):\n"
           + "".join(f"    {mt}: {tuned_lrs[mt]:.2e}\n" for mt in archs)
           + f"{'═'*60}")
     results = []
-    for i, (mt, wd) in enumerate(plan, 1):
+    for i, (mt, wd, s) in enumerate(plan, 1):
         if mt not in tuned_lrs:
             print(f"[{i}/{len(plan)}] SKIP {mt}: no tuned LR for this arch in "
                   f"configs/mup_tuned.json — re-run mup_base_sweep --archs {mt}")
             continue
         lr = tuned_lrs[mt]
-        run_tag = f"{mt}_dim{dim}_lr{lr:.0e}_wd{wd:.3g}"
+        run_tag = f"{mt}_dim{dim}_lr{lr:.0e}_wd{wd:.3g}_s{s}"
         print(f"\n[{i}/{len(plan)}] {run_tag}")
         t0 = time.time()
-        r = _train_one(mt, dim, enc, dec, tokens, lr, wd, run_tag,
+        r = _train_one(mt, dim, enc, dec, tokens, lr, wd, s, run_tag,
                        dry_run=dry_run, use_compile=use_compile)
         r["run_tag"] = run_tag
         results.append(r)
@@ -265,25 +291,35 @@ def _sweep(archs, tuned_lrs, wds, dim, enc, dec, tokens, dry_run=False,
 
 
 def _best_wd_per_arch(results, tuned_lrs):
-    """Pick the WD with the lowest final_eval_loss for each arch.
-    Returns {arch: {weight_decay, best_loss, tuned_lr_used, wd_curve}}."""
-    by_arch = {}
+    """Per arch, pick the WD that minimizes seed-mean eval loss.
+    Mirrors mup_base_sweep._best_lr_per_arch's averaging convention so the
+    two configs (mup_tuned / wd_tuned) report comparable noise budgets."""
+    by = {}
     for r in results:
         if r.get("final_eval_loss") is None:
             continue
-        by_arch.setdefault(r["model_type"], []).append(r)
+        by.setdefault((r["model_type"], r["wd"]), []).append(r)
+
+    by_arch = {}
+    for (mt, wd), cells in by.items():
+        mean_loss = sum(c["final_eval_loss"] for c in cells) / len(cells)
+        # Carry one sample to read dim/tokens/lr off (those are constant across
+        # seeds for a given (mt, wd) — only seed and final_eval_loss differ).
+        by_arch.setdefault(mt, []).append((wd, mean_loss, len(cells), cells[0]))
+
     out = {}
-    for mt, runs in by_arch.items():
-        runs_sorted = sorted(runs, key=lambda r: r["final_eval_loss"])
-        best = runs_sorted[0]
+    for mt, rows in by_arch.items():
+        rows.sort(key=lambda x: x[1])
+        best_wd, best_mean, n_seeds, sample = rows[0]
         out[mt] = {
-            "weight_decay": best["wd"],
-            "best_loss": best["final_eval_loss"],
-            "tuned_lr_used": tuned_lrs.get(mt, best["lr"]),
-            "sweep_dim": best["dim"],
-            "sweep_tokens": best["tokens"],
-            "wd_curve": sorted([(r["wd"], r["final_eval_loss"]) for r in runs],
-                               key=lambda t: t[0]),
+            "weight_decay": best_wd,
+            "best_loss": best_mean,
+            "n_seeds": n_seeds,
+            "tuned_lr_used": tuned_lrs.get(mt, sample["lr"]),
+            "sweep_dim": sample["dim"],
+            "sweep_tokens": sample["tokens"],
+            "wd_curve": [(wd, mean) for wd, mean, _, _ in
+                         sorted(rows, key=lambda x: x[0])],
         }
     return out
 
@@ -301,8 +337,9 @@ def _write_tuned_json(wds_per_arch):
     print(f"\nWrote tuned WDs to: {TUNED_WD_PATH}")
     for mt, info in wds_per_arch.items():
         print(f"  {mt}: weight_decay={info['weight_decay']:.3g}  "
-              f"(best_loss={info['best_loss']:.4f}  "
-              f"at lr={info['tuned_lr_used']:.2e})")
+              f"(seed-mean loss={info['best_loss']:.4f}, "
+              f"n_seeds={info['n_seeds']}, "
+              f"lr={info['tuned_lr_used']:.2e})")
 
 
 def _plot(all_results):
@@ -326,19 +363,34 @@ def _plot(all_results):
     fig, axes = plt.subplots(1, len(archs), figsize=(5 * len(archs), 4),
                              sharey=True, squeeze=False)
     for ax, mt in zip(axes[0], archs):
-        runs = sorted([r for r in finished if r["model_type"] == mt],
-                      key=lambda r: r["wd"])
+        cells = [r for r in finished if r["model_type"] == mt]
+        # Group by wd, compute seed-mean and per-seed spread (min/max). The
+        # mean drives the argmin; the band shows whether neighbouring WDs are
+        # within seed noise of each other.
+        by_wd = {}
+        for r in cells:
+            by_wd.setdefault(r["wd"], []).append(r["final_eval_loss"])
+        rows = sorted([(wd, sum(losses) / len(losses),
+                        min(losses), max(losses), len(losses))
+                       for wd, losses in by_wd.items()], key=lambda t: t[0])
+        xs = [r[0] for r in rows]
+        means = [r[1] for r in rows]
+        lo = [r[2] for r in rows]
+        hi = [r[3] for r in rows]
+        n_max = max(r[4] for r in rows)
         # Use symlog so wd=0 is on-axis (a plain log scale would drop it).
-        xs = [r["wd"] for r in runs]
-        ys = [r["final_eval_loss"] for r in runs]
-        ax.plot(xs, ys, "o-", linewidth=2, markersize=8)
-        best = min(runs, key=lambda r: r["final_eval_loss"])
-        ax.plot(best["wd"], best["final_eval_loss"], "*",
+        ax.plot(xs, means, "o-", linewidth=2, markersize=8,
+                label=f"seed-mean (n≤{n_max})")
+        if n_max > 1:
+            ax.fill_between(xs, lo, hi, alpha=0.2,
+                            label="seed min/max")
+        best_idx = min(range(len(rows)), key=lambda i: rows[i][1])
+        ax.plot(rows[best_idx][0], rows[best_idx][1], "*",
                 markersize=18, color="red", zorder=5,
-                label=f"best: wd={best['wd']:.3g}")
+                label=f"best: wd={rows[best_idx][0]:.3g}")
         ax.set_xscale("symlog", linthresh=1e-3)
         ax.set_xlabel("weight decay")
-        ax.set_title(f"{mt} (lr={runs[0]['lr']:.2e})")
+        ax.set_title(f"{mt} (lr={cells[0]['lr']:.2e})")
         ax.legend()
         ax.grid(True, alpha=0.3)
     axes[0][0].set_ylabel("final eval loss")
@@ -355,6 +407,8 @@ def main():
                         help="Comma-separated archs to sweep (default: dd,sed,dec)")
     parser.add_argument("--wds", default=None,
                         help=f"Comma-separated WDs (default: {DEFAULT_WDS})")
+    parser.add_argument("--seeds", default=None,
+                        help=f"Comma-separated seeds (default: {DEFAULT_SEEDS})")
     parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS,
                         help=f"Tokens per cell (default: {DEFAULT_TOKENS:,})")
     parser.add_argument("--dim", type=int, default=DEFAULT_DIM,
@@ -385,6 +439,8 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--single-wd", type=float, default=None,
                         help=argparse.SUPPRESS)
+    parser.add_argument("--single-seed", type=int, default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--single-tokens", type=int, default=None,
                         help=argparse.SUPPRESS)
     parser.add_argument("--single-run-tag", default=None, help=argparse.SUPPRESS)
@@ -398,6 +454,7 @@ def main():
             model_type=args.single_mt, dim=args.single_dim,
             enc=args.single_enc, dec=args.single_dec,
             tokens=args.single_tokens, lr=args.single_lr, wd=args.single_wd,
+            seed=args.single_seed,
             run_tag=args.single_run_tag,
             result_path=args.single_result_path,
             use_compile=use_compile)
@@ -405,6 +462,8 @@ def main():
 
     archs = [a.strip() for a in args.archs.split(",")]
     wds = ([float(x) for x in args.wds.split(",")] if args.wds else DEFAULT_WDS)
+    seeds = ([int(x) for x in args.seeds.split(",")] if args.seeds
+             else list(DEFAULT_SEEDS))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     results_path = OUT_DIR / "results.json"
@@ -423,8 +482,9 @@ def main():
         all_results = json.loads(results_path.read_text())
         print(f"Resuming from {len(all_results)} prior results in {results_path}")
 
-    new = _sweep(archs, tuned_lrs, wds, args.dim, args.enc, args.dec,
-                 args.tokens, dry_run=args.dry_run, use_compile=use_compile)
+    new = _sweep(archs, tuned_lrs, wds, seeds, args.dim, args.enc, args.dec,
+                 args.tokens, dry_run=args.dry_run, use_compile=use_compile,
+                 existing_results=all_results)
     all_results.extend(new)
     if not args.dry_run:
         results_path.write_text(json.dumps(all_results, indent=2))

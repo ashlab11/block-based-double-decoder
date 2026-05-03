@@ -1,50 +1,32 @@
 #!/usr/bin/env python3
-"""μP base hparam sweep — find per-arch optimal LR before the big runs.
+"""μP base hparam sweep — single phase, full grid, multi-seed, mid-training coord check.
 
-Item #3 of the paper-prep plan. The big sweep in parallel_scaling.py uses a
-single global BASE_LR=2e-3 for all three archs. μP says LR transfers across
-widths *if* the base width is tuned, but it makes no claim across architectures
-— DD's combo cross-attn, SED's bidirectional encoder, and DEC's pure causal
-stack each have a different optimum. This script finds those optima.
+Replaces the old two-phase design (cheap LR sweep at base width, then a 3-LR
+verification at 3 widths). The two-phase design produced misleadingly clean
+"PASS"/"WARN" verdicts because Phase 2 only sampled `{best/2, best, best*2}`
+around a single-seed Phase 1 winner, so any noise in Phase 1 cascaded into a
+grid that couldn't resolve sub-grid-step shifts.
 
-Two phases:
+The new design runs the full Phase-1 LR grid at every width, with two seeds per
+cell, at double the original Phase 1 token budget. A mid-training coord check
+fires at 25%/50%/75% of training to catch residual-stream / attention-statistic
+drift that the static checks in mup_full_check.py can't see (those only probe
+init + 5 Adam steps).
 
-  Phase 1 — LR sweep at base width (cheap, definitive)
-    For each arch in {dd, sed, dec}, train at the smallest scale (default
-    dim=64, ~0.5M params, 50M tokens) with 6–7 candidate LRs. Best LR per
-    arch defines the base LR that gets baked into configs/mup_tuned.json.
-
-  Phase 2 — LR transfer verification across widths (optional but useful)
-    For each arch, train at 3 widths × 3 LRs near the Phase 1 optimum.
-    Confirms the U-curve minimum lands at the same LR across widths — the
-    signature of a working μP implementation. If transfer fails, that's a
-    bug to fix before the big runs (cheap to find now, expensive after).
-
-Output: configs/mup_tuned.json — read at startup by parallel_scaling.py to
-override the per-arch base LR. Format:
-    {"dd":  {"base_lr": 0.002, "best_loss": 5.83, "phase1_dim": 64, ...},
-     "sed": {"base_lr": 0.001, ...},
-     "dec": {"base_lr": 0.003, ...}}
+Output:
+  checkpoints/mup_base_sweep/results.json — all (arch, dim, lr, seed) cells
+  configs/mup_tuned.json — per-arch base LR (argmin at base width, seed mean)
 
 Usage:
-    # Phase 1 only (default; ~1 hour on one GPU):
     python scripts/mup_base_sweep.py --archs dd,sed,dec
-
-    # Phase 1 + Phase 2 (verify width transfer; ~3 hours):
-    python scripts/mup_base_sweep.py --archs dd,sed,dec --verify-transfer
-
-    # Subset / debug:
-    python scripts/mup_base_sweep.py --archs dd --lrs 1e-3,2e-3,4e-3 --tokens 10000000
-
-    # Dry-run (planning only, no training):
-    python scripts/mup_base_sweep.py --dry-run
-
-    # Just plot existing results:
+    python scripts/mup_base_sweep.py --archs dd --lrs 1e-3,2e-3,4e-3 --seeds 0
     python scripts/mup_base_sweep.py --plot-only
+    python scripts/mup_base_sweep.py --dry-run
 """
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -53,55 +35,31 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Phase 1 default constants — chosen so the sweep finishes in ~1 hour.
-# 0.5M params × 50M tokens ≈ 100× Chinchilla-overtrained, which is fine for
-# finding LR optima (the U-curve is visible long before convergence).
-DEFAULT_PHASE1_DIM = 64           # = MUP_BASE_DIM in parallel_scaling
-DEFAULT_PHASE1_TOKENS = 50_000_000
+# Doubled from the old Phase 1 default (50M) — the entire token budget that
+# used to fund Phase 1 + Phase 2 now goes into a single, longer Phase 2 cell.
+DEFAULT_TOKENS = 100_000_000
+DEFAULT_DIMS = [64, 128, 256]
 DEFAULT_LRS = [3e-4, 6e-4, 1e-3, 2e-3, 4e-3, 8e-3, 1.5e-2]
-
-# Phase 2: verify transfer across these widths (must include base for a
-# self-consistency check). 3 widths is enough to draw the LR-transfer curve
-# without making the sweep prohibitively expensive.
-DEFAULT_PHASE2_DIMS = [64, 128, 256]
-PHASE2_LRS_NEAR_OPT = 3  # take optimum from phase 1 ± 1 step on each side
+DEFAULT_SEEDS = [0, 1]
+DEFAULT_COORD_FRACS = (0.25, 0.5, 0.75)
+BASE_DIM = 64  # the dim whose argmin defines per-arch base_lr in mup_tuned.json
 
 OUT_DIR = PROJECT_ROOT / "checkpoints" / "mup_base_sweep"
 TUNED_PATH = PROJECT_ROOT / "configs" / "mup_tuned.json"
 
 
-def _arch_to_dim_layers(arch_label):
-    """Map a small arch label to a (dim, enc, dec) tuple. Inputs to phase 1
-    deliberately stay at the smallest scale (dim=64, enc=4, dec=2) so each
-    run takes seconds, not minutes."""
-    return {
-        "tiny": (64, 4, 2),       # Phase 1 default
-        "base": (64, 8, 4),       # Same as MUP_BASE_DIM in production sweep
-        "dim128": (128, 8, 4),
-        "dim256": (256, 8, 4),
-        "dim512": (512, 8, 4),
-    }.get(arch_label, (64, 4, 2))
-
-
-def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False,
-               use_compile=True):
-    """Train a single (model_type, dim, lr) point in an isolated subprocess.
-
-    Process isolation is the only reliable way to keep torch.compile state
-    (dynamo cache, inductor PyCodeCache, async-compile workers, FlexAttention
-    HOP closures, allocator fragmentation) from accumulating across runs.
-    Each subprocess imports torch fresh, compiles one model, writes its
-    result JSON, and exits — the OS reclaims everything. ~5–8s startup
-    overhead per run is well under 10% of a 50M-token training run.
-    """
+def _train_one(model_type, dim, enc, dec, tokens, lr, seed, run_tag,
+               dry_run=False, use_compile=True):
+    """Subprocess-isolated single training run. Process isolation flushes
+    torch.compile caches and CUDA allocator state between runs."""
     if dry_run:
-        return {"model_type": model_type, "dim": dim, "lr": lr,
+        return {"model_type": model_type, "dim": dim, "lr": lr, "seed": seed,
                 "tokens": tokens, "final_eval_loss": None, "dry_run": True}
 
     result_path = OUT_DIR / run_tag / "result.json"
     result_path.parent.mkdir(parents=True, exist_ok=True)
     if result_path.exists():
-        result_path.unlink()  # avoid reading a stale result if subprocess dies
+        result_path.unlink()
 
     cmd = [sys.executable, str(Path(__file__).resolve()),
            "--single-run",
@@ -110,29 +68,187 @@ def _train_one(model_type, dim, enc, dec, tokens, lr, run_tag, dry_run=False,
            "--single-enc", str(enc),
            "--single-dec", str(dec),
            "--single-lr", repr(lr),
+           "--single-seed", str(seed),
            "--single-tokens", str(tokens),
            "--single-run-tag", run_tag,
            "--single-result-path", str(result_path)]
     if not use_compile:
         cmd.append("--no-compile")
 
-    print(f"  → subprocess: {model_type} dim={dim} lr={lr:.2e} tokens={tokens:,}")
+    print(f"  → subprocess: {model_type} dim={dim} lr={lr:.2e} seed={seed} "
+          f"tokens={tokens:,}")
     subprocess.run(cmd, check=True)
     return json.loads(result_path.read_text())
 
 
-def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
-                           result_path, use_compile=True):
-    """Body of a single training run, executed inside the subprocess spawned
-    by _train_one. No cross-run hygiene is needed here: process exit handles
-    cache flushing, allocator reclamation, and reference cleanup automatically.
-    """
+# ── Mid-training coord probe ────────────────────────────────────────────────
+
+def _make_coord_callback(record, fractions, model_type, coord_batch):
+    """Return a step_callback for train_one_budget that snapshots residual /
+    attn / (DD only) gate stats at fractional progress points."""
+    fired = set()
+
+    def callback(trainers, step, total_steps):
+        for f in fractions:
+            target = max(1, int(f * total_steps))
+            if step >= target and f not in fired:
+                fired.add(f)
+                for t in trainers:
+                    snap = _coord_snapshot(t["model"], coord_batch, t["model_type"])
+                    snap.update(step=step, fraction=f, total_steps=total_steps)
+                    record.append(snap)
+    return callback
+
+
+def _coord_snapshot(model, batch, model_type):
+    """One-batch probe: residual-stream RMS per layer, logits RMS, qk_std,
+    softmax entropy, and (DD only) sigmoid-gate mean. Cheap; runs in eval
+    mode under no_grad on a fixed batch."""
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+
+    eager = getattr(model, "_orig_mod", model)
+    was_training = eager.training
+    eager.eval()
+
+    layer_rms = {}
+    hooks = []
+
+    def _hook(name):
+        def fn(_m, _inp, out):
+            t = out[0] if isinstance(out, tuple) else out
+            layer_rms[name] = t.detach().float().pow(2).mean().sqrt().item()
+        return fn
+
+    enc_layers = getattr(eager, "encoder_layers", None)
+    if enc_layers is not None:
+        for i, lyr in enumerate(enc_layers):
+            hooks.append(lyr.register_forward_hook(_hook(f"enc_{i}")))
+    dec_layers = getattr(eager, "decoder_layers", None) or getattr(eager, "layers", None)
+    if dec_layers is not None:
+        prefix = "dec" if getattr(eager, "decoder_layers", None) is not None else "lyr"
+        for i, lyr in enumerate(dec_layers):
+            hooks.append(lyr.register_forward_hook(_hook(f"{prefix}_{i}")))
+
+    qk_stds, entropies = [], []
+    orig_sdpa = F.scaled_dot_product_attention
+
+    def _sdpa_wrap(q, k, v, attn_mask=None, dropout_p=0.0,
+                   is_causal=False, scale=None, **kw):
+        with torch.no_grad():
+            head_dim = q.shape[-1]
+            eff = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
+            qk = torch.matmul(q.float(), k.float().transpose(-2, -1)) * eff
+            if is_causal:
+                Lq, Lk = qk.shape[-2], qk.shape[-1]
+                m = torch.triu(torch.ones(Lq, Lk, device=qk.device,
+                                          dtype=torch.bool), diagonal=1)
+                qk = qk.masked_fill(m, float('-inf'))
+            elif attn_mask is not None and attn_mask.dtype == torch.bool:
+                qk = qk.masked_fill(~attn_mask, float('-inf'))
+            elif attn_mask is not None:
+                qk = qk + attn_mask
+            finite = qk[qk.isfinite()]
+            if finite.numel():
+                qk_stds.append(finite.std().item())
+                probs = qk.softmax(dim=-1)
+                ent = -(probs * probs.clamp_min(1e-12).log()).sum(-1)
+                row_ok = qk.isfinite().any(-1)
+                if row_ok.any():
+                    entropies.append(ent[row_ok].mean().item())
+        return orig_sdpa(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+                         is_causal=is_causal, scale=scale, **kw)
+
+    # DD-only: capture the combo gate by intercepting paired _attn_with_lse calls.
+    # ComboAttention.forward calls _attn_with_lse twice per layer (dec, then enc);
+    # we pair them by module id and compute sigmoid(dec_lse - enc_lse).mean().
+    dec_w_means = []
+    pending = {}
+    orig_attn_with_lse = None
+    if model_type == "dd":
+        from components.attention import ComboAttention
+        orig_attn_with_lse = ComboAttention._attn_with_lse
+
+        def _attn_wrap(self, query, key, value, mask, default_causal):
+            out, lse = orig_attn_with_lse(self, query, key, value, mask, default_causal)
+            mid = id(self)
+            if mid not in pending:
+                pending[mid] = lse.detach()
+            else:
+                dec_lse = pending.pop(mid)
+                with torch.no_grad():
+                    dec_w_means.append(torch.sigmoid(dec_lse - lse.detach()).mean().item())
+            return out, lse
+        ComboAttention._attn_with_lse = _attn_wrap
+
+    F.scaled_dot_product_attention = _sdpa_wrap
+
+    needs_blocks = model_type in ("dd", "sed")
+    embed_rms = logits_rms = loss_val = None
+    try:
+        with torch.no_grad():
+            raw_emb = eager.embedding(batch["input_ids"])
+            embed_rms = raw_emb.detach().float().pow(2).mean().sqrt().item()
+            if needs_blocks:
+                out = eager(**batch)
+            else:
+                out = eager(input_ids=batch["input_ids"], labels=batch["labels"])
+            logits_rms = out["logits"].detach().float().pow(2).mean().sqrt().item()
+            if out.get("loss") is not None:
+                loss_val = float(out["loss"].item())
+    finally:
+        F.scaled_dot_product_attention = orig_sdpa
+        if orig_attn_with_lse is not None:
+            from components.attention import ComboAttention
+            ComboAttention._attn_with_lse = orig_attn_with_lse
+        for h in hooks:
+            h.remove()
+        if was_training:
+            eager.train()
+
+    return {
+        "model_type": model_type,
+        "embed_rms": embed_rms,
+        "logits_rms": logits_rms,
+        "loss": loss_val,
+        "layer_rms": layer_rms,
+        "qk_std": float(np.mean(qk_stds)) if qk_stds else None,
+        "softmax_entropy": float(np.mean(entropies)) if entropies else None,
+        "dec_w_mean": float(np.mean(dec_w_means)) if dec_w_means else None,
+    }
+
+
+def _build_coord_batch(model_type, vocab_size, seq_len, device, seed):
+    """Fixed batch the probe reuses at every fractional checkpoint. Same seed
+    for every cell so coord-check trajectories are comparable across runs."""
+    import torch
+    g = torch.Generator(device='cpu').manual_seed(12345 + seed * 7)
+    bs = 4
+    input_ids = torch.randint(0, vocab_size, (bs, seq_len), generator=g).to(device)
+    blocks = (torch.full((bs,), seq_len, device=device, dtype=torch.long)
+              if model_type == "sed"
+              else torch.tensor([seq_len // 4, seq_len // 2, 3 * seq_len // 4],
+                                device=device))
+    return {"input_ids": input_ids, "labels": input_ids.clone(),
+            "blocks": blocks, "sft": False}
+
+
+# ── Subprocess body ─────────────────────────────────────────────────────────
+
+def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, seed,
+                           run_tag, result_path, use_compile=True):
+    """Execute a single training cell. Called in a fresh subprocess."""
     import torch
     from torch.utils.data import DataLoader
     from datasets import load_dataset
     from transformers import PreTrainedTokenizerFast
 
     import scripts.parallel_scaling as ps
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = PreTrainedTokenizerFast(
@@ -142,8 +258,6 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
     pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
 
-    # Override BASE_LR for this run. No restore needed — the process exits
-    # right after train_one_budget returns.
     ps.BASE_LR = lr
     ps.TUNED_LRS = {model_type: {"base_lr": lr}}
 
@@ -155,24 +269,25 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
              "model": model, "ne": ne,
              "needs_blocks": model_type in ("dd", "sed")}]
 
-    # Single-trainer batches: stay tiny so dim=64 runs in <1 min each.
-    bs = 8
-    ga = 4  # effective batch 32 — small but adequate for LR optima search
+    bs, ga = 8, 4
 
     train_ds = load_dataset(
         "json",
         data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_packed.jsonl"),
         split="train", streaming=True)
+    # Per-seed shuffle so seed=0 and seed=1 see different token orderings.
+    train_ds = train_ds.shuffle(seed=seed, buffer_size=10_000)
     eval_ds = load_dataset(
         "json",
         data_files=str(PROJECT_ROOT / "data/Pretrain/slimpajama_6b_eval_packed.jsonl"),
         split="train")
 
+    collator_seed = 42 + seed * 10_000
     loaders = {
         mt: DataLoader(train_ds, batch_size=bs,
                        collate_fn=ps.build_pretrain_collator(
                            mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
-                           global_seed=42),
+                           global_seed=collator_seed),
                        drop_last=True)
         for mt in ps.MODEL_TYPES
     }
@@ -180,16 +295,22 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
         mt: DataLoader(eval_ds, batch_size=bs,
                        collate_fn=ps.build_pretrain_collator(
                            mt, bos_id, eos_id, pad_id, ps.SEQ_LEN,
-                           global_seed=42),
+                           global_seed=collator_seed),
                        drop_last=True)
         for mt in ps.MODEL_TYPES
     }
 
     gpu_tflops = ps.detect_gpu_tflops()
 
+    coord_record = []
+    coord_batch = _build_coord_batch(model_type, vocab_size, ps.SEQ_LEN, device,
+                                     seed=0)
+    coord_cb = _make_coord_callback(coord_record, DEFAULT_COORD_FRACS,
+                                    model_type, coord_batch)
+
     out_subdir = OUT_DIR / run_tag
     results = ps.train_one_budget(
-        info, tok_label="phase", total_tokens=tokens,
+        info, tok_label="sweep", total_tokens=tokens,
         batch_size=bs, grad_accum=ga,
         train_loaders=loaders, eval_loaders=eval_loaders,
         device=device, gpu_tflops=gpu_tflops,
@@ -198,37 +319,55 @@ def _run_single_in_process(model_type, dim, enc, dec, tokens, lr, run_tag,
         mid_eval_points=0,
         run_full_eval=False,
         tokenizer=tokenizer,
-        run_sft=False)
+        run_sft=False,
+        step_callback=coord_cb)
+
+    # Final coord snapshot (fraction=1.0) so the curve includes end-state.
+    coord_record.append({
+        **_coord_snapshot(model, coord_batch, model_type),
+        "step": -1, "fraction": 1.0, "total_steps": -1,
+    })
 
     key = f"{model_type}_{run_tag}"
     run = results.get(key, {})
 
     result = {
         "model_type": model_type, "dim": dim, "enc": enc, "dec": dec,
-        "lr": lr, "tokens": tokens,
+        "lr": lr, "seed": seed, "tokens": tokens,
         "final_eval_loss": run.get("final_eval_loss"),
         "final_eval_ppl": run.get("final_eval_ppl"),
         "non_emb_params": run.get("non_emb_params"),
         "training_time_sec": run.get("training_time_sec"),
+        "coord_curve": coord_record,
     }
     Path(result_path).write_text(json.dumps(result, indent=2))
 
 
-def _phase1(archs, dim, enc, dec, tokens, lrs, dry_run=False, use_compile=True):
-    """Sweep LR at base width per arch. Returns list of result dicts."""
-    plan = [(mt, lr) for mt in archs for lr in lrs]
-    print(f"\n{'═'*60}\n  Phase 1: LR sweep at base "
-          f"(dim={dim}, enc={enc}, dec={dec}, tokens={tokens:,})\n"
-          f"  {len(plan)} runs ({len(archs)} archs × {len(lrs)} LRs)  "
-          f"compile={use_compile}\n{'═'*60}")
+# ── Sweep driver ────────────────────────────────────────────────────────────
+
+def _sweep(archs, dims, lrs, seeds, enc, dec, tokens, dry_run=False,
+           use_compile=True, existing_results=None):
+    """Run the full grid: archs × dims × lrs × seeds. Skip cells already in
+    `existing_results` so resume works."""
+    done = {(r["model_type"], r["dim"], r["lr"], r.get("seed", 0))
+            for r in (existing_results or [])
+            if r.get("final_eval_loss") is not None}
+
+    plan = [(mt, d, lr, s) for mt in archs for d in dims for lr in lrs
+            for s in seeds if (mt, d, lr, s) not in done]
+    skipped = (len(archs) * len(dims) * len(lrs) * len(seeds)) - len(plan)
+    print(f"\n{'═'*60}\n  Full grid sweep\n"
+          f"  archs={archs}  dims={dims}  lrs={lrs}  seeds={seeds}\n"
+          f"  enc={enc} dec={dec} tokens={tokens:,}\n"
+          f"  {len(plan)} runs to do  ({skipped} cached)  compile={use_compile}\n"
+          f"{'═'*60}")
     results = []
-    for i, (mt, lr) in enumerate(plan, 1):
-        run_tag = f"p1_{mt}_dim{dim}_lr{lr:.0e}"
+    for i, (mt, d, lr, s) in enumerate(plan, 1):
+        run_tag = f"sweep_{mt}_dim{d}_lr{lr:.0e}_s{s}"
         print(f"\n[{i}/{len(plan)}] {run_tag}")
         t0 = time.time()
-        r = _train_one(mt, dim, enc, dec, tokens, lr, run_tag,
+        r = _train_one(mt, d, enc, dec, tokens, lr, s, run_tag,
                        dry_run=dry_run, use_compile=use_compile)
-        r["phase"] = 1
         r["run_tag"] = run_tag
         results.append(r)
         if not dry_run:
@@ -237,69 +376,35 @@ def _phase1(archs, dim, enc, dec, tokens, lrs, dry_run=False, use_compile=True):
     return results
 
 
-def _best_lr_per_arch(phase1_results):
-    """Pick the LR with the lowest final_eval_loss for each arch.
-    Returns {arch: {best_lr, best_loss, all_lrs}}."""
-    by_arch = {}
-    for r in phase1_results:
+def _best_lr_per_arch(all_results, base_dim):
+    """Per arch, pick LR that minimizes seed-mean eval loss at base width."""
+    by = {}
+    for r in all_results:
         if r.get("final_eval_loss") is None:
             continue
-        by_arch.setdefault(r["model_type"], []).append(r)
+        if r["dim"] != base_dim:
+            continue
+        by.setdefault((r["model_type"], r["lr"]), []).append(r["final_eval_loss"])
+
+    by_arch = {}
+    for (mt, lr), losses in by.items():
+        by_arch.setdefault(mt, []).append((lr, sum(losses) / len(losses), len(losses)))
+
     out = {}
-    for mt, runs in by_arch.items():
-        runs_sorted = sorted(runs, key=lambda r: r["final_eval_loss"])
-        best = runs_sorted[0]
+    for mt, rows in by_arch.items():
+        rows.sort(key=lambda x: x[1])
+        best_lr, best_mean, n = rows[0]
         out[mt] = {
-            "base_lr": best["lr"],
-            "best_loss": best["final_eval_loss"],
-            "phase1_dim": best["dim"],
-            "phase1_enc": best["enc"],
-            "phase1_dec": best["dec"],
-            "phase1_tokens": best["tokens"],
-            "lr_curve": [(r["lr"], r["final_eval_loss"]) for r in runs],
+            "base_lr": best_lr,
+            "best_loss": best_mean,
+            "n_seeds": n,
+            "phase1_dim": base_dim,
+            "lr_curve": [(lr, mean) for lr, mean, _ in sorted(rows, key=lambda x: x[0])],
         }
     return out
 
 
-def _phase2(archs, lrs_per_arch, dims, enc, dec, tokens, dry_run=False,
-            use_compile=True):
-    """Verify LR transfer across widths. For each arch, train at each (dim, lr)
-    near the phase-1 optimum. Returns list of result dicts."""
-    plan = []
-    for mt in archs:
-        if mt not in lrs_per_arch:
-            print(f"[Phase 2] Skipping {mt}: no phase-1 best LR")
-            continue
-        best_lr = lrs_per_arch[mt]["base_lr"]
-        # ±1 step on a log-spaced grid to span the bottom of the U-curve
-        try_lrs = sorted({best_lr / 2, best_lr, best_lr * 2})
-        for d in dims:
-            for lr in try_lrs:
-                plan.append((mt, d, lr))
-    print(f"\n{'═'*60}\n  Phase 2: LR transfer across widths "
-          f"(dims={dims}, enc={enc}, dec={dec}, tokens={tokens:,})\n"
-          f"  {len(plan)} runs  compile={use_compile}\n{'═'*60}")
-    results = []
-    for i, (mt, d, lr) in enumerate(plan, 1):
-        run_tag = f"p2_{mt}_dim{d}_lr{lr:.0e}"
-        print(f"\n[{i}/{len(plan)}] {run_tag}")
-        t0 = time.time()
-        r = _train_one(mt, d, enc, dec, tokens, lr, run_tag,
-                       dry_run=dry_run, use_compile=use_compile)
-        r["phase"] = 2
-        r["run_tag"] = run_tag
-        results.append(r)
-        if not dry_run:
-            print(f"  loss={r.get('final_eval_loss')}  "
-                  f"({(time.time()-t0):.0f}s)")
-    return results
-
-
 def _write_tuned_json(lrs_per_arch):
-    """Write configs/mup_tuned.json with one block per arch. parallel_scaling
-    reads this at startup and uses base_lr per arch."""
-    # Preserve any pre-existing entries so partial sweeps don't clobber tuned
-    # values for archs we didn't re-sweep.
     if TUNED_PATH.exists():
         existing = json.loads(TUNED_PATH.read_text())
     else:
@@ -310,118 +415,33 @@ def _write_tuned_json(lrs_per_arch):
     print(f"\nWrote tuned LRs to: {TUNED_PATH}")
     for mt, info in lrs_per_arch.items():
         print(f"  {mt}: base_lr={info['base_lr']:.2e}  "
-              f"(best_loss={info['best_loss']:.4f} at dim={info['phase1_dim']})")
+              f"(seed-mean loss={info['best_loss']:.4f}, n_seeds={info['n_seeds']})")
 
 
-def _plot(all_results):
-    """Render LR-vs-loss curves per arch (Phase 1) and per-width LR-transfer
-    panels (Phase 2). Saved to checkpoints/mup_base_sweep/."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import numpy as np
-    except ImportError:
-        print("matplotlib not available — skipping plots")
-        return
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Phase 1: one panel per arch, x=lr, y=loss
-    p1 = [r for r in all_results if r.get("phase") == 1
-          and r.get("final_eval_loss") is not None]
-    if p1:
-        archs = sorted(set(r["model_type"] for r in p1))
-        fig, axes = plt.subplots(1, len(archs), figsize=(5 * len(archs), 4),
-                                 sharey=True, squeeze=False)
-        for ax, mt in zip(axes[0], archs):
-            runs = sorted([r for r in p1 if r["model_type"] == mt],
-                          key=lambda r: r["lr"])
-            xs = [r["lr"] for r in runs]
-            ys = [r["final_eval_loss"] for r in runs]
-            ax.plot(xs, ys, "o-", linewidth=2, markersize=8)
-            best = min(runs, key=lambda r: r["final_eval_loss"])
-            ax.plot(best["lr"], best["final_eval_loss"], "*",
-                    markersize=18, color="red", zorder=5,
-                    label=f"best: lr={best['lr']:.0e}")
-            ax.set_xscale("log")
-            ax.set_xlabel("learning rate")
-            ax.set_title(f"{mt} (Phase 1)")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        axes[0][0].set_ylabel("final eval loss")
-        plt.tight_layout()
-        for ext in ("png", "pdf"):
-            fig.savefig(OUT_DIR / f"phase1_lr_sweep.{ext}", dpi=150,
-                        bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved {OUT_DIR / 'phase1_lr_sweep.png'}")
-
-    # Phase 2: one panel per arch, x=lr, y=loss, lines=width
-    p2 = [r for r in all_results if r.get("phase") == 2
-          and r.get("final_eval_loss") is not None]
-    if p2:
-        archs = sorted(set(r["model_type"] for r in p2))
-        fig, axes = plt.subplots(1, len(archs), figsize=(5 * len(archs), 4),
-                                 sharey=True, squeeze=False)
-        for ax, mt in zip(axes[0], archs):
-            runs = [r for r in p2 if r["model_type"] == mt]
-            dims = sorted(set(r["dim"] for r in runs))
-            for d in dims:
-                drs = sorted([r for r in runs if r["dim"] == d],
-                             key=lambda r: r["lr"])
-                xs = [r["lr"] for r in drs]
-                ys = [r["final_eval_loss"] for r in drs]
-                ax.plot(xs, ys, "o-", label=f"dim={d}", linewidth=2)
-            ax.set_xscale("log")
-            ax.set_xlabel("learning rate")
-            ax.set_title(f"{mt} (Phase 2: width transfer)")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        axes[0][0].set_ylabel("final eval loss")
-        plt.tight_layout()
-        for ext in ("png", "pdf"):
-            fig.savefig(OUT_DIR / f"phase2_width_transfer.{ext}", dpi=150,
-                        bbox_inches="tight")
-        plt.close(fig)
-        print(f"Saved {OUT_DIR / 'phase2_width_transfer.png'}")
-
+# ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archs", default="dd,sed,dec",
-                        help="Comma-separated archs to sweep (default: dd,sed,dec)")
+                        help="Comma-separated archs (default: dd,sed,dec)")
+    parser.add_argument("--dims", default=None,
+                        help=f"Comma-separated widths (default: {DEFAULT_DIMS})")
     parser.add_argument("--lrs", default=None,
-                        help="Comma-separated LRs for Phase 1 "
-                             "(default: 3e-4,6e-4,1e-3,2e-3,4e-3,8e-3,1.5e-2)")
-    parser.add_argument("--tokens", type=int, default=DEFAULT_PHASE1_TOKENS,
-                        help=f"Tokens per Phase 1 run (default: {DEFAULT_PHASE1_TOKENS:,})")
-    parser.add_argument("--phase1-dim", type=int, default=DEFAULT_PHASE1_DIM,
-                        help=f"Base dim for Phase 1 (default: {DEFAULT_PHASE1_DIM} = MUP_BASE_DIM)")
-    parser.add_argument("--phase1-enc", type=int, default=4,
-                        help="Encoder layers in Phase 1 (default 4 — kept tiny for speed)")
-    parser.add_argument("--phase1-dec", type=int, default=2,
-                        help="Decoder layers in Phase 1 (default 2 — kept tiny for speed)")
-    parser.add_argument("--verify-transfer", action="store_true",
-                        help="After Phase 1, run Phase 2 LR-transfer verification "
-                             "across widths. Adds ~3 hours; recommended before the big sweep.")
-    parser.add_argument("--phase2-dims", default=None,
-                        help="Comma-separated dims for Phase 2 "
-                             f"(default: {DEFAULT_PHASE2_DIMS})")
-    parser.add_argument("--phase2-tokens", type=int, default=None,
-                        help="Tokens per Phase 2 run (default: same as --tokens)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Plan only; don't train")
+                        help="Comma-separated LRs "
+                             f"(default: {','.join(f'{x:.0e}' for x in DEFAULT_LRS)})")
+    parser.add_argument("--seeds", default=None,
+                        help=f"Comma-separated seeds (default: {DEFAULT_SEEDS})")
+    parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS,
+                        help=f"Tokens per run (default: {DEFAULT_TOKENS:,})")
+    parser.add_argument("--enc", type=int, default=4,
+                        help="Encoder layers (default 4)")
+    parser.add_argument("--dec", type=int, default=2,
+                        help="Decoder layers (default 2)")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--plot-only", action="store_true",
-                        help="Re-render plots from existing results.json; no training")
-    parser.add_argument("--no-compile", action="store_true",
-                        help="Disable torch.compile (default: compile on). Use as "
-                             "an escape hatch if compile breaks for some arch.")
+                        help="Re-render via mup_verdict.py from existing results.json")
+    parser.add_argument("--no-compile", action="store_true")
 
-    # --single-run: internal subprocess entrypoint invoked by _train_one for
-    # one (model_type, dim, lr) point. Not for direct human use; it exists so
-    # each training run gets its own clean torch process (no compile-cache or
-    # allocator state inherited from prior runs).
     parser.add_argument("--single-run", action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--single-mt", default=None, help=argparse.SUPPRESS)
@@ -432,6 +452,8 @@ def main():
     parser.add_argument("--single-dec", type=int, default=None,
                         help=argparse.SUPPRESS)
     parser.add_argument("--single-lr", type=float, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--single-seed", type=int, default=None,
                         help=argparse.SUPPRESS)
     parser.add_argument("--single-tokens", type=int, default=None,
                         help=argparse.SUPPRESS)
@@ -446,16 +468,19 @@ def main():
             model_type=args.single_mt, dim=args.single_dim,
             enc=args.single_enc, dec=args.single_dec,
             tokens=args.single_tokens, lr=args.single_lr,
+            seed=args.single_seed,
             run_tag=args.single_run_tag,
             result_path=args.single_result_path,
             use_compile=use_compile)
         return
 
     archs = [a.strip() for a in args.archs.split(",")]
-    lrs = ([float(x) for x in args.lrs.split(",")] if args.lrs else DEFAULT_LRS)
-    phase2_dims = ([int(x) for x in args.phase2_dims.split(",")]
-                   if args.phase2_dims else DEFAULT_PHASE2_DIMS)
-    phase2_tokens = args.phase2_tokens or args.tokens
+    dims = ([int(x) for x in args.dims.split(",")]
+            if args.dims else list(DEFAULT_DIMS))
+    lrs = ([float(x) for x in args.lrs.split(",")]
+           if args.lrs else list(DEFAULT_LRS))
+    seeds = ([int(x) for x in args.seeds.split(",")]
+             if args.seeds else list(DEFAULT_SEEDS))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     results_path = OUT_DIR / "results.json"
@@ -464,8 +489,9 @@ def main():
         if not results_path.exists():
             print(f"No results at {results_path} — run without --plot-only first.")
             sys.exit(1)
-        all_results = json.loads(results_path.read_text())
-        _plot(all_results)
+        subprocess.run([sys.executable,
+                        str(Path(__file__).resolve().parent / "mup_verdict.py"),
+                        "--results", str(results_path)], check=True)
         return
 
     all_results = []
@@ -473,32 +499,23 @@ def main():
         all_results = json.loads(results_path.read_text())
         print(f"Resuming from {len(all_results)} prior results in {results_path}")
 
-    # Phase 1
-    p1 = _phase1(archs, args.phase1_dim, args.phase1_enc, args.phase1_dec,
-                 args.tokens, lrs, dry_run=args.dry_run, use_compile=use_compile)
-    all_results.extend(p1)
+    new_results = _sweep(archs, dims, lrs, seeds, args.enc, args.dec,
+                         args.tokens, dry_run=args.dry_run,
+                         use_compile=use_compile,
+                         existing_results=all_results)
+    all_results.extend(new_results)
     if not args.dry_run:
         results_path.write_text(json.dumps(all_results, indent=2))
 
-    best = _best_lr_per_arch([r for r in all_results if r.get("phase") == 1])
+    best = _best_lr_per_arch(all_results, base_dim=BASE_DIM)
     if best and not args.dry_run:
         _write_tuned_json(best)
 
-    # Phase 2 (optional)
-    if args.verify_transfer:
-        p2 = _phase2(archs, best, phase2_dims, args.phase1_enc, args.phase1_dec,
-                     phase2_tokens, dry_run=args.dry_run, use_compile=use_compile)
-        all_results.extend(p2)
-        if not args.dry_run:
-            results_path.write_text(json.dumps(all_results, indent=2))
-
     if not args.dry_run:
-        _plot(all_results)
+        subprocess.run([sys.executable,
+                        str(Path(__file__).resolve().parent / "mup_verdict.py"),
+                        "--results", str(results_path)], check=True)
     print("\nDone.")
-    if best:
-        print("Per-arch tuned base LRs (also written to configs/mup_tuned.json):")
-        for mt, info in best.items():
-            print(f"  {mt}: base_lr={info['base_lr']:.2e}")
 
 
 if __name__ == "__main__":

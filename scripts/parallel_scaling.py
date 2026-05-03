@@ -730,7 +730,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                      tokenizer=None,
                      run_sft=False, sft_train_file=None, sft_eval_file=None,
                      sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4,
-                     wandb_runs=None, save_checkpoints=False):
+                     wandb_runs=None, save_checkpoints=False,
+                     step_callback=None):
     """Train all co-resident models for one token budget. After training,
     run held-out PPL eval, then (optionally) the full benchmark suite, and
     write per-run JSONs into output_dir.
@@ -744,6 +745,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         eval_suite: group name ("paper", "quick", "all", "intrinsic", ...) or
             comma-separated eval names.
         eval_max_examples: per-eval cap (500 matches the SFT script default).
+        step_callback: optional callable(trainers, step, total_steps) invoked
+            at every grad-accum boundary; mup_base_sweep uses it for the
+            mid-training coord probe. `None` (default) keeps the fast path.
     """
     tokens_per_step = batch_size * grad_accum * SEQ_LEN
     total_steps = max(1, total_tokens // tokens_per_step)
@@ -844,6 +848,9 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                         _wandb_log(wandb_runs, t["display"], {
                             "eval/loss_mid": eval_loss,
                         }, step=t["step"])
+
+        if step_callback is not None and is_step_boundary and current_step > 0:
+            step_callback(trainers, current_step, total_steps)
 
         # Log progress
         if current_step > 0 and current_step % log_interval == 0 and is_step_boundary:

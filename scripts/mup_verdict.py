@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Render a single MuP-working-or-not verdict figure from mup_base_sweep results.
+"""Render the μP transfer verdict figure from mup_base_sweep results.
 
-Reads checkpoints/mup_base_sweep/results.json (written by mup_base_sweep.py
-when run with --verify-transfer) and produces:
+Reads checkpoints/mup_base_sweep/results.json (full grid: archs × dims × lrs ×
+seeds) and produces:
 
   checkpoints/mup_base_sweep/mup_verdict.png
 
-Three panels per arch:
-  1. Phase 1 U-curve at base width (full LR sweep, basin shape)
-  2. Phase 2 U-curves, one per width, with argmin starred (the MuP coord check)
-  3. argmin-LR vs width on log-log axes (flat horizontal => transfer working)
+Four panels per arch:
+  1. Base-width LR sweep (seed-mean ± seed-range)
+  2. Full LR×width grid (seed-mean curves; stars at argmin per width)
+  3. Argmin-LR vs width on log-log axes (the verdict plot)
+  4. Mid-training coord-check trajectory (logits-RMS at fractional progress,
+     one line per width, taken at each width's empirical-best LR)
 
-Verdict (printed and rendered in the figure title):
-  PASS  — every width has the same argmin LR on the Phase 2 grid
-  PASS* — argmins span one grid step (±2x) but not monotonic across widths
-  WARN  — argmins drift monotonically across widths by one step
-  FAIL  — argmins span the full 4x grid (best/2 at one width, best*2 at another)
+Verdicts (from spread of argmin LRs across widths):
+  PASS  — every width's seed-mean argmin lands on the same LR
+  PASS* — argmins span 1 grid step, but not monotonic across widths
+  WARN  — argmins drift monotonically by 1 grid step (try a wider/finer grid)
+  FAIL  — spread > 2× — μP transfer is genuinely broken
 
 Usage:
     python scripts/mup_verdict.py
@@ -24,6 +26,7 @@ Usage:
 
 import argparse
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -37,14 +40,9 @@ DEFAULT_OUT = PROJECT_ROOT / "checkpoints" / "mup_base_sweep" / "mup_verdict.png
 
 
 def _classify(argmins_by_width):
-    """Decide PASS / PASS* / WARN / FAIL from {dim: argmin_lr}.
-
-    The Phase 2 grid is {best/2, best, best*2}, so any argmin spread is a
-    multiple of 2 in log-LR. Spread of 1.0 means perfect agreement; 2.0 is
-    one grid step (within resolution); 4.0 is the full grid (clear failure).
-    """
+    """PASS / PASS* / WARN / FAIL from {dim: argmin_lr}."""
     if len(argmins_by_width) < 2:
-        return "INSUFFICIENT", "Need at least 2 widths in Phase 2 to judge transfer"
+        return "INSUFFICIENT", "Need at least 2 widths to judge transfer"
 
     dims_sorted = sorted(argmins_by_width)
     lrs = [argmins_by_width[d] for d in dims_sorted]
@@ -63,15 +61,73 @@ def _classify(argmins_by_width):
     return "FAIL", f"argmin spans full {spread:.0f}x grid ({min(lrs):.0e}..{max(lrs):.0e}) — μP transfer is broken"
 
 
-def _argmin_per_width(p2_runs):
-    """For each width in p2_runs, return the LR that minimized eval loss."""
+def _aggregate(records):
+    """Group by (model_type, dim, lr) and compute seed mean / range."""
+    by = {}
+    for r in records:
+        if r.get("final_eval_loss") is None:
+            continue
+        key = (r["model_type"], r["dim"], r["lr"])
+        by.setdefault(key, []).append(r)
+    agg = {}
+    for key, runs in by.items():
+        losses = [r["final_eval_loss"] for r in runs]
+        agg[key] = {
+            "mean": sum(losses) / len(losses),
+            "min": min(losses),
+            "max": max(losses),
+            "n": len(losses),
+            "runs": runs,
+        }
+    return agg
+
+
+def _argmin_per_width(agg, mt):
+    """For each dim of arch `mt`, return LR with lowest seed-mean eval loss."""
     by_dim = {}
-    for r in p2_runs:
-        by_dim.setdefault(r["dim"], []).append(r)
-    return {
-        d: min(rs, key=lambda r: r["final_eval_loss"])["lr"]
-        for d, rs in by_dim.items()
-    }
+    for (model_type, dim, lr), v in agg.items():
+        if model_type != mt:
+            continue
+        by_dim.setdefault(dim, []).append((lr, v["mean"]))
+    return {d: min(rows, key=lambda x: x[1])[0] for d, rows in by_dim.items()}
+
+
+def _best_lr_at_width(agg, mt, dim):
+    """Per-width best LR (used to pick which coord-curve to plot)."""
+    rows = [(lr, v["mean"]) for (m, d, lr), v in agg.items()
+            if m == mt and d == dim]
+    return min(rows, key=lambda x: x[1])[0] if rows else None
+
+
+def _coord_series(records, mt, dim, lr, metric):
+    """Average a coord-curve metric across seeds for a (mt, dim, lr) cell."""
+    runs = [r for r in records if r["model_type"] == mt and r["dim"] == dim
+            and abs(r["lr"] - lr) < 1e-12 and r.get("coord_curve")]
+    if not runs:
+        return [], []
+    by_frac = {}
+    for r in runs:
+        for c in r["coord_curve"]:
+            f = c.get("fraction")
+            if f is None:
+                continue
+            v = c.get(metric)
+            if v is None:
+                # logits_rms / embed_rms / qk_std map straight to a key; for
+                # layer_rms we accept "last_dec" / "last_enc" pseudo-keys.
+                if metric == "last_layer":
+                    lr_dict = c.get("layer_rms") or {}
+                    if not lr_dict:
+                        continue
+                    last_key = max(lr_dict.keys(),
+                                   key=lambda k: int(k.rsplit("_", 1)[-1]) if k.rsplit("_", 1)[-1].isdigit() else -1)
+                    v = lr_dict[last_key]
+                else:
+                    continue
+            by_frac.setdefault(f, []).append(v)
+    fracs = sorted(by_frac)
+    means = [statistics.mean(by_frac[f]) for f in fracs]
+    return fracs, means
 
 
 def render(results_path, out_path):
@@ -79,67 +135,79 @@ def render(results_path, out_path):
         print(f"No results at {results_path}", file=sys.stderr)
         sys.exit(1)
     all_results = json.loads(results_path.read_text())
-
     finished = [r for r in all_results if r.get("final_eval_loss") is not None]
-    archs = sorted({r["model_type"] for r in finished})
-    if not archs:
-        print("No finished runs in results.json yet — is the sweep still going?",
+    if not finished:
+        print("No finished runs in results.json yet — sweep still running?",
               file=sys.stderr)
         sys.exit(1)
 
+    archs = sorted({r["model_type"] for r in finished})
+    agg = _aggregate(finished)
+
+    base_dim = min({r["dim"] for r in finished})
+
     n = len(archs)
-    fig, axes = plt.subplots(n, 3, figsize=(15, 4 * n), squeeze=False)
-
+    fig, axes = plt.subplots(n, 4, figsize=(20, 4 * n), squeeze=False)
     overall_verdict = []
-    for row, mt in enumerate(archs):
-        p1 = sorted([r for r in finished if r["phase"] == 1 and r["model_type"] == mt],
-                    key=lambda r: r["lr"])
-        p2 = [r for r in finished if r["phase"] == 2 and r["model_type"] == mt]
 
-        # ── Panel 1: Phase 1 U-curve ──────────────────────────────────────
+    for row, mt in enumerate(archs):
+        # ── Panel 1: base-width LR sweep with seed band ──────────────────
         ax = axes[row][0]
-        if p1:
-            xs = [r["lr"] for r in p1]
-            ys = [r["final_eval_loss"] for r in p1]
-            ax.plot(xs, ys, "o-", color="steelblue", linewidth=2, markersize=7)
-            best = min(p1, key=lambda r: r["final_eval_loss"])
-            ax.plot(best["lr"], best["final_eval_loss"], "*",
-                    markersize=18, color="red", zorder=5)
-            ax.annotate(f"best lr={best['lr']:.0e}",
-                        xy=(best["lr"], best["final_eval_loss"]),
+        cells = sorted([((m, d, lr), v) for (m, d, lr), v in agg.items()
+                        if m == mt and d == base_dim],
+                       key=lambda x: x[0][2])
+        if cells:
+            xs = [k[2] for k, _ in cells]
+            means = [v["mean"] for _, v in cells]
+            mins = [v["min"] for _, v in cells]
+            maxs = [v["max"] for _, v in cells]
+            ax.fill_between(xs, mins, maxs, color="steelblue", alpha=0.2,
+                            label="seed range")
+            ax.plot(xs, means, "o-", color="steelblue", linewidth=2,
+                    markersize=7, label="seed mean")
+            best_idx = means.index(min(means))
+            ax.plot(xs[best_idx], means[best_idx], "*", markersize=18,
+                    color="red", zorder=5)
+            ax.annotate(f"best lr={xs[best_idx]:.0e}",
+                        xy=(xs[best_idx], means[best_idx]),
                         xytext=(8, 8), textcoords="offset points")
         ax.set_xscale("log")
         ax.set_xlabel("learning rate")
         ax.set_ylabel("final eval loss")
-        ax.set_title(f"{mt} — Phase 1 (base width)")
+        ax.set_title(f"{mt} — base width (dim={base_dim})\nseed-mean ± seed-range")
         ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left")
 
-        # ── Panel 2: Phase 2 per-width U-curves ───────────────────────────
+        # ── Panel 2: full LR × width grid ─────────────────────────────────
         ax = axes[row][1]
         argmins = {}
-        if p2:
-            dims = sorted({r["dim"] for r in p2})
-            cmap = plt.get_cmap("viridis", max(len(dims), 2))
-            for i, d in enumerate(dims):
-                runs = sorted([r for r in p2 if r["dim"] == d],
-                              key=lambda r: r["lr"])
-                xs = [r["lr"] for r in runs]
-                ys = [r["final_eval_loss"] for r in runs]
-                color = cmap(i)
-                ax.plot(xs, ys, "o-", color=color, linewidth=2,
-                        label=f"dim={d}")
-                bw = min(runs, key=lambda r: r["final_eval_loss"])
-                argmins[d] = bw["lr"]
-                ax.plot(bw["lr"], bw["final_eval_loss"], "*",
-                        markersize=18, color=color, markeredgecolor="black",
-                        markeredgewidth=1.0, zorder=5)
-            ax.legend()
+        dims = sorted({d for (m, d, _) in agg if m == mt})
+        cmap = plt.get_cmap("viridis", max(len(dims), 2))
+        for i, d in enumerate(dims):
+            cells_d = sorted([((m, dd, lr), v) for (m, dd, lr), v in agg.items()
+                              if m == mt and dd == d],
+                             key=lambda x: x[0][2])
+            if not cells_d:
+                continue
+            xs = [k[2] for k, _ in cells_d]
+            means = [v["mean"] for _, v in cells_d]
+            mins = [v["min"] for _, v in cells_d]
+            maxs = [v["max"] for _, v in cells_d]
+            color = cmap(i)
+            ax.fill_between(xs, mins, maxs, color=color, alpha=0.15)
+            ax.plot(xs, means, "o-", color=color, linewidth=2, label=f"dim={d}")
+            best_idx = means.index(min(means))
+            argmins[d] = xs[best_idx]
+            ax.plot(xs[best_idx], means[best_idx], "*", markersize=18,
+                    color=color, markeredgecolor="black", markeredgewidth=1.0,
+                    zorder=5)
+        ax.legend()
         ax.set_xscale("log")
         ax.set_xlabel("learning rate")
-        ax.set_title(f"{mt} — Phase 2 width transfer\n(stars = argmin per width)")
+        ax.set_title(f"{mt} — full LR × width grid\n(stars = argmin per width)")
         ax.grid(True, alpha=0.3)
 
-        # ── Panel 3: argmin-LR vs width (the verdict plot) ────────────────
+        # ── Panel 3: argmin LR vs width with verdict ─────────────────────
         ax = axes[row][2]
         verdict, detail = _classify(argmins)
         overall_verdict.append((mt, verdict, detail))
@@ -150,24 +218,42 @@ def render(results_path, out_path):
             for d in dims_sorted:
                 ax.annotate(f"{argmins[d]:.0e}", xy=(d, argmins[d]),
                             xytext=(6, 6), textcoords="offset points")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("width (dim)")
-        ax.set_ylabel("argmin LR")
+            median = sorted(argmins.values())[len(argmins) // 2]
+            ax.axhline(median, color="gray", linestyle="--", alpha=0.5,
+                       label="perfect transfer")
+            ax.legend()
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel("width (dim)"); ax.set_ylabel("argmin LR")
         color = {"PASS": "green", "PASS*": "olive",
                  "WARN": "darkorange", "FAIL": "crimson",
                  "INSUFFICIENT": "gray"}.get(verdict, "black")
         ax.set_title(f"{mt} — verdict: {verdict}", color=color, fontweight="bold")
         ax.grid(True, alpha=0.3)
-        # Reference line: where a perfect-transfer optimum would sit
-        if argmins:
-            median = sorted(argmins.values())[len(argmins) // 2]
-            ax.axhline(median, color="gray", linestyle="--", alpha=0.5,
-                       label="perfect transfer")
-            ax.legend()
+
+        # ── Panel 4: mid-training coord trajectory per width ─────────────
+        ax = axes[row][3]
+        for i, d in enumerate(dims):
+            best_lr_d = _best_lr_at_width(agg, mt, d)
+            if best_lr_d is None:
+                continue
+            fracs, vals = _coord_series(finished, mt, d, best_lr_d,
+                                        "logits_rms")
+            if fracs:
+                ax.plot(fracs, vals, "o-", color=cmap(i),
+                        label=f"dim={d} @ lr={best_lr_d:.0e}",
+                        linewidth=2, markersize=6)
+        ax.set_xlabel("training fraction")
+        ax.set_ylabel("logits RMS (seed-mean)")
+        ax.set_title(f"{mt} — mid-training coord check\n"
+                     "(flat across widths ⇒ μP holding)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
 
     overall = ", ".join(f"{mt}: {v}" for mt, v, _ in overall_verdict)
-    fig.suptitle(f"μP transfer check — {overall}", fontsize=14, fontweight="bold")
+    n_seeds = len({r.get("seed", 0) for r in finished})
+    fig.suptitle(f"μP transfer check — {overall}  "
+                 f"(n_seeds={n_seeds}, full LR×width grid)",
+                 fontsize=14, fontweight="bold")
     plt.tight_layout(rect=(0, 0, 1, 0.97))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

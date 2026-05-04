@@ -32,9 +32,6 @@ class Double_Decoder(nn.Module):
         self.mup_base_head_dim = mup_base_head_dim
         mup = mup_base_dim > 0
         self.mup_mult = mup_base_dim / dim if mup else 1.0
-        # With tied embedding (constant std init), readout grows like √dim from
-        # the dim-wide dot product, not like dim — so the readout multiplier is
-        # √(base/dim), not base/dim. Verified by mup_full_check.py Check 6.
         self.mup_readout_mult = math.sqrt(self.mup_mult)
         # Token embeddings
         self.embedding = nn.Embedding(vocab_size, dim)
@@ -82,7 +79,7 @@ class Double_Decoder(nn.Module):
 
         return x
     
-    #More complicated, uses combo attention in combination with the results of encode
+    # uses combo attention in combination with the results of encode
     def decode(self, input_ids, encoder_output, block_masks = None, decoder_input_positions=None):
 
         # Embed input tokens (μP: scale embedding output by base_dim/dim)
@@ -104,7 +101,7 @@ class Double_Decoder(nn.Module):
         return logits
     
     #Forward combines encode with decode, but also works for when we are SFTing
-    #For SFTing I use "blocks" as just regular causal/full attention as in a regular encoder-decoder
+    # For SFTing, use blocks as regular causal/full attention as in a regular encoder-decoder
     #We don't **technically need blocks** and might want to remove them (NOTE) but I found this made it easier
     #So we don't have to split up into forward pt / forward inference 
     def forward(

@@ -77,32 +77,17 @@ def load_model(checkpoint_path, tokenizer_path=None, device="cuda"):
     model = model.to(device)
     model.eval()
 
-    # Load tokenizer. When path isn't pinned, pick the one whose vocab matches
-    # the loaded model — guards against the silent 8k/32k mismatch that would
-    # otherwise produce garbage outputs without raising.
+    # Refuse to silently mismatch tokenizer/model vocab — that produces garbage
+    # outputs without raising.
     model_vocab = model.embedding.weight.shape[0]
-    candidates = ["tokenizer/tokenizer_32k.json", "tokenizer/tokenizer.json"]
     if tokenizer_path is None:
-        existing = [c for c in candidates if os.path.exists(c)]
-        matched = None
-        for c in existing:
-            tk = PreTrainedTokenizerFast(tokenizer_file=c)
-            if tk.vocab_size == model_vocab:
-                matched = (c, tk)
-                break
-        if matched is None:
-            raise RuntimeError(
-                f"Model expects vocab={model_vocab} but no tokenizer file matches. "
-                f"Searched {candidates}. Pass tokenizer_path explicitly."
-            )
-        tokenizer_path, tokenizer = matched
-    else:
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
-        if tokenizer.vocab_size != model_vocab:
-            raise RuntimeError(
-                f"tokenizer_path={tokenizer_path} has vocab={tokenizer.vocab_size} "
-                f"but model expects vocab={model_vocab}."
-            )
+        tokenizer_path = "tokenizer/tokenizer_32k.json"
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+    if tokenizer.vocab_size != model_vocab:
+        raise RuntimeError(
+            f"tokenizer_path={tokenizer_path} has vocab={tokenizer.vocab_size} "
+            f"but model expects vocab={model_vocab}."
+        )
 
     return model, tokenizer, is_enc_dec
 

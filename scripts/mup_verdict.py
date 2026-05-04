@@ -35,8 +35,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_RESULTS = PROJECT_ROOT / "checkpoints" / "mup_base_sweep" / "results.json"
-DEFAULT_OUT = PROJECT_ROOT / "checkpoints" / "mup_base_sweep" / "mup_verdict.png"
+DEFAULT_RESULTS = PROJECT_ROOT / "mup_base_sweep" / "results.json"
+DEFAULT_OUT = PROJECT_ROOT / "mup_base_sweep" / "mup_verdict.png"
 
 
 def _classify(argmins_by_width):
@@ -147,7 +147,7 @@ def render(results_path, out_path):
     base_dim = min({r["dim"] for r in finished})
 
     n = len(archs)
-    fig, axes = plt.subplots(n, 4, figsize=(20, 4 * n), squeeze=False)
+    fig, axes = plt.subplots(n, 3, figsize=(15, 4 * n), squeeze=False)
     overall_verdict = []
 
     for row, mt in enumerate(archs):
@@ -229,25 +229,6 @@ def render(results_path, out_path):
                  "INSUFFICIENT": "gray"}.get(verdict, "black")
         ax.set_title(f"{mt} — verdict: {verdict}", color=color, fontweight="bold")
         ax.grid(True, alpha=0.3)
-
-        # ── Panel 4: mid-training coord trajectory per width ─────────────
-        ax = axes[row][3]
-        for i, d in enumerate(dims):
-            best_lr_d = _best_lr_at_width(agg, mt, d)
-            if best_lr_d is None:
-                continue
-            fracs, vals = _coord_series(finished, mt, d, best_lr_d,
-                                        "logits_rms")
-            if fracs:
-                ax.plot(fracs, vals, "o-", color=cmap(i),
-                        label=f"dim={d} @ lr={best_lr_d:.0e}",
-                        linewidth=2, markersize=6)
-        ax.set_xlabel("training fraction")
-        ax.set_ylabel("logits RMS (seed-mean)")
-        ax.set_title(f"{mt} — mid-training coord check\n"
-                     "(flat across widths ⇒ μP holding)")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
 
     overall = ", ".join(f"{mt}: {v}" for mt, v, _ in overall_verdict)
     n_seeds = len({r.get("seed", 0) for r in finished})

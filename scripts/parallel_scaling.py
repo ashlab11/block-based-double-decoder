@@ -720,6 +720,66 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
     return avg_final_loss, train_time, step, final_mfu
 
 
+# ── Fractional checkpoint helper ────────────────────────────────────────────
+
+def _save_trainer_checkpoint(t, fraction, total_tokens, batch_size, grad_accum,
+                             tok_label, scaling_dir, hf_repo=None):
+    """Save trainer ``t``'s weights at progress ``fraction`` (0, 1].
+
+    Writes to ``scaling_dir`` with a ``_pct{NNN}`` suffix and, if ``hf_repo``
+    is set, uploads the same file to HF Hub. Failures in the HF leg are
+    logged but do NOT abort the training run — the local copy remains.
+    """
+    pct = int(round(fraction * 100))
+    arch = t["arch"]
+    actual_base_lr = (LR_OVERRIDE if LR_OVERRIDE is not None
+                      else base_lr_for(t["model_type"]))
+    if LR_OVERRIDE is not None:
+        lr_source = "CLI --peak-lr"
+    elif t["model_type"] in TUNED_LRS:
+        lr_source = "configs/mup_tuned.json"
+    else:
+        lr_source = "BASE_LR fallback"
+    eager_for_save = getattr(t["model"], "_orig_mod", t["model"])
+
+    hparams = {
+        "model_cls": MODEL_TYPE_NAMES[t["model_type"]],
+        "dim": arch["dim"],
+        "num_encoder_layers": arch["num_encoder_layers"],
+        "num_decoder_layers": arch["num_decoder_layers"],
+        "num_heads": arch["dim"] // 64,
+        "seq_len": SEQ_LEN,
+        "mup_base_dim": MUP_BASE_DIM if MUP_ENABLED else 0,
+        "mup_enabled": MUP_ENABLED,
+        "lr": actual_base_lr,
+        "lr_source": lr_source,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum,
+        "total_tokens": total_tokens,
+    }
+    ckpt_path = scaling_dir / f"{t['model_type']}_{t['name']}_{tok_label}tok_pct{pct:03d}.pt"
+    torch.save({
+        "state_dict": eager_for_save.state_dict(),
+        "hparams": hparams,
+        "vocab_size": eager_for_save.embedding.weight.shape[0],
+        "model_type": t["model_type"],
+        "step": t["step"],
+        "tokens_seen": t["tokens_seen"],
+        "fraction": fraction,
+    }, ckpt_path)
+    print(f"      [save@pct{pct:03d}] {t['display']} step={t['step']} "
+          f"tok={t['tokens_seen']/1e6:.1f}M  -> {ckpt_path}")
+
+    if hf_repo:
+        try:
+            from training.hf_hub import upload_checkpoint
+            rel = f"{t['model_type']}/{t['name']}/{tok_label}tok/pct{pct:03d}.pt"
+            upload_checkpoint(ckpt_path, hf_repo, rel, repo_type="model")
+        except Exception as e:
+            print(f"      [hf-upload] FAILED for {ckpt_path}: {e}  -- continuing")
+    return ckpt_path
+
+
 # ── Training one token budget ───────────────────────────────────────────────
 
 def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accum,
@@ -731,6 +791,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                      run_sft=False, sft_train_file=None, sft_eval_file=None,
                      sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4,
                      wandb_runs=None, save_checkpoints=False,
+                     checkpoint_fractions=(), hf_repo=None,
                      step_callback=None):
     """Train all co-resident models for one token budget. After training,
     run held-out PPL eval, then (optionally) the full benchmark suite, and
@@ -768,6 +829,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "needs_blocks": m["needs_blocks"], "arch": m["arch"],
             "step": 0, "micro": 0, "loss_sum": 0.0, "loss_n": 0,
             "train_curve": [], "eval_curve": [], "tokens_seen": 0,
+            "pct_fractions_done": set(),
         })
 
     for t in trainers:
@@ -776,6 +838,17 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         # Per-model-type iterator: each trainer's collator produces a different
         # batch shape (DD blocks vs SED T5-corruption vs DEC single-stream).
         t["_train_iter"] = iter(train_loaders[t["model_type"]])
+
+    # Resolve mid-training fractional checkpoints. 1.0 is handled by the
+    # end-of-budget save block so it's not in the in-loop schedule.
+    mid_fractions = sorted(f for f in (checkpoint_fractions or [])
+                           if 0.0 < f < 1.0)
+    end_save_uses_fractions = bool(checkpoint_fractions) and 1.0 in checkpoint_fractions
+
+    # Output dir is needed both for mid-training saves and for the end-of-budget
+    # results JSON. Materialize it up front so checkpoints have a place to land.
+    scaling_dir = Path(output_dir)
+    scaling_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
 
@@ -834,6 +907,21 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         current_step = trainers[0]["step"]
         is_step_boundary = trainers[0]["micro"] % grad_accum == 0
 
+        # Mid-training fractional checkpoints. Fires once per fraction per
+        # trainer when the lockstep step count crosses f * total_steps.
+        if (is_step_boundary and current_step > 0 and save_checkpoints
+                and mid_fractions):
+            for f in mid_fractions:
+                target_step = max(1, int(round(f * total_steps)))
+                if current_step >= target_step:
+                    for t in trainers:
+                        if f in t["pct_fractions_done"]:
+                            continue
+                        t["pct_fractions_done"].add(f)
+                        _save_trainer_checkpoint(
+                            t, f, total_tokens, batch_size, grad_accum,
+                            tok_label, scaling_dir, hf_repo=hf_repo)
+
         # Periodic eval — only if user opted in. With mid_eval_points=0 we skip
         # all mid-training PPL evals (final-only), saving ~mid_eval_points × 10
         # forward batches per model. The large sweep defaults to 0.
@@ -885,9 +973,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
 
     # Eval + write per-run results — all artifacts land in output_dir so
     # L40/H100/B200 tier jobs writing to the same parallel_scaling/ folder
-    # produce a unified result set.
-    scaling_dir = Path(output_dir)
-    scaling_dir.mkdir(parents=True, exist_ok=True)
+    # produce a unified result set. (scaling_dir was created above so mid-
+    # training fractional checkpoints had a place to land.)
 
     # Lazy import — only needed when run_full_eval is True. Doing it here
     # lets `--skip-full-eval` runs work even if eval module deps are missing.
@@ -971,16 +1058,24 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
         # Persist trained weights (opt-in via --save-checkpoints) so chat.py
         # / inference scripts can reload the same model. Stored alongside the
         # per-run JSON; payload is state_dict + minimal hparams + vocab_size.
+        # When --checkpoint-fractions is set with 1.0, route through the
+        # fractional helper so the file gets a _pct100 suffix and HF upload.
         if save_checkpoints:
-            ckpt_path = scaling_dir / f"{t['model_type']}_{t['name']}_{tok_label}tok.pt"
-            eager_for_save = getattr(t["model"], "_orig_mod", t["model"])
-            torch.save({
-                "state_dict": eager_for_save.state_dict(),
-                "hparams": run_result["hparams"],
-                "vocab_size": eager_for_save.embedding.weight.shape[0],
-                "model_type": t["model_type"],
-            }, ckpt_path)
-            print(f"      [save] {t['display']} → {ckpt_path}")
+            if end_save_uses_fractions:
+                _save_trainer_checkpoint(
+                    t, 1.0, total_tokens, batch_size, grad_accum,
+                    tok_label, scaling_dir, hf_repo=hf_repo)
+            elif not checkpoint_fractions:
+                # Legacy single-save path (no --checkpoint-fractions specified).
+                ckpt_path = scaling_dir / f"{t['model_type']}_{t['name']}_{tok_label}tok.pt"
+                eager_for_save = getattr(t["model"], "_orig_mod", t["model"])
+                torch.save({
+                    "state_dict": eager_for_save.state_dict(),
+                    "hparams": run_result["hparams"],
+                    "vocab_size": eager_for_save.embedding.weight.shape[0],
+                    "model_type": t["model_type"],
+                }, ckpt_path)
+                print(f"      [save] {t['display']} -> {ckpt_path}")
 
         # Pre-SFT eval suite (in-process; reuses already-compiled graph; pass
         # the eager module so eval doesn't trigger recompiles for new shapes).
@@ -1283,6 +1378,20 @@ def main():
                              "dump model weights to <output-dir>/<model_type>_<arch>_<tokens>tok.pt "
                              "so chat.py / inference can reload them. Off by default to avoid "
                              "filling disk during full sweeps.")
+    parser.add_argument("--checkpoint-fractions", type=str, default="",
+                        help="Comma-separated training-progress fractions in (0,1] "
+                             "at which to save checkpoints, e.g. '0.5,0.9,1.0'. Each "
+                             "produces a `_pct{NNN}.pt` file in --output-dir. "
+                             "Requires --save-checkpoints. Default '': legacy single "
+                             "end-of-run save with no _pct suffix.")
+    parser.add_argument("--hf-repo", type=str, default=None,
+                        help="If set, upload each saved checkpoint to this HF Hub repo "
+                             "(e.g. 'username/bbdd-scaling-checkpoints'). Requires "
+                             "huggingface_hub installed and `huggingface-cli login`. "
+                             "Path-in-repo: <model_type>/<arch>/<tokens>tok/pct{NNN}.pt.")
+    parser.add_argument("--hf-private", action="store_true",
+                        help="If --hf-repo is set and the repo doesn't exist yet, "
+                             "create it as private. Default: public.")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan only: print resolved batch sizes and FLOPs/cell")
@@ -1308,6 +1417,41 @@ def main():
     parser.add_argument("--_subprocess-mt", dest="_subprocess_mt", default=None,
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Parse + validate --checkpoint-fractions / --hf-repo. Failing here is much
+    # cheaper than failing 4 hours into a 6B-token cell.
+    checkpoint_fractions = []
+    if args.checkpoint_fractions:
+        try:
+            checkpoint_fractions = sorted({
+                float(x) for x in args.checkpoint_fractions.split(",") if x.strip()
+            })
+        except ValueError as e:
+            print(f"ERROR: --checkpoint-fractions must be comma-separated floats, got "
+                  f"'{args.checkpoint_fractions}': {e}")
+            sys.exit(1)
+        for f in checkpoint_fractions:
+            if not (0.0 < f <= 1.0):
+                print(f"ERROR: --checkpoint-fractions values must be in (0, 1], got {f}")
+                sys.exit(1)
+        if not args.save_checkpoints:
+            print("ERROR: --checkpoint-fractions requires --save-checkpoints")
+            sys.exit(1)
+
+    if args.hf_repo:
+        if not args.save_checkpoints:
+            print("ERROR: --hf-repo requires --save-checkpoints (nothing to upload otherwise)")
+            sys.exit(1)
+        try:
+            from training.hf_hub import verify_repo
+            verify_repo(args.hf_repo, private=args.hf_private)
+        except ImportError as e:
+            print(f"ERROR: --hf-repo set but huggingface_hub unavailable: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: HF preflight failed for {args.hf_repo}: {e}")
+            print("  Did you run `huggingface-cli login`? Token needs write scope.")
+            sys.exit(1)
 
     if args.wandb_project:
         _WANDB_OPTS["project"] = args.wandb_project
@@ -1688,7 +1832,9 @@ def main():
                                 sft_lr=args.sft_lr,
                                 sft_grad_accum=args.sft_grad_accum,
                                 wandb_runs=wandb_runs,
-                                save_checkpoints=args.save_checkpoints)
+                                save_checkpoints=args.save_checkpoints,
+                                checkpoint_fractions=checkpoint_fractions,
+                                hf_repo=args.hf_repo)
                         finally:
                             _finish_wandb_runs(wandb_runs)
                         all_results.setdefault(tok_label, {}).update(results)
@@ -1774,7 +1920,9 @@ def main():
                             sft_lr=args.sft_lr,
                             sft_grad_accum=args.sft_grad_accum,
                             wandb_runs=wandb_runs,
-                            save_checkpoints=args.save_checkpoints)
+                            save_checkpoints=args.save_checkpoints,
+                            checkpoint_fractions=checkpoint_fractions,
+                            hf_repo=args.hf_repo)
                     finally:
                         _finish_wandb_runs(wandb_runs)
                     all_results.setdefault(tok_label, {}).update(results)

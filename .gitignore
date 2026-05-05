@@ -4,3 +4,4 @@ __pycache__/
 evals/*.png
 slurm.env
 logs/
+.venv/

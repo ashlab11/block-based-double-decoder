@@ -26,10 +26,9 @@ class EDSFTCollator:
         padded_decoder = [seq[:self.max_seq_len] + [self.pad_token_id] * max(0, self.max_seq_len - len(seq)) for seq in decoder_inputs]
         padded_labels = [seq[:self.max_seq_len] + [self.label_pad_token_id] * max(0, self.max_seq_len - len(seq)) for seq in labels]
 
-        decoder_input_pos = [
-            [min(cxt_len + pos, self.max_seq_len - 1) for pos in range(self.max_seq_len)]
-            for cxt_len in encoder_lens
-        ]
+        # Standard encoder-decoder decoder positions are local to the decoder,
+        # unlike DD's concatenated-position convention.
+        decoder_input_pos = [list(range(self.max_seq_len)) for _ in encoder_lens]
 
         return {
             "encoder_input_ids": torch.tensor(padded_encoder, dtype=torch.long),

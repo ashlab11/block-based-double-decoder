@@ -1702,11 +1702,15 @@ def main():
             models_info = []
             for name, arch in arch_list:
                 model = build_model(mt, arch, vocab_size, device, use_compile=use_compile)
+                eager = getattr(model, "_orig_mod", model)
+                actual_arch = dict(arch)
+                if mt == "sed":
+                    actual_arch["num_decoder_layers"] = len(eager.decoder_layers)
                 ne = non_emb_param_count(model)
                 print(f"    {name:>6}: dim={arch['dim']:>4}  non_emb={ne:>11,}  "
                       f"grad_ckpt={arch['dim'] >= 320}")
                 models_info.append({
-                    "name": name, "model_type": mt, "arch": arch,
+                    "name": name, "model_type": mt, "arch": actual_arch,
                     "model": model, "ne": ne, "needs_blocks": needs_blocks,
                 })
 

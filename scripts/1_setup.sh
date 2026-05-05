@@ -67,21 +67,35 @@ echo "  Step 1: Setup & Dependencies"
 [ "$IN_ALLOCATION" = 1 ] && echo "  Running under SLURM job ${SLURM_JOB_ID}"
 echo "═══════════════════════════════════════════════════════════════"
 
-# ── (1/4) Install PyTorch (pinned to cu124 for CUDA 12.4 pods) ──────────────
+# ── (1/4) Install PyTorch (auto-select cu128 for Blackwell, cu124 otherwise) ─
+# Blackwell (sm_100, sm_120) has no kernels in cu124 wheels of torch 2.6 and
+# fails with 'no kernel image is available for execution on the device'.
 echo ""
-echo "── (1/4) Installing PyTorch 2.6.0+cu124 ──"
-pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | head -n1)
+COMPUTE_CAP_INT=$(awk -v c="$COMPUTE_CAP" 'BEGIN{split(c,a,"."); printf "%d", a[1]*10 + a[2]}')
+
+if [ "$COMPUTE_CAP_INT" -ge 100 ]; then
+    TORCH_SPEC="torch>=2.7"
+    TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+    echo "── (1/4) Detected Blackwell (compute cap $COMPUTE_CAP) — installing PyTorch with cu128 wheels ──"
+else
+    TORCH_SPEC="torch==2.6.0"
+    TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+    echo "── (1/4) Installing PyTorch 2.6.0+cu124 (compute cap $COMPUTE_CAP) ──"
+fi
+
+pip install "$TORCH_SPEC" --index-url "$TORCH_INDEX"
 echo "  ✓ Installed PyTorch $(python -c 'import torch; print(torch.__version__)')"
 echo "  ✓ CUDA build: $(python -c 'import torch; print(torch.version.cuda)')"
 
 # ── (2/4) Install training stack ─────────────────────────────────────────────
-# Pin torch here too so pip doesn't silently swap our cu124 build for a
-# different one pulled transitively via torchdata→torch.
+# Pin torch here too so pip doesn't silently swap our build for a different
+# one pulled transitively via torchdata→torch.
 echo ""
 echo "── (2/4) Installing training stack ──"
 pip install torchtune==0.6.0 torchao==0.6.1 transformers datasets \
     hydra-core omegaconf matplotlib tqdm wandb hf_transfer \
-    "torch==2.6.0" --index-url https://download.pytorch.org/whl/cu124 \
+    "$TORCH_SPEC" --index-url "$TORCH_INDEX" \
     --extra-index-url https://pypi.org/simple/
 
 # ── (3/4) Install flash-attn (must be AFTER torch, compiled against it) ──────

@@ -141,7 +141,7 @@ class StandardEncDec(nn.Module):
         num_incoming_tokens = input_ids.shape[1]
         num_new_tokens = 1  # Assistant token
         
-        decoder_input_positions = torch.tensor([num_incoming_tokens]).to(device).unsqueeze(0)
+        decoder_input_positions = torch.zeros((1, 1), dtype=torch.long, device=device)
         
         while return_ids[0][-1] != eos_token_id and num_new_tokens < max_new_tokens: 
             #Create block masks if we're on B200 (for now)  

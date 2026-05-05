@@ -10,9 +10,9 @@ class EDPretrainCollator:
         bos_token_id=1,
         label_pad_token_id=-100,
         sentinel_start_id=6,
-        num_sentinel_tokens=15,
+        num_sentinel_tokens=100,
         noise_density=0.15,
-        mean_span_length=3.0,
+        mean_span_length=4.0,
         global_seed=None,
         **kwargs
     ):
@@ -105,10 +105,10 @@ class EDPretrainCollator:
         padded_decoder = [seq + [self.pad_token_id] * (self.max_seq_len - len(seq)) for seq in decoder_inputs]
         padded_labels = [seq + [self.label_pad_token_id] * (self.max_seq_len - len(seq)) for seq in labels]
 
-        decoder_positions = [
-            [min(enc_len + pos, self.max_seq_len - 1) for pos in range(self.max_seq_len)]
-            for enc_len in encoder_lens
-        ]
+        # Standard encoder-decoder uses an independent decoder position stream.
+        # Offsetting by encoder length makes long packed examples clip many
+        # supervised decoder tokens to the final RoPE position.
+        decoder_positions = [list(range(self.max_seq_len)) for _ in encoder_lens]
 
         return {
             "encoder_input_ids": torch.tensor(padded_encoder, dtype=torch.long),

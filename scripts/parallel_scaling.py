@@ -659,9 +659,13 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
     track_mfu = gpu_tflops is not None and tokens_per_micro is not None
 
     opt.zero_grad(set_to_none=True)
-    losses = []
+    losses = []  # one entry per optimizer step (token-weighted mean)
     micro = 0
     step = 0
+    # Token-weighted accumulation — see training/pretrain.py for full
+    # rationale. Single-process here, so no DDP world_size correction.
+    accum_loss_sum = 0.0
+    accum_n_valid = 0
     t0 = time.time()
 
     for batch_idx, raw_batch in enumerate(sft_loader):
@@ -673,19 +677,29 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = trainer["model"](**batch)
             loss = out["loss"]
-        (loss / grad_accum).backward()
-        losses.append(loss.detach().item())
+
+        n_valid = int((batch["labels"] != -100).sum().item())
+        (loss * n_valid).backward()
+        accum_loss_sum += loss.detach().item() * n_valid
+        accum_n_valid += n_valid
         micro += 1
 
         if micro % grad_accum == 0:
+            if accum_n_valid > 0:
+                scale = 1.0 / accum_n_valid
+                for p in eager.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
             torch.nn.utils.clip_grad_norm_(eager.parameters(), 1.0)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1
+            avg = accum_loss_sum / max(1, accum_n_valid)
+            losses.append(avg)
+            accum_loss_sum = 0.0
+            accum_n_valid = 0
             if step % log_interval == 0:
-                recent = losses[-grad_accum:] if len(losses) >= grad_accum else losses
-                avg = sum(recent) / max(1, len(recent))
                 elapsed = time.time() - t0
                 mfu_str = ""
                 if track_mfu:
@@ -827,7 +841,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             "display": f"{m['model_type']}_{m['name']}",
             "model": m["model"], "opt": opt, "sched": sched, "ne": m["ne"],
             "needs_blocks": m["needs_blocks"], "arch": m["arch"],
-            "step": 0, "micro": 0, "loss_sum": 0.0, "loss_n": 0,
+            "step": 0, "micro": 0, "accum_loss_sum": 0.0, "accum_n_valid": 0,
             "train_curve": [], "eval_curve": [], "tokens_seen": 0,
             "pct_fractions_done": set(),
         })
@@ -865,12 +879,19 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out = model_forward(t["model"], batch, t["needs_blocks"])
                 loss = out["loss"]
-            (loss / grad_accum).backward()
-            t["loss_sum"] += loss.detach().item()
-            t["loss_n"] += 1
+
+            n_valid = int((batch["labels"] != -100).sum().item())
+            (loss * n_valid).backward()
+            t["accum_loss_sum"] += loss.detach().item() * n_valid
+            t["accum_n_valid"] += n_valid
             t["micro"] += 1
 
             if t["micro"] % grad_accum == 0:
+                if t["accum_n_valid"] > 0:
+                    scale = 1.0 / t["accum_n_valid"]
+                    for p in t["model"].parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
                 grad_norm_t = torch.nn.utils.clip_grad_norm_(
                     t["model"].parameters(), 1.0)
                 t["opt"].step()
@@ -878,7 +899,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                 t["opt"].zero_grad(set_to_none=True)
                 t["step"] += 1
                 t["tokens_seen"] += tokens_per_step
-                avg_loss = t["loss_sum"] / t["loss_n"]
+                avg_loss = t["accum_loss_sum"] / max(1, t["accum_n_valid"])
                 t["train_curve"].append((t["step"], t["tokens_seen"], round(avg_loss, 4)))
                 if wandb_runs:
                     try:
@@ -901,8 +922,8 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                         "train/tokens_seen": t["tokens_seen"],
                         **({"train/lr": cur_lr} if cur_lr is not None else {}),
                     }, step=t["step"])
-                t["loss_sum"] = 0.0
-                t["loss_n"] = 0
+                t["accum_loss_sum"] = 0.0
+                t["accum_n_valid"] = 0
 
         current_step = trainers[0]["step"]
         is_step_boundary = trainers[0]["micro"] % grad_accum == 0

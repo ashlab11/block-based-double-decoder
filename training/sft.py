@@ -159,6 +159,12 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
     eval_steps = cfg.eval_steps // cfg.grad_accum_steps
     save_steps = cfg.save_steps // cfg.grad_accum_steps
 
+    # Token-weighted accumulation — see training/pretrain.py for the full
+    # rationale. SFT especially benefits since prompt tokens are masked
+    # (-100) so n_valid varies a lot across microbatches.
+    accum_loss_sum = torch.zeros(1, dtype=torch.float64, device=device)
+    accum_n_valid  = torch.zeros(1, dtype=torch.float64, device=device)
+
     progress_bar = tqdm(dataloader, total=len(dataloader), desc="Training", disable=(rank != 0 or verbose <= 1))
     for batch_idx, batch in enumerate(progress_bar):
         batch = {
@@ -169,20 +175,36 @@ def sft(cfg: TrainingConfig, verbose = False) -> str:
             outputs = model(**batch)
             loss = outputs["loss"]
 
-        loss_value = loss.detach().item()
-        (loss / accumulation_steps).backward()
+        n_valid = (batch["labels"] != -100).sum()
+        loss_sum = loss * n_valid
+        loss_sum.backward()
+
+        accum_loss_sum += loss_sum.detach().to(dtype=torch.float64)
+        accum_n_valid  += n_valid.to(dtype=torch.float64)
 
         if (batch_idx + 1) % accumulation_steps == 0:
+            total_n = all_reduce_sum(accum_n_valid).item()
+            if total_n > 0:
+                scale = float(world_size) / total_n
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+
             clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
 
+            total_loss = all_reduce_sum(accum_loss_sum).item()
+            avg_step_loss = total_loss / max(total_n, 1)
+            accum_loss_sum.zero_()
+            accum_n_valid.zero_()
+
             if logging_steps > 0 and step % logging_steps == 0 and rank == 0:
                 if verbose > 1:
-                    tqdm.write(f"Step {step}/{num_accumulations} - loss: {loss_value:.4f}")
-                train_losses.append(loss_value)
+                    tqdm.write(f"Step {step}/{num_accumulations} - loss: {avg_step_loss:.4f}")
+                train_losses.append(avg_step_loss)
                 train_steps_arr.append(step)
 
             if eval_steps > 0 and step % eval_steps == 0:

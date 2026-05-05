@@ -478,9 +478,15 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
         total_tok = display_max * tokens_per_step
         print(f"Total tokens to process: {total_tok:,} ({total_tok / 1e9:.2f}B)")
 
-    # Accumulate micro-batch losses within an accumulation step
-    accum_loss_sum = 0.0
-    accum_loss_count = 0
+    # Token-weighted accumulation: backward (loss * n_valid) per microbatch
+    # (= sum of per-token losses), then before optimizer.step scale grads by
+    # world_size / total_valid_tokens. DDP averaged grads across ranks (÷ W),
+    # so the *W cancels and the net per-param scale is 1/total_n — the true
+    # gradient of (sum of losses across all ranks/microbatches) / (total
+    # valid tokens). Equivalent to F.cross_entropy(reduction='sum') across
+    # the whole accumulation step.
+    accum_loss_sum = torch.zeros(1, dtype=torch.float64, device=device)
+    accum_n_valid  = torch.zeros(1, dtype=torch.float64, device=device)
 
     for batch_idx, batch in enumerate(dataloader):
         # Skip already-processed batches when resuming
@@ -495,12 +501,21 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
             outputs = model(**batch)
             loss = outputs["loss"]
 
-        loss_value = loss.detach().item()
-        accum_loss_sum += loss_value
-        accum_loss_count += 1
-        (loss / steps_per_accum_per_gpu).backward()
+        n_valid = (batch["labels"] != -100).sum()
+        loss_sum = loss * n_valid
+        loss_sum.backward()
+
+        accum_loss_sum += loss_sum.detach().to(dtype=torch.float64)
+        accum_n_valid  += n_valid.to(dtype=torch.float64)
 
         if (batch_idx + 1) % steps_per_accum_per_gpu == 0:
+            total_n = all_reduce_sum(accum_n_valid).item()
+            if total_n > 0:
+                scale = float(world_size) / total_n
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+
             grad = clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
@@ -508,10 +523,10 @@ def pretrain(cfg: TrainingConfig, verbose=0) -> str:
             step += 1
             tokens_seen += tokens_per_step
 
-            # Average loss across micro-batches in this accumulation
-            avg_step_loss = accum_loss_sum / max(accum_loss_count, 1)
-            accum_loss_sum = 0.0
-            accum_loss_count = 0
+            total_loss = all_reduce_sum(accum_loss_sum).item()
+            avg_step_loss = total_loss / max(total_n, 1)
+            accum_loss_sum.zero_()
+            accum_n_valid.zero_()
 
             # Update EMA
             if loss_ema is None:

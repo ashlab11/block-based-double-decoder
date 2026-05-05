@@ -587,11 +587,11 @@ def build_pretrain_collator(model_type, bos_id, eos_id, pad_id, seq_len,
             boundary_strategy=boundary_strategy)
     if model_type == "sed":
         # sentinel_start_id=6 matches the post-merge tokenizer where the
-        # first 6 special tokens occupy ids 0..5 and <sentinel_0..14> sit at 6..20.
+        # first 6 special tokens occupy ids 0..5 and <sentinel_0..99> sit at 6..105.
         return EDPretrainCollator(
             max_seq_len=seq_len, pad_token_id=pad_id,
             bos_token_id=bos_id, eos_token_id=eos_id,
-            sentinel_start_id=6, num_sentinel_tokens=15,
+            sentinel_start_id=6, num_sentinel_tokens=100,
             global_seed=global_seed)
     if model_type == "dec":
         return DecoderPretrainCollator(

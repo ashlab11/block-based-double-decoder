@@ -273,17 +273,14 @@ def check_tokenizer():
     print("\n── Check 7: Tokenizer ──")
     from transformers import PreTrainedTokenizerFast
 
-    # Try 32K first, fall back to 8K
-    for path in ["tokenizer/tokenizer_32k.json", "tokenizer/tokenizer.json"]:
-        if os.path.exists(path):
-            break
-    else:
+    path = "tokenizer/tokenizer_32k.json"
+    if not os.path.exists(path):
         print("  [SKIP] No tokenizer found")
         return True
 
     print(f"  Loading {path}")
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=path)
-    expected_vocab = 32768 if "32k" in path else 8192
+    expected_vocab = 32768
 
     ok = True
     ok &= _print_result(f"Vocab size = {expected_vocab}", tokenizer.vocab_size == expected_vocab,

@@ -1,6 +1,6 @@
 {
   "dd": {
-    "base_lr": 0.015,
+    "base_lr": 0.01,
     "best_loss": 5.62045,
     "n_seeds": 2,
     "phase1_dim": 64,
@@ -84,7 +84,7 @@
     ]
   },
   "dec": {
-    "base_lr": 0.05,
+    "base_lr": 0.01,
     "best_loss": 4.9523,
     "n_seeds": 2,
     "phase1_dim": 64,

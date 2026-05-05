@@ -40,9 +40,6 @@ class StandardEncDec(nn.Module):
         self.mup_base_head_dim = mup_base_head_dim
         mup = mup_base_dim > 0
         self.mup_mult = mup_base_dim / dim if mup else 1.0
-        # With tied embedding (constant std init), readout grows like √dim from
-        # the dim-wide dot product, not like dim — so the readout multiplier is
-        # √(base/dim), not base/dim. Verified by mup_full_check.py Check 6.
         self.mup_readout_mult = math.sqrt(self.mup_mult)
 
         # Shared token embeddings

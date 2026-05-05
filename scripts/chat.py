@@ -1,18 +1,13 @@
-"""Interactive REPL for a trained DecoderOnlyModel checkpoint.
-
-This is a *base pretrain* model — it CONTINUES text rather than chatting.
-Type a prompt; the model emits a continuation. Prior turns stay in context
-so the model can build on what it generated. Commands: 'reset', 'exit'.
-
+"""
 Usage:
-    # 1) Re-run training with weights persisted (one-line patch added):
+    1. after running training with weights persisted (one-line patch added):
     python scripts/parallel_scaling.py --arch-set large --only-arch 5M \\
         --token-set large --token-budgets 500M --model-types dec \\
         --auto-batch-size --no-mup --peak-lr 1e-3 --save-checkpoints \\
         --wandb-project scaling-laws-runpod
 
-    # 2) Chat with the resulting checkpoint:
-    python scripts/chat.py --ckpt checkpoints/parallel_scaling/dec_5M_500Mtok.pt
+    2. chat with the resulting checkpoint:
+    python scripts/chat.py --ckpt checkpoints/parallel_scaling/dec_XM_XXXMtok.pt
 """
 
 import argparse
@@ -23,53 +18,22 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 
-# Allow `python scripts/chat.py` from the repo root without setting PYTHONPATH.
+# Allow `python scripts/chat.py` from repo root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.decoder import DecoderOnlyModel  # noqa: E402
+from models.decoder import DecoderOnlyModel
 
-TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
-# Search order: canonical 32K first, then legacy 8K. Auto-pick still verifies
-# vocab matches the checkpoint, so order is just a tiebreaker.
-TOKENIZER_CANDIDATES = [
-    TOKENIZER_DIR / "tokenizer_32k.json",
-    TOKENIZER_DIR / "tokenizer.json",
-]
-
-
-def pick_tokenizer(explicit: Path | None, model_vocab: int) -> Path:
-    """Resolve which tokenizer file to load. If --tokenizer was passed, honor it
-    (and validate vocab below). Otherwise scan known locations and pick the one
-    whose vocab exactly matches the model — this turns the old silent garbage-
-    output bug into a hard, obvious error."""
-    if explicit is not None:
-        return explicit
-    found = [p for p in TOKENIZER_CANDIDATES if p.exists()]
-    if not found:
-        raise FileNotFoundError(
-            f"No tokenizer found. Looked for: {[str(p) for p in TOKENIZER_CANDIDATES]}. "
-            f"Run scripts/2_data.sh or pass --tokenizer."
-        )
-    for p in found:
-        tk = PreTrainedTokenizerFast(tokenizer_file=str(p))
-        if tk.vocab_size == model_vocab:
-            return p
-    raise RuntimeError(
-        f"Model expects vocab={model_vocab} but no tokenizer in {TOKENIZER_DIR} "
-        f"matches. Available: "
-        + ", ".join(f"{p.name}(vocab={PreTrainedTokenizerFast(tokenizer_file=str(p)).vocab_size})"
-                    for p in found)
-        + ". Pass --tokenizer to point at the correct file."
-    )
+TOKENIZER_PATH = PROJECT_ROOT / "tokenizer" / "tokenizer_32k.json"
 
 
 def load_model(ckpt_path: Path, device: torch.device):
     """Reconstruct DecoderOnlyModel from a parallel_scaling.py or pretrain.py
-    checkpoint. Both formats stash a `state_dict` and an `hparams` dict; this
+    checkpoint. Both stash a 'state_dict' and an 'hparams' dict; this
     handles either layer-naming convention (num_layers vs enc/dec split) and
     strips torch.compile / DDP key prefixes."""
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state_dict = ckpt["state_dict"]
     hparams = ckpt["hparams"]
@@ -77,8 +41,9 @@ def load_model(ckpt_path: Path, device: torch.device):
 
     num_layers = hparams.get("num_layers")
     if num_layers is None:
-        num_layers = (hparams.get("num_encoder_layers", 0)
-                      + hparams.get("num_decoder_layers", 0))
+        num_layers = hparams.get("num_encoder_layers", 0) + hparams.get(
+            "num_decoder_layers", 0
+        )
     if num_layers == 0:
         raise ValueError(f"Couldn't infer num_layers from hparams: {hparams}")
 
@@ -95,22 +60,25 @@ def load_model(ckpt_path: Path, device: torch.device):
     for k, v in state_dict.items():
         for prefix in ("_orig_mod.", "module."):
             if k.startswith(prefix):
-                k = k[len(prefix):]
+                k = k[len(prefix) :]
         cleaned[k] = v
 
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
     if missing:
         print(f"[warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
     if unexpected:
-        print(f"[warn] unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        print(
+            f"[warn] unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}"
+        )
     model.to(device).eval()
     return model, hparams, vocab_size
 
 
 @torch.inference_mode()
-def stream_generate(model, tokens, max_new, temperature, top_k, top_p,
-                    eos_id, seq_len, device):
-    """Yield token ids one at a time. `tokens` is a CPU 1D LongTensor of context.
+def stream_generate(
+    model, tokens, max_new, temperature, top_k, top_p, eos_id, seq_len, device
+):
+    """Yield token ids one at a time. 'tokens' is a CPU 1D LongTensor of context.
     Truncates context from the left to seq_len — fine because attention is
     causal, so dropping old tokens just shortens the window."""
     for _ in range(max_new):
@@ -141,21 +109,30 @@ def stream_generate(model, tokens, max_new, temperature, top_k, top_p,
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ckpt", required=True, type=Path,
-                    help="Trained .pt (e.g. checkpoints/parallel_scaling/dec_5M_500Mtok.pt)")
-    ap.add_argument("--tokenizer", default=None, type=Path,
-                    help="Tokenizer JSON. If omitted, auto-pick one in tokenizer/ "
-                         "whose vocab matches the checkpoint.")
-    ap.add_argument("--max-new", type=int, default=128,
-                    help="Max new tokens to generate per turn.")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--ckpt",
+        required=True,
+        type=Path,
+        help="Trained .pt (e.g. checkpoints/parallel_scaling/dec_5M_500Mtok.pt)",
+    )
+    ap.add_argument(
+        "--max-new", type=int, default=128, help="Max new tokens to generate per turn."
+    )
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=40)
     ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--max-context", type=int, default=None,
-                    help="Cap prompt+history tokens (default: model's seq_len).")
-    ap.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
+    ap.add_argument(
+        "--max-context",
+        type=int,
+        default=None,
+        help="Cap prompt+history tokens (default: model's seq_len).",
+    )
+    ap.add_argument(
+        "--device", default=("cuda" if torch.cuda.is_available() else "cpu")
+    )
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -167,28 +144,33 @@ def main():
     model, hparams, vocab_size = load_model(args.ckpt, device)
     seq_len = args.max_context or hparams.get("seq_len", 2048)
 
-    tokenizer_path = pick_tokenizer(args.tokenizer, vocab_size)
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_path))
+    if not TOKENIZER_PATH.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found at {TOKENIZER_PATH}. Run scripts/2_data.sh."
+        )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(TOKENIZER_PATH))
     bos_id = tokenizer.convert_tokens_to_ids("<s>")
     eos_id = tokenizer.convert_tokens_to_ids("</s>")
     if tokenizer.vocab_size != vocab_size:
-        # User passed --tokenizer explicitly; respect it but refuse to produce
-        # garbage. This used to be a silent warning.
         raise SystemExit(
             f"[fatal] tokenizer vocab={tokenizer.vocab_size} but model "
             f"vocab={vocab_size}. Mismatch produces garbage output."
         )
-    print(f"  Tokenizer: {tokenizer_path.name} (vocab={tokenizer.vocab_size})")
+    print(f"  Tokenizer: {TOKENIZER_PATH.name} (vocab={tokenizer.vocab_size})")
 
-    n_layers = (hparams.get("num_layers")
-                or hparams.get("num_encoder_layers", 0)
-                + hparams.get("num_decoder_layers", 0))
+    n_layers = hparams.get("num_layers") or hparams.get(
+        "num_encoder_layers", 0
+    ) + hparams.get("num_decoder_layers", 0)
     print("=" * 64)
-    print(f"  Model:  {hparams.get('model_cls', 'DecoderOnly')}  "
-          f"dim={hparams['dim']}  layers={n_layers}  seq_len={seq_len}  "
-          f"vocab={vocab_size}")
-    print(f"  Sample: T={args.temperature}  top_k={args.top_k}  top_p={args.top_p}  "
-          f"max_new={args.max_new}")
+    print(
+        f"  Model:  {hparams.get('model_cls', 'DecoderOnly')}  "
+        f"dim={hparams['dim']}  layers={n_layers}  seq_len={seq_len}  "
+        f"vocab={vocab_size}"
+    )
+    print(
+        f"  Sample: T={args.temperature}  top_k={args.top_k}  top_p={args.top_p}  "
+        f"max_new={args.max_new}"
+    )
     print("  This is a base pretrain model — it continues text, not chats.")
     print("  Commands:  reset (clear history)   exit (quit)")
     print("=" * 64)
@@ -222,8 +204,15 @@ def main():
         printed = 0
         print("    ", end="", flush=True)
         for nid in stream_generate(
-            model, history, args.max_new, args.temperature, args.top_k, args.top_p,
-            eos_id, seq_len, device,
+            model,
+            history,
+            args.max_new,
+            args.temperature,
+            args.top_k,
+            args.top_p,
+            eos_id,
+            seq_len,
+            device,
         ):
             out_ids.append(nid)
             full = tokenizer.decode(out_ids, skip_special_tokens=False)

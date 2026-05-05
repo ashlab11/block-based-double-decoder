@@ -5,3 +5,5 @@ evals/*.png
 slurm.env
 logs/
 .venv/
+.venv-data/
+data/Pretrain/

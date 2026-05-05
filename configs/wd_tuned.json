@@ -120,7 +120,7 @@
     ]
   },
   "dec": {
-    "weight_decay": 0.1,
+    "weight_decay": 0.5,
     "best_loss": 4.9279,
     "n_seeds": 2,
     "tuned_lr_used": 0.05,

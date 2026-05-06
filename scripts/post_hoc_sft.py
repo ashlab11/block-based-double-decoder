@@ -41,6 +41,7 @@ import json
 import time
 import argparse
 import traceback
+import random
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -66,6 +67,104 @@ from scripts.parallel_scaling import (
 )
 from evals.run_evals import run_evals_on_model, resolve_eval_names
 from training.hf_hub import upload_checkpoint, available as hf_available
+try:
+    from huggingface_hub import hf_hub_download, HfApi
+except Exception:
+    hf_hub_download = None
+    HfApi = None
+
+
+def build_ctx_resp_eval_collator(model_type, tokenizer, seq_len):
+    """Collator for split-loss eval where both context+response labels are kept.
+    Returns batches that include ctx_mask / resp_mask (shape = labels)."""
+    bos_id = tokenizer.convert_tokens_to_ids("<s>")
+    eos_id = tokenizer.convert_tokens_to_ids("</s>")
+    pad_id = tokenizer.convert_tokens_to_ids("<pad>") or 0
+
+    def _pad(ids):
+        ids = ids[:seq_len]
+        return ids + [pad_id] * (seq_len - len(ids))
+
+    def _collate(batch):
+        if model_type == "dec":
+            inputs, labels, ctx_masks, resp_masks = [], [], [], []
+            for ex in batch:
+                seq = [bos_id] + ex["input_ids"] + ex["output_ids"] + [eos_id]
+                seq = _pad(seq)
+                lab = seq[1:] + [-100]
+                ctx_len = min(1 + len(ex["input_ids"]), seq_len - 1)
+                valid = [tok != pad_id for tok in lab]
+                ctx = [(i < ctx_len and valid[i]) for i in range(seq_len)]
+                resp = [(i >= ctx_len and valid[i]) for i in range(seq_len)]
+                inputs.append(seq)
+                labels.append([tok if v else -100 for tok, v in zip(lab, valid)])
+                ctx_masks.append(ctx)
+                resp_masks.append(resp)
+            return {
+                "input_ids": torch.tensor(inputs, dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+                "ctx_mask": torch.tensor(ctx_masks, dtype=torch.bool),
+                "resp_mask": torch.tensor(resp_masks, dtype=torch.bool),
+            }
+
+        encs, decs, labels, dec_pos, blocks, ctx_masks, resp_masks = [], [], [], [], [], [], []
+        for ex in batch:
+            ctx = [bos_id] + ex["input_ids"]
+            resp = ex["output_ids"] + [eos_id]
+            enc = _pad(ctx)
+            dec = _pad(resp)
+            lab = _pad(resp[1:] + [-100])
+            valid = [tok != pad_id for tok in lab]
+            # no context tokens in decoder labels for enc-dec families
+            ctx_masks.append([False] * seq_len)
+            resp_masks.append(valid)
+            if model_type == "dd":
+                clen = min(len(ctx), seq_len)
+                dpos = [min(clen + j, seq_len - 1) for j in range(seq_len)]
+                blocks.append(clen)
+            else:
+                dpos = list(range(seq_len))
+                blocks.append(min(len(ctx), seq_len))
+            encs.append(enc); decs.append(dec); labels.append([t if v else -100 for t, v in zip(lab, valid)]); dec_pos.append(dpos)
+        return {
+            "encoder_input_ids": torch.tensor(encs, dtype=torch.long),
+            "decoder_input_ids": torch.tensor(decs, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "decoder_input_positions": torch.tensor(dec_pos, dtype=torch.long),
+            "blocks": torch.tensor(blocks, dtype=torch.long),
+            "sft": True,
+            "ctx_mask": torch.tensor(ctx_masks, dtype=torch.bool),
+            "resp_mask": torch.tensor(resp_masks, dtype=torch.bool),
+        }
+    return _collate
+
+
+def compute_split_losses(model, model_type, loader, device):
+    model.eval()
+    ctx_loss_sum = ctx_tok = resp_loss_sum = resp_tok = 0.0
+    ce = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+    with torch.no_grad():
+        for raw in loader:
+            ctx_mask = raw.pop("ctx_mask").to(device)
+            resp_mask = raw.pop("resp_mask").to(device)
+            batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                     for k, v in raw.items()}
+            out = model(**batch)
+            logits, labels = out["logits"], batch["labels"]
+            tok_loss = ce(logits.reshape(-1, logits.size(-1)), labels.reshape(-1)).reshape_as(labels)
+            ctx_loss_sum += float((tok_loss * ctx_mask).sum().item())
+            ctx_tok += float(ctx_mask.sum().item())
+            resp_loss_sum += float((tok_loss * resp_mask).sum().item())
+            resp_tok += float(resp_mask.sum().item())
+    model.train()
+    return {
+        "context_ce": ctx_loss_sum / max(1.0, ctx_tok),
+        "context_ppl": float(torch.exp(torch.tensor(ctx_loss_sum / max(1.0, ctx_tok))).item()) if ctx_tok > 0 else None,
+        "response_ce": resp_loss_sum / max(1.0, resp_tok),
+        "response_ppl": float(torch.exp(torch.tensor(resp_loss_sum / max(1.0, resp_tok))).item()),
+        "context_tokens": int(ctx_tok),
+        "response_tokens": int(resp_tok),
+    }
 
 
 def find_pretrain_checkpoints(search_dir):
@@ -142,6 +241,10 @@ def main():
     # SFT data + hyperparameters (defaults match parallel_scaling.py --run-sft)
     p.add_argument("--sft-train-file", type=str,
                    default="data/SFT/ultrachat.jsonl")
+    p.add_argument("--sft-val-file", type=str, default=None,
+                   help="Heldout context/response jsonl. Defaults to --sft-train-file.")
+    p.add_argument("--sft-train-frac", type=float, default=1.0,
+                   help="Fraction of SFT train set to use (e.g. 0.05 for 5%).")
     p.add_argument("--sft-tokens", type=int, default=50_000_000,
                    help="Approximate target token budget for SFT.")
     p.add_argument("--sft-lr", type=float, default=2e-5)
@@ -167,8 +270,21 @@ def main():
                         "sidecar to this repo. Use the same repo as your "
                         "pretrain --hf-repo so all artifacts live together.")
     p.add_argument("--hf-private", action="store_true")
+    p.add_argument("--hf-search-prefix", type=str, default="",
+                   help="If set, download *_pct100.pt from HF repo under this prefix.")
+    p.add_argument("--hf-require-patterns", type=str, default="",
+                   help="Comma-separated required substrings; picks newest remote checkpoint per pattern.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Global seed for deterministic SFT/eval data order.")
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="If set, logs each post-SFT result to a new wandb run.")
+    p.add_argument("--wandb-entity", type=str, default=None)
 
     args = p.parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Read tuned LRs/WDs so any logging in sft_one_model that references them
     # has the right numbers (sft_one_model itself uses --sft-lr explicitly).
@@ -201,6 +317,39 @@ def main():
 
     # ── Discover work ──────────────────────────────────────────────────────
     ckpts = find_pretrain_checkpoints(args.search_dir)
+    if args.hf_repo and args.hf_search_prefix:
+        if HfApi is None or hf_hub_download is None:
+            print("ERROR: --hf-search-prefix requires huggingface_hub installed.")
+            sys.exit(1)
+        api = HfApi()
+        info = api.model_info(args.hf_repo, files_metadata=True)
+        siblings = getattr(info, "siblings", []) or []
+        remote_meta = []
+        for s in siblings:
+            name = getattr(s, "rfilename", None)
+            if not name:
+                continue
+            if name.startswith(args.hf_search_prefix) and name.endswith("_pct100.pt") and "_postsft_" not in name:
+                remote_meta.append((name, getattr(s, "last_modified", None)))
+
+        req_pats = [p.strip() for p in args.hf_require_patterns.split(",") if p.strip()]
+        if req_pats:
+            selected = []
+            for pat in req_pats:
+                matches = [(n, ts) for n, ts in remote_meta if pat in n]
+                if not matches:
+                    print(f"ERROR: no remote checkpoint matched required pattern '{pat}'")
+                    sys.exit(1)
+                matches.sort(key=lambda x: (str(x[1]) if x[1] is not None else "", x[0]))
+                selected.append(matches[-1][0])
+            remote = sorted(set(selected))
+        else:
+            remote = [n for n, _ in remote_meta]
+
+        for rp in remote:
+            local = Path(hf_hub_download(repo_id=args.hf_repo, filename=rp, repo_type="model"))
+            ckpts.append(local)
+        ckpts = sorted(set(ckpts))
     if args.only_pattern:
         ckpts = [p for p in ckpts if fnmatch(str(p), args.only_pattern)]
     if args.skip_existing:
@@ -225,7 +374,14 @@ def main():
     print(f"[data] loading SFT data from {args.sft_train_file}...")
     sft_train_ds = load_dataset("json", data_files=args.sft_train_file,
                                 split="train")
+    if args.sft_train_frac < 1.0:
+        keep = max(1, int(len(sft_train_ds) * args.sft_train_frac))
+        sft_train_ds = sft_train_ds.select(range(keep))
     print(f"[data] loaded {len(sft_train_ds):,} SFT examples")
+    sft_val_file = args.sft_val_file or args.sft_train_file
+    sft_val_ds = load_dataset("json", data_files=sft_val_file, split="train")
+    sft_train_ds = sft_train_ds.shuffle(seed=args.seed)
+    sft_val_ds = sft_val_ds.shuffle(seed=args.seed)
 
     eval_names = resolve_eval_names(args.eval_suite)
     print(f"[eval] suite '{args.eval_suite}' → {len(eval_names)} eval(s): {eval_names}")
@@ -383,6 +539,49 @@ def main():
                 "eval_max_examples": args.eval_max_examples,
                 "wall_time_sec": round(time.time() - t_total, 1),
             }
+            split_collator = build_ctx_resp_eval_collator(model_type, tokenizer, SEQ_LEN)
+            split_loader = DataLoader(
+                sft_val_ds, batch_size=args.batch_size, shuffle=False,
+                collate_fn=split_collator, drop_last=False, num_workers=2, pin_memory=True)
+            split_metrics = compute_split_losses(eager, model_type, split_loader, device)
+            sidecar["heldout_split_loss"] = split_metrics
+            print(f"  [heldout] context_ce={split_metrics['context_ce']:.4f} "
+                  f"response_ce={split_metrics['response_ce']:.4f}")
+
+            if args.wandb_project:
+                try:
+                    import wandb
+                    wrun = wandb.init(
+                        project=args.wandb_project,
+                        entity=args.wandb_entity,
+                        name=f"postsft_{display}_{tok_label or 'unk'}",
+                        config={
+                            "model_type": model_type,
+                            "arch_label": arch_label,
+                            "tok_label": tok_label,
+                            "sft_tokens_target": args.sft_tokens,
+                            "sft_train_frac": args.sft_train_frac,
+                            "seed": args.seed,
+                            "eval_suite": args.eval_suite,
+                        },
+                        reinit=True,
+                    )
+                    wrun.log({
+                        "sft/final_loss": float(avg_sft_loss),
+                        "sft/train_time_sec": float(sft_train_time),
+                        "heldout/context_ce": split_metrics["context_ce"],
+                        "heldout/response_ce": split_metrics["response_ce"],
+                        "heldout/context_ppl": split_metrics["context_ppl"] or float("nan"),
+                        "heldout/response_ppl": split_metrics["response_ppl"],
+                    })
+                    for ev_name, ev_metrics in bench_sft.items():
+                        if isinstance(ev_metrics, dict):
+                            for k, v in ev_metrics.items():
+                                if isinstance(v, (int, float)):
+                                    wrun.log({f"bench/{ev_name}/{k}": v})
+                    wrun.finish()
+                except Exception as e:
+                    print(f"  [wandb] logging failed: {e}")
             with open(sidecar_path, "w") as f:
                 json.dump(sidecar, f, indent=2, default=str)
             print(f"  [save] {sidecar_path}")

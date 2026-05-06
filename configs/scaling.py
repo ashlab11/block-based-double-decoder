@@ -61,11 +61,14 @@ ARCH_SETS = {
         ("28.9M", dict(dim=448, num_encoder_layers=8, num_decoder_layers=4)),
     ],
     "large": [
-        ("5M",    dict(dim=192,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("25M",   dict(dim=448,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("50M",   dict(dim=576,  num_encoder_layers=8, num_decoder_layers=4)),
-        ("150M",  dict(dim=1024, num_encoder_layers=8, num_decoder_layers=4)),
-        ("300M",  dict(dim=1408, num_encoder_layers=8, num_decoder_layers=4)),
+        ("5M",    dict(dim=192,  num_encoder_layers=8,  num_decoder_layers=4)),   # 5,308,416
+        ("6.25M", dict(dim=192,  num_encoder_layers=10, num_decoder_layers=5)),   # 6,635,520  (2:1 ratio preserved via 10:5)
+        ("12.5M", dict(dim=256,  num_encoder_layers=10, num_decoder_layers=5)),   # 11,796,480 (2:1 ratio preserved via 10:5)
+        ("25M",   dict(dim=448,  num_encoder_layers=8,  num_decoder_layers=4)),   # 28,901,376
+        ("50M",   dict(dim=576,  num_encoder_layers=8,  num_decoder_layers=4)),   # 47,775,744
+        ("100M",  dict(dim=832,  num_encoder_layers=8,  num_decoder_layers=4)),   # 99,680,256 (num_heads=13)
+        ("150M",  dict(dim=1024, num_encoder_layers=8,  num_decoder_layers=4)),
+        ("300M",  dict(dim=1408, num_encoder_layers=8,  num_decoder_layers=4)),
     ],
 }
 
@@ -79,8 +82,11 @@ TOKEN_SETS = {
     ],
     "large": [
         ("100M", 100_000_000),
+        ("125M", 125_000_000),
+        ("250M", 250_000_000),
         ("500M", 500_000_000),
         ("1B",   1_000_000_000),
+        ("2B",   2_000_000_000),
         ("3B",   3_000_000_000),
         ("6B",   6_000_000_000),
     ],

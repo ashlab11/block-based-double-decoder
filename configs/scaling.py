@@ -68,7 +68,9 @@ ARCH_SETS = {
         ("50M",   dict(dim=576,  num_encoder_layers=8,  num_decoder_layers=4)),   # 47,775,744
         ("100M",  dict(dim=832,  num_encoder_layers=8,  num_decoder_layers=4)),   # 99,680,256 (num_heads=13)
         ("150M",  dict(dim=1024, num_encoder_layers=8,  num_decoder_layers=4)),
+        ("200M", dict(dim=1216, num_encoder_layers=8, num_decoder_layers=4)),
         ("300M",  dict(dim=1408, num_encoder_layers=8,  num_decoder_layers=4)),
+        ("1B", dict(dim=2624, num_encoder_layers=8, num_decoder_layers=4)),
     ],
 }
 

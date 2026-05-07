@@ -265,7 +265,12 @@ def main():
                    help="Fraction of SFT train set to use (e.g. 0.05 for 5%).")
     p.add_argument("--sft-tokens", type=int, default=50_000_000,
                    help="Approximate target token budget for SFT.")
-    p.add_argument("--sft-lr", type=float, default=2e-5)
+    p.add_argument("--sft-lr", type=float, default=2e-4,
+                   help="SFT base LR. μP-scales internally to "
+                        "base × MUP_BASE_DIM/dim for hidden weights, so 2e-4 "
+                        "→ ~2.5e-5 hidden LR at dim=512 (standard SFT range). "
+                        "Previous default of 2e-5 left hidden LR at 2.5e-6, "
+                        "which often left the SFT loss curve flat.")
     p.add_argument("--sft-grad-accum", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=8,
                    help="SFT micro-batch size; auto-halved for dd/sed (which "
@@ -464,12 +469,50 @@ def main():
                   f"({sft_total_micro} micro / {sft_steps} steps  "
                   f"bs={sft_bs} ga={sft_ga} lr={args.sft_lr})")
 
+            # ── wandb: open the run BEFORE training so sft_one_model's
+            # on_step callback can stream loss/grad/lr per optimizer step.
+            # Previously the run was only opened post-training to log final
+            # metrics, which made the per-step loss curve invisible. The run
+            # is held in `wrun` and finished after the eval block below.
+            wrun = None
+            if args.wandb_project:
+                try:
+                    import wandb
+                    wrun = wandb.init(
+                        project=args.wandb_project,
+                        entity=args.wandb_entity,
+                        name=f"postsft_{display}_{tok_label or 'unk'}",
+                        config={
+                            "model_type": model_type,
+                            "arch_label": arch_label,
+                            "tok_label": tok_label,
+                            "sft_tokens_target": args.sft_tokens,
+                            "sft_train_frac": args.sft_train_frac,
+                            "seed": args.seed,
+                            "eval_suite": args.eval_suite,
+                            "sft_lr": args.sft_lr,
+                            "sft_batch_size": sft_bs,
+                            "sft_grad_accum": sft_ga,
+                        },
+                        reinit=True,
+                    )
+                except Exception as e:
+                    print(f"  [wandb] init failed (continuing without per-step logging): {e}")
+                    wrun = None
+
+            def _on_step(step_idx, metrics):
+                # Strip None values; wandb chokes on them in some versions.
+                clean = {k: v for k, v in metrics.items() if v is not None}
+                if wrun is not None:
+                    wrun.log(clean, step=step_idx)
+
             sft_t0 = time.time()
             avg_sft_loss, sft_train_time, sft_n_steps, sft_mfu = sft_one_model(
                 trainer, sft_loader, device, sft_total_micro,
                 sft_ga, args.sft_lr,
                 gpu_tflops=gpu_tflops,
                 tokens_per_micro=sft_bs * SEQ_LEN,
+                on_step=_on_step,
             )
             print(f"  [sft] done: loss={avg_sft_loss:.3f}  "
                   f"time={sft_train_time:.0f}s  MFU={sft_mfu:.1f}%")
@@ -566,24 +609,8 @@ def main():
             print(f"  [heldout] context_ce={split_metrics['context_ce']:.4f} "
                   f"response_ce={split_metrics['response_ce']:.4f}")
 
-            if args.wandb_project:
+            if wrun is not None:
                 try:
-                    import wandb
-                    wrun = wandb.init(
-                        project=args.wandb_project,
-                        entity=args.wandb_entity,
-                        name=f"postsft_{display}_{tok_label or 'unk'}",
-                        config={
-                            "model_type": model_type,
-                            "arch_label": arch_label,
-                            "tok_label": tok_label,
-                            "sft_tokens_target": args.sft_tokens,
-                            "sft_train_frac": args.sft_train_frac,
-                            "seed": args.seed,
-                            "eval_suite": args.eval_suite,
-                        },
-                        reinit=True,
-                    )
                     wrun.log({
                         "sft/final_loss": float(avg_sft_loss),
                         "sft/train_time_sec": float(sft_train_time),
@@ -599,7 +626,7 @@ def main():
                                     wrun.log({f"bench/{ev_name}/{k}": v})
                     wrun.finish()
                 except Exception as e:
-                    print(f"  [wandb] logging failed: {e}")
+                    print(f"  [wandb] final logging failed: {e}")
             with open(sidecar_path, "w") as f:
                 json.dump(sidecar, f, indent=2, default=str)
             print(f"  [save] {sidecar_path}")

@@ -691,7 +691,12 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
                 for p in eager.parameters():
                     if p.grad is not None:
                         p.grad.mul_(scale)
-            torch.nn.utils.clip_grad_norm_(eager.parameters(), 1.0)
+            # clip_grad_norm_ returns the pre-clip total grad norm; capture it
+            # so we can log both pre-clip magnitude (loss-landscape signal) and
+            # how aggressively the clipper is acting (clip_ratio < 1 means the
+            # SFT lr is effectively being throttled by the 1.0 ceiling).
+            clip_max_norm = 1.0
+            pre_clip_norm = torch.nn.utils.clip_grad_norm_(eager.parameters(), clip_max_norm)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
@@ -700,41 +705,64 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
             losses.append(avg)
             accum_loss_sum = 0.0
             accum_n_valid = 0
+
+            pre_clip_norm_val = float(pre_clip_norm.item() if hasattr(pre_clip_norm, "item") else pre_clip_norm)
+            clip_ratio = min(1.0, clip_max_norm / max(pre_clip_norm_val, 1e-12))
+            post_clip_norm_val = pre_clip_norm_val * clip_ratio
+            was_clipped = pre_clip_norm_val > clip_max_norm
+
+            elapsed = time.time() - t0
+            mfu_val = None
+            if track_mfu:
+                # SFT uses arch-aware FLOPs too — the per-arch multiplier
+                # is the same as pretrain since the model topology is
+                # identical. tokens_per_micro is the per-step input-token
+                # count (bs × seq_len).
+                arch = trainer["arch"]
+                flops = compute_flops_arch(
+                    trainer["model_type"], trainer["ne"],
+                    micro * tokens_per_micro,
+                    enc=arch["num_encoder_layers"],
+                    dec=arch["num_decoder_layers"])
+                mfu_val = flops / (max(elapsed, 1e-6) * gpu_tflops * 1e12) * 100
+
+            # Per-step wandb streaming. Fires every optimizer step (not gated by
+            # log_interval) — the per-call overhead is dwarfed by the optimizer
+            # step itself, and a high-resolution curve is the only way to see
+            # the underlying trend through SFT's per-batch token-count noise.
+            # Failing the callback must NOT abort training — wrap defensively.
+            if on_step is not None:
+                try:
+                    cb_metrics = {
+                        "sft/loss": float(avg),
+                        "sft/lr": float(opt.param_groups[0]["lr"]),
+                        "sft/grad_norm_preclip": pre_clip_norm_val,
+                        "sft/grad_norm_postclip": post_clip_norm_val,
+                        "sft/clip_ratio": float(clip_ratio),
+                        "sft/clip_max_norm": float(clip_max_norm),
+                        "sft/was_clipped": float(was_clipped),
+                        "sft/elapsed_s": float(elapsed),
+                        "sft/tokens_seen": int(micro * tokens_per_micro)
+                            if tokens_per_micro else None,
+                    }
+                    # Per-param-group LR — group 1 is the μP-scaled hidden lr,
+                    # which is what's actually moving the transformer block
+                    # weights. Logging it explicitly makes "is μP throttling
+                    # the layers?" answerable from the wandb panel alone.
+                    for gi, g in enumerate(opt.param_groups):
+                        cb_metrics[f"sft/lr_group{gi}"] = float(g["lr"])
+                    if mfu_val is not None:
+                        cb_metrics["sft/mfu_pct"] = float(mfu_val)
+                    on_step(step, cb_metrics)
+                except Exception as e:
+                    print(f"      [sft {trainer['display']}] on_step callback failed: {e}")
+
             if step % log_interval == 0:
-                elapsed = time.time() - t0
-                mfu_str = ""
-                mfu_val = None
-                if track_mfu:
-                    # SFT uses arch-aware FLOPs too — the per-arch multiplier
-                    # is the same as pretrain since the model topology is
-                    # identical. tokens_per_micro is the per-step input-token
-                    # count (bs × seq_len).
-                    arch = trainer["arch"]
-                    flops = compute_flops_arch(
-                        trainer["model_type"], trainer["ne"],
-                        micro * tokens_per_micro,
-                        enc=arch["num_encoder_layers"],
-                        dec=arch["num_decoder_layers"])
-                    mfu_val = flops / (max(elapsed, 1e-6) * gpu_tflops * 1e12) * 100
-                    mfu_str = f"  MFU={mfu_val:.1f}%"
+                mfu_str = f"  MFU={mfu_val:.1f}%" if mfu_val is not None else ""
+                clip_flag = "*" if was_clipped else " "
                 print(f"      [sft {trainer['display']}] step {step}/{total_steps}  "
-                      f"loss={avg:.3f}  [{elapsed:.0f}s]{mfu_str}")
-                # Optional external callback (e.g. wandb logging from a caller).
-                # Failing the callback should NOT abort training — wrap defensively.
-                if on_step is not None:
-                    try:
-                        cb_metrics = {
-                            "sft/loss": float(avg),
-                            "sft/lr": float(opt.param_groups[0]["lr"]),
-                            "sft/elapsed_s": float(elapsed),
-                            "sft/tokens_seen": int(micro * tokens_per_micro)
-                                if tokens_per_micro else None,
-                        }
-                        if mfu_val is not None:
-                            cb_metrics["sft/mfu_pct"] = float(mfu_val)
-                        on_step(step, cb_metrics)
-                    except Exception as e:
-                        print(f"      [sft {trainer['display']}] on_step callback failed: {e}")
+                      f"loss={avg:.3f}  grad={pre_clip_norm_val:.2f}{clip_flag}  "
+                      f"clip_ratio={clip_ratio:.2f}  [{elapsed:.0f}s]{mfu_str}")
 
     train_time = time.time() - t0
     final_mfu = 0.0
@@ -821,7 +849,7 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                      eval_data_file="data/Pretrain/slimpajama_eval_packed.jsonl",
                      tokenizer=None,
                      run_sft=False, sft_train_file=None, sft_eval_file=None,
-                     sft_tokens=50_000_000, sft_lr=2e-5, sft_grad_accum=4,
+                     sft_tokens=50_000_000, sft_lr=2e-4, sft_grad_accum=4,
                      wandb_runs=None, save_checkpoints=False,
                      checkpoint_fractions=(), hf_repo=None,
                      step_callback=None):
@@ -1224,12 +1252,26 @@ def train_one_budget(models_info, tok_label, total_tokens, batch_size, grad_accu
                   f"({sft_total_micro} micro / {sft_steps} steps  "
                   f"bs={sft_bs} ga={sft_ga} lr={sft_lr})")
 
+            # Per-step wandb streaming during SFT — without this, wandb only
+            # ever sees the post-training summary (sft/loss + sft/mfu_pct), so
+            # a flat-looking SFT loss curve is invisible. The closure captures
+            # `wandb_runs` and `t["display"]` to route into the right run.
+            _t_display = t["display"]
+            _runs_local = wandb_runs
+
+            def _on_sft_step(step_idx, metrics):
+                if not _runs_local:
+                    return
+                clean = {k: v for k, v in metrics.items() if v is not None}
+                _wandb_log(_runs_local, _t_display, clean, step=step_idx)
+
             try:
                 avg_sft_loss, sft_train_time, sft_n_steps, sft_mfu = sft_one_model(
                     t, sft_loader, device, sft_total_micro,
                     sft_ga, sft_lr,
                     gpu_tflops=gpu_tflops,
-                    tokens_per_micro=sft_bs * SEQ_LEN)
+                    tokens_per_micro=sft_bs * SEQ_LEN,
+                    on_step=_on_sft_step)
                 run_result["sft_final_loss"] = round(avg_sft_loss, 4)
                 run_result["sft_train_time_sec"] = round(sft_train_time, 1)
                 run_result["sft_total_steps"] = sft_n_steps
@@ -1396,9 +1438,12 @@ def main():
                              "scripts/retrieval_scripts/ultrachat.py to build it)")
     parser.add_argument("--sft-eval-file", type=str,
                         default="data/SFT/ultrachat_eval.jsonl")
-    parser.add_argument("--sft-lr", type=float, default=2e-5,
-                        help="SFT base LR (μP-scaled per arch internally). "
-                             "Default 2e-5 matches existing configs/runs/sft_*.yaml")
+    parser.add_argument("--sft-lr", type=float, default=2e-4,
+                        help="SFT base LR (μP-scaled per arch internally — "
+                             "hidden-layer LR = base × MUP_BASE_DIM/dim). "
+                             "Default 2e-4 puts the μP-scaled hidden LR in the "
+                             "2.5e-5 range for dim=512, which is the standard "
+                             "SFT range. Was 2e-5 — too small after μP scaling.")
     parser.add_argument("--sft-grad-accum", type=int, default=4,
                         help="SFT grad-accum steps. Effective batch is "
                              "batch_size * sft_grad_accum.")

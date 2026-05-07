@@ -251,88 +251,74 @@ def postprefixlm_path_for(ckpt_path):
     return ckpt_path.with_name(new)
 
 
-def download_specific_hf_checkpoints(repo_id, paths_in_repo, local_dir):
-    """Download an explicit list of paths-in-repo from a HF model repo.
+def list_hf_repo_files(repo_id):
+    """One-shot HfApi.model_info call. Returns the list of remote rfilenames.
 
-    Use when the user passed --checkpoints with a comma-separated list of
-    paths. No filtering, no listing — just resolve each one.
+    Pulled out so the caller can ask both 'what pretrain checkpoints exist?'
+    and 'what post-SFT siblings already exist?' without two round-trips.
     """
-    from huggingface_hub import hf_hub_download
-
-    local_dir = Path(local_dir)
-    local_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[hf] downloading {len(paths_in_repo)} explicit checkpoint(s) from {repo_id}",
-          flush=True)
-    local_paths = []
-    for i, rp in enumerate(paths_in_repo):
-        target = local_dir / rp
-        if target.exists():
-            print(f"[hf] [{i+1}/{len(paths_in_repo)}] cached: {rp}", flush=True)
-        else:
-            print(f"[hf] [{i+1}/{len(paths_in_repo)}] downloading: {rp}", flush=True)
-            try:
-                hf_hub_download(repo_id=repo_id, filename=rp, repo_type="model",
-                                local_dir=str(local_dir))
-            except Exception as e:
-                print(f"[hf] ERROR downloading {rp}: {e}  (skipping this one)")
-                continue
-        local_paths.append(target)
-    return sorted(set(local_paths))
-
-
-def discover_hf_checkpoints(repo_id, only_pattern, local_dir):
-    """List all *_pct100.pt files in `repo_id` (a HF model repo), filter by
-    `only_pattern` (fnmatch glob applied to the path-in-repo), and download
-    each into `local_dir` preserving the repo's path structure.
-
-    Returns a sorted list of local Paths suitable for the per-checkpoint loop.
-
-    Skips files whose name contains `_postsft_` or `_postprefixlm_` (derived,
-    not pretrain). Skips files that already exist locally (idempotent on
-    re-runs after a partially-completed pod restart).
-    """
-    from huggingface_hub import HfApi, hf_hub_download
-
+    from huggingface_hub import HfApi
     api = HfApi()
     print(f"[hf] listing files in {repo_id} (repo_type=model)...", flush=True)
     info = api.model_info(repo_id, files_metadata=True)
     siblings = getattr(info, "siblings", []) or []
+    return [s.rfilename for s in siblings if getattr(s, "rfilename", None)]
 
-    candidates = []
-    for s in siblings:
-        name = getattr(s, "rfilename", None)
-        if not name:
-            continue
-        # Match both naming conventions; exclude derived files
-        if not (name.endswith("_pct100.pt") or name.endswith("/pct100.pt")
-                or name == "pct100.pt"):
-            continue
-        if "_postsft_" in name or "_postprefixlm_" in name:
-            continue
-        if only_pattern and not fnmatch(name, only_pattern):
-            continue
-        candidates.append(name)
 
-    candidates.sort()
-    print(f"[hf] {len(candidates)} matching checkpoint(s) "
-          f"(only_pattern={only_pattern!r})", flush=True)
-    for c in candidates:
-        print(f"  - {c}")
+def filter_pretrain_paths(rfilenames, only_pattern=None, explicit_paths=None):
+    """From a list of remote rfilenames, return the pretrain *pct100.pt paths
+    matching `only_pattern` (fnmatch glob) or `explicit_paths` (literal list).
+    Excludes derived files (_postsft_, _postprefixlm_)."""
+    pretrain = [
+        n for n in rfilenames
+        if (n.endswith("_pct100.pt") or n.endswith("/pct100.pt") or n == "pct100.pt")
+        and "_postsft_" not in n
+        and "_postprefixlm_" not in n
+    ]
+    if explicit_paths is not None:
+        wanted = set(explicit_paths)
+        return sorted(p for p in pretrain if p in wanted)
+    if only_pattern:
+        return sorted(p for p in pretrain if fnmatch(p, only_pattern))
+    return sorted(pretrain)
 
+
+def existing_postprefixlm_set(rfilenames):
+    """Set of remote rfilenames that look like post-SFT outputs from this script
+    (matches both naming conventions: 'postprefixlm_pct100.pt' and
+    '*_postprefixlm_pct100.pt'). Used by --skip-existing to check HF state."""
+    return {
+        n for n in rfilenames
+        if (n.endswith("postprefixlm_pct100.pt")
+            or n.endswith("_postprefixlm_pct100.pt"))
+    }
+
+
+def remote_postprefixlm_path_for(remote_pretrain_path):
+    """Map a remote pretrain path → its expected post-SFT sibling path.
+    Mirrors postprefixlm_path_for() but operates on string paths."""
+    if remote_pretrain_path.endswith("_pct100.pt"):
+        return remote_pretrain_path[:-len("_pct100.pt")] + "_postprefixlm_pct100.pt"
+    if remote_pretrain_path.endswith("pct100.pt"):
+        return remote_pretrain_path[:-len("pct100.pt")] + "postprefixlm_pct100.pt"
+    return remote_pretrain_path  # fallback (shouldn't hit)
+
+
+def download_one_checkpoint(repo_id, remote_path, local_dir):
+    """Download a single rfilename from `repo_id` into `local_dir` preserving
+    the repo's path structure. Returns the local Path. Idempotent — re-runs
+    skip the network round-trip if the file already exists locally."""
+    from huggingface_hub import hf_hub_download
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
-    local_paths = []
-    for i, rp in enumerate(candidates):
-        target = local_dir / rp
-        if target.exists():
-            print(f"[hf] [{i+1}/{len(candidates)}] cached: {rp}", flush=True)
-        else:
-            print(f"[hf] [{i+1}/{len(candidates)}] downloading: {rp} → {target}",
-                  flush=True)
-            hf_hub_download(repo_id=repo_id, filename=rp, repo_type="model",
-                            local_dir=str(local_dir))
-        local_paths.append(target)
-    return sorted(set(local_paths))
+    target = local_dir / remote_path
+    if target.exists():
+        print(f"  [hf-dl] cached: {remote_path}", flush=True)
+    else:
+        print(f"  [hf-dl] downloading: {remote_path}", flush=True)
+        hf_hub_download(repo_id=repo_id, filename=remote_path, repo_type="model",
+                        local_dir=str(local_dir))
+    return target
 
 
 def load_pretrain_checkpoint(ckpt_path, device):
@@ -557,6 +543,15 @@ def main():
                    help="Skip the post-SFT upload step. Outputs stay on local "
                         "disk only — DON'T USE on an ephemeral pod unless you "
                         "have another persistence story.")
+    p.add_argument("--keep-local", action="store_true",
+                   help="Keep all .pt and .json files on local disk after each "
+                        "checkpoint completes. Default behavior (in HF mode) is "
+                        "to delete the pre-SFT .pt always (re-downloadable from "
+                        "HF) and the post-SFT .pt + .json after a successful "
+                        "upload — keeps peak local-disk usage to one pre + one "
+                        "post checkpoint at a time, critical on small pods. "
+                        "Pass --keep-local to retain everything for debugging "
+                        "or for serving the post-SFT weights from local disk.")
 
     p.add_argument("--seed", type=int, default=42,
                    help="Global seed for deterministic SFT/eval data order.")
@@ -627,36 +622,69 @@ def main():
                 sys.exit(1)
 
     # ── Discover work ──────────────────────────────────────────────────────
-    # Default: pull every *_pct100 from --hf-repo. Three opt-outs:
-    #   --checkpoints "a,b,c"  → only those paths-in-repo
-    #   --only-pattern '*glob*' → fnmatch filter on repo paths
-    #   --local-only            → skip HF entirely, scan --search-dir
+    # New default: list remote paths only — DO NOT download yet. We download
+    # one checkpoint at a time inside the per-cell loop and (unless
+    # --keep-local) delete it again after upload, so peak local-disk usage
+    # stays at one pre-SFT + one post-SFT per cell.
     hf_local_dir = Path(args.search_dir) / "from_hf"
+    # `ckpts_remote` is a list of either remote paths-in-repo (HF mode) or
+    # local Paths (--local-only mode). The per-cell loop below downloads
+    # the remote ones JIT and treats local ones as already-on-disk.
+    ckpts_remote = []  # list of (remote_path: str) or (local_path: Path)
+    is_hf_mode = False
 
     if args.local_only:
-        ckpts = find_pretrain_checkpoints(args.search_dir)
+        ckpts_local_paths = find_pretrain_checkpoints(args.search_dir)
         if args.only_pattern:
-            ckpts = [p for p in ckpts if fnmatch(str(p), args.only_pattern)]
-    elif args.checkpoints:
-        if not args.hf_repo:
-            print("ERROR: --checkpoints requires --hf-repo (default should be set)")
-            sys.exit(1)
-        requested = [c.strip() for c in args.checkpoints.split(",") if c.strip()]
-        if not requested:
-            print("ERROR: --checkpoints was empty after splitting on commas")
-            sys.exit(1)
-        ckpts = download_specific_hf_checkpoints(args.hf_repo, requested,
-                                                 hf_local_dir)
+            ckpts_local_paths = [p for p in ckpts_local_paths
+                                 if fnmatch(str(p), args.only_pattern)]
+        if args.skip_existing:
+            ckpts_local_paths = [p for p in ckpts_local_paths
+                                 if not postprefixlm_path_for(p).exists()]
+        ckpts_remote = ckpts_local_paths  # already local; no download needed
     else:
         if not args.hf_repo:
-            print("ERROR: --hf-repo required for default HF discovery. "
+            print("ERROR: --hf-repo required for HF discovery. "
                   "Pass --local-only to scan --search-dir instead.")
             sys.exit(1)
-        ckpts = discover_hf_checkpoints(args.hf_repo, args.only_pattern,
-                                        hf_local_dir)
+        is_hf_mode = True
 
-    if args.skip_existing:
-        ckpts = [p for p in ckpts if not postprefixlm_path_for(p).exists()]
+        rfilenames = list_hf_repo_files(args.hf_repo)
+
+        if args.checkpoints:
+            requested = [c.strip() for c in args.checkpoints.split(",") if c.strip()]
+            if not requested:
+                print("ERROR: --checkpoints was empty after splitting on commas")
+                sys.exit(1)
+            ckpts_remote = filter_pretrain_paths(rfilenames, explicit_paths=requested)
+            missing = set(requested) - set(ckpts_remote)
+            if missing:
+                print(f"WARNING: {len(missing)} requested path(s) not found on HF: "
+                      f"{sorted(missing)}")
+        else:
+            ckpts_remote = filter_pretrain_paths(rfilenames,
+                                                 only_pattern=args.only_pattern)
+
+        # --skip-existing now checks HF (the durable record) instead of local
+        # disk (which is ephemeral in the new download-then-delete flow).
+        if args.skip_existing:
+            existing = existing_postprefixlm_set(rfilenames)
+            before = len(ckpts_remote)
+            ckpts_remote = [p for p in ckpts_remote
+                            if remote_postprefixlm_path_for(p) not in existing]
+            print(f"[skip-existing] {before - len(ckpts_remote)} cell(s) already "
+                  f"have post-SFT weights on HF — skipping. {len(ckpts_remote)} "
+                  f"left to process.")
+
+        print(f"[hf] {len(ckpts_remote)} pretrain checkpoint(s) selected:",
+              flush=True)
+        for c in ckpts_remote:
+            print(f"  - {c}")
+
+    # For consistency below, we treat ckpts_remote uniformly:
+    # in HF mode it's strings, in local mode it's Paths. The per-cell loop
+    # branches on `is_hf_mode` to decide whether to download.
+    ckpts = ckpts_remote
 
     if not ckpts:
         print(f"[plan] no checkpoints to process under {args.search_dir} "
@@ -690,15 +718,27 @@ def main():
     n_ok = 0
     n_fail = 0
     summary_rows = []
-    for i, ckpt_path in enumerate(ckpts):
+    for i, ckpt_remote_or_local in enumerate(ckpts):
         print(f"\n{'='*70}")
-        print(f"[{i+1}/{len(ckpts)}] {ckpt_path}")
+        print(f"[{i+1}/{len(ckpts)}] {ckpt_remote_or_local}")
         print(f"{'='*70}")
         t_total = time.time()
         model = None  # set inside try, freed in finally
         wandb_run = None  # set inside try, finished in finally
+        ckpt_path = None  # local Path to the pre-SFT .pt; set after download
+        postpfx_path = None  # set once we know the input filename
+        sidecar_path = None  # ditto
+        upload_succeeded = False
 
         try:
+            # JIT-download in HF mode so peak local-disk usage stays small.
+            # In --local-only mode the path is already a local Path.
+            if is_hf_mode:
+                ckpt_path = download_one_checkpoint(
+                    args.hf_repo, ckpt_remote_or_local, hf_local_dir)
+            else:
+                ckpt_path = ckpt_remote_or_local
+
             print(f"  [load] reading {ckpt_path}...")
             model, arch, model_type, hparams, raw_ckpt = load_pretrain_checkpoint(
                 ckpt_path, device)
@@ -894,6 +934,7 @@ def main():
 
             # ── HF upload ──────────────────────────────────────────────────
             if upload_to_hf:
+                n_uploaded = 0
                 for f in (postpfx_path, sidecar_path):
                     try:
                         # training/hf_hub.upload_checkpoint signature:
@@ -908,9 +949,16 @@ def main():
                             repo_type="model",
                         )
                         print(f"  [hf-upload] ✓ {f.name}")
+                        n_uploaded += 1
                     except Exception as e:
                         print(f"  [hf-upload] FAILED for {f}: {e}  "
                               "(weights still on local disk; manual retry possible)")
+                # Both files (post-SFT .pt + .json sidecar) must upload for us
+                # to safely delete the locals. If either fails, keep them.
+                upload_succeeded = (n_uploaded == 2)
+            else:
+                # --no-upload: by definition we want to keep the locals
+                upload_succeeded = False
 
             n_ok += 1
             summary_rows.append({
@@ -940,6 +988,37 @@ def main():
             # before we move on. Even on exception, finishing prevents a
             # zombie run from blocking the next checkpoint's init.
             _wandb_finish_run(wandb_run)
+
+            # Disk cleanup. Only active in HF mode (where files were just
+            # downloaded and are re-fetchable) and only when --keep-local
+            # is NOT set. Skipped entirely in --local-only mode so the user's
+            # pre-existing checkpoints aren't accidentally deleted.
+            if is_hf_mode and not args.keep_local:
+                # Pre-SFT .pt: always safe to delete after the cell — it's
+                # already on HF (that's where we just downloaded it from).
+                if ckpt_path is not None and ckpt_path.exists():
+                    try:
+                        ckpt_path.unlink()
+                        print(f"  [cleanup] deleted pre-SFT: {ckpt_path.name} "
+                              f"({ckpt_path.parent})", flush=True)
+                    except Exception as e:
+                        print(f"  [cleanup] failed to delete {ckpt_path}: {e}")
+                # Post-SFT .pt + .json: delete only if both uploaded
+                # successfully. Otherwise keep them so the user can retry
+                # the upload manually instead of redoing SFT.
+                if upload_succeeded:
+                    for f in (postpfx_path, sidecar_path):
+                        if f is None or not f.exists():
+                            continue
+                        try:
+                            f.unlink()
+                            print(f"  [cleanup] deleted post-SFT: {f.name}",
+                                  flush=True)
+                        except Exception as e:
+                            print(f"  [cleanup] failed to delete {f}: {e}")
+                elif (postpfx_path is not None and postpfx_path.exists()):
+                    print(f"  [cleanup] KEEPING post-SFT (upload incomplete): "
+                          f"{postpfx_path.name}", flush=True)
 
     # ── Summary table ──────────────────────────────────────────────────────
     print(f"\n{'='*70}")

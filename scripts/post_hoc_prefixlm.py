@@ -99,16 +99,91 @@ def build_prefixlm_collator(model_type, tokenizer, seq_len, seed):
 
 def find_pretrain_checkpoints(search_dir):
     """Return all *_pct100.pt under search_dir, excluding any postprefixlm/postsft
-    siblings (those are derived files, not pretrain checkpoints)."""
-    paths = sorted(Path(search_dir).rglob("*_pct100.pt"))
+    siblings (those are derived files, not pretrain checkpoints).
+
+    Matches both local naming `<basename>_pct100.pt` (e.g. dd_5M_6Btok_pct100.pt)
+    and HF-cached naming `pct100.pt` (e.g. <local-dir>/dd/5M/6Btok/pct100.pt).
+    """
+    paths = []
+    for pattern in ("*_pct100.pt", "pct100.pt"):
+        paths.extend(Path(search_dir).rglob(pattern))
+    paths = sorted(set(paths))
     return [p for p in paths
             if "_postsft_" not in p.name and "_postprefixlm_" not in p.name]
 
 
 def postprefixlm_path_for(ckpt_path):
-    """Map foo_pct100.pt → foo_postprefixlm_pct100.pt (sibling in same dir)."""
-    return ckpt_path.with_name(ckpt_path.name.replace(
-        "_pct100.pt", "_postprefixlm_pct100.pt"))
+    """Map a *_pct100.pt path to its post-prefixLM sibling.
+
+    Local naming (parallel_scaling.py output, has `_pct100` suffix):
+        dd_5M_6Btok_pct100.pt → dd_5M_6Btok_postprefixlm_pct100.pt
+    HF-cached naming (parallel_scaling.py uploads as `pct100.pt`):
+        pct100.pt → postprefixlm_pct100.pt
+    """
+    name = ckpt_path.name
+    if name.endswith("_pct100.pt"):
+        new = name[: -len("_pct100.pt")] + "_postprefixlm_pct100.pt"
+    elif name.endswith("pct100.pt"):
+        new = name[: -len("pct100.pt")] + "postprefixlm_pct100.pt"
+    else:
+        # Fallback for non-standard names
+        new = ckpt_path.stem + "_postprefixlm" + ckpt_path.suffix
+    return ckpt_path.with_name(new)
+
+
+def discover_hf_checkpoints(repo_id, only_pattern, local_dir):
+    """List all *_pct100.pt files in `repo_id` (a HF model repo), filter by
+    `only_pattern` (fnmatch glob applied to the path-in-repo), and download
+    each into `local_dir` preserving the repo's path structure.
+
+    Returns a sorted list of local Paths suitable for the per-checkpoint loop.
+
+    Skips files whose name contains `_postsft_` or `_postprefixlm_` (derived,
+    not pretrain). Skips files that already exist locally (idempotent on
+    re-runs after a partially-completed pod restart).
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    api = HfApi()
+    print(f"[hf] listing files in {repo_id} (repo_type=model)...", flush=True)
+    info = api.model_info(repo_id, files_metadata=True)
+    siblings = getattr(info, "siblings", []) or []
+
+    candidates = []
+    for s in siblings:
+        name = getattr(s, "rfilename", None)
+        if not name:
+            continue
+        # Match both naming conventions; exclude derived files
+        if not (name.endswith("_pct100.pt") or name.endswith("/pct100.pt")
+                or name == "pct100.pt"):
+            continue
+        if "_postsft_" in name or "_postprefixlm_" in name:
+            continue
+        if only_pattern and not fnmatch(name, only_pattern):
+            continue
+        candidates.append(name)
+
+    candidates.sort()
+    print(f"[hf] {len(candidates)} matching checkpoint(s) "
+          f"(only_pattern={only_pattern!r})", flush=True)
+    for c in candidates:
+        print(f"  - {c}")
+
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_paths = []
+    for i, rp in enumerate(candidates):
+        target = local_dir / rp
+        if target.exists():
+            print(f"[hf] [{i+1}/{len(candidates)}] cached: {rp}", flush=True)
+        else:
+            print(f"[hf] [{i+1}/{len(candidates)}] downloading: {rp} → {target}",
+                  flush=True)
+            hf_hub_download(repo_id=repo_id, filename=rp, repo_type="model",
+                            local_dir=str(local_dir))
+        local_paths.append(target)
+    return sorted(set(local_paths))
 
 
 def load_pretrain_checkpoint(ckpt_path, device):
@@ -221,6 +296,13 @@ def main():
                         "sidecar to this repo. Use the same repo as your pretrain "
                         "--hf-repo so all artifacts live together.")
     p.add_argument("--hf-private", action="store_true")
+    p.add_argument("--from-hf", action="store_true",
+                   help="Discover *_pct100.pt files on --hf-repo (instead of "
+                        "scanning --search-dir locally), download them into "
+                        "--search-dir/from_hf/, then process. Combine with "
+                        "--only-pattern to filter (e.g. '*dd*5M*'). Useful on "
+                        "fresh pods where pretrain checkpoints live on HF "
+                        "rather than local disk.")
 
     p.add_argument("--seed", type=int, default=42,
                    help="Global seed for deterministic SFT/eval data order.")
@@ -260,9 +342,20 @@ def main():
             sys.exit(1)
 
     # ── Discover work ──────────────────────────────────────────────────────
-    ckpts = find_pretrain_checkpoints(args.search_dir)
-    if args.only_pattern:
-        ckpts = [p for p in ckpts if fnmatch(str(p), args.only_pattern)]
+    if args.from_hf:
+        if not args.hf_repo:
+            print("ERROR: --from-hf requires --hf-repo to be set "
+                  "(the model repo to discover and download from)")
+            sys.exit(1)
+        # Download into --search-dir/from_hf/ so outputs land predictably
+        # alongside the inputs and won't pollute --search-dir's top level.
+        hf_local_dir = Path(args.search_dir) / "from_hf"
+        ckpts = discover_hf_checkpoints(args.hf_repo, args.only_pattern,
+                                        hf_local_dir)
+    else:
+        ckpts = find_pretrain_checkpoints(args.search_dir)
+        if args.only_pattern:
+            ckpts = [p for p in ckpts if fnmatch(str(p), args.only_pattern)]
     if args.skip_existing:
         ckpts = [p for p in ckpts if not postprefixlm_path_for(p).exists()]
 

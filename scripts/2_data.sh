@@ -151,6 +151,27 @@ if [ "$NEED_SLOW_PATH" = true ]; then
     fi
 fi
 
+# ── 2c.5: prefixLM SFT + eval (best-effort download from HF) ─────────────────
+# These files are produced by data/retrieval_scripts/slimpajama_prefixlm.py and
+# uploaded to the same HF repo as the pretrain pack. On a fresh pod we try the
+# fast path; if the files aren't on HF yet, just print a hint — they aren't a
+# hard prerequisite for pretrain runs and the user can generate them later.
+echo ""
+echo "── 2c.5: prefixLM SFT + eval data (fast path from HF) ──"
+if [ -f "data/Pretrain/slimpajama_prefixlm_sft_packed.jsonl" ] && \
+   [ -f "data/Pretrain/slimpajama_prefixlm_eval_packed.jsonl" ]; then
+    echo "  prefixLM packed data already exists locally, skipping."
+elif hf download "${HF_DATASET_REPO}" \
+        data/Pretrain/slimpajama_prefixlm_sft_packed.jsonl \
+        data/Pretrain/slimpajama_prefixlm_eval_packed.jsonl \
+        --repo-type dataset \
+        --local-dir . 2>/dev/null; then
+    echo "  ✓ Downloaded prefixLM packed data from ${HF_DATASET_REPO}"
+else
+    echo "  (prefixLM packed data not on HF yet — generate with:"
+    echo "    python data/retrieval_scripts/slimpajama_prefixlm.py --pack)"
+fi
+
 # ── 2d: SFT data (UltraChat) ────────────────────────────────────────────────
 # Used by parallel_scaling.py --run-sft. ~50M tokens, ~5 min download+tokenize.
 # Skipped if the JSONL already exists.

@@ -358,11 +358,14 @@ def load_pretrain_checkpoint(ckpt_path, device):
     # pretrain (large cells run for tens of minutes — easy amortization).
     model = build_model(model_type, arch, vocab_size, device, use_compile=True)
     state_dict = raw["state_dict"]
-    # Strip torch.compile prefix if present (defensive — pretrain checkpoints
-    # are saved from the eager submodule but a future caller might save the
-    # compiled wrapper directly).
+    # Pretrain checkpoints save the EAGER state_dict (bare keys like
+    # "embedding.weight"). After torch.compile, the wrapper renames every
+    # parameter to "_orig_mod.embedding.weight". Load into the eager submodule
+    # to bypass the prefix mismatch — load_state_dict on the compiled wrapper
+    # would error with "missing _orig_mod.X" / "unexpected X" for every param.
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+    eager = getattr(model, "_orig_mod", model)
+    eager.load_state_dict(state_dict)
     return model, arch, model_type, hparams, raw
 
 

@@ -353,7 +353,10 @@ def load_pretrain_checkpoint(ckpt_path, device):
     }
     model_type = raw["model_type"]
     vocab_size = raw["vocab_size"]
-    model = build_model(model_type, arch, vocab_size, device, use_compile=False)
+    # use_compile=True: ~30s warmup tax per checkpoint, but 2-3x steady-state
+    # SFT throughput. Worth it now that --sft-tokens-frac scales budget with
+    # pretrain (large cells run for tens of minutes — easy amortization).
+    model = build_model(model_type, arch, vocab_size, device, use_compile=True)
     state_dict = raw["state_dict"]
     # Strip torch.compile prefix if present (defensive — pretrain checkpoints
     # are saved from the eager submodule but a future caller might save the

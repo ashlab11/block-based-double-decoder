@@ -190,9 +190,27 @@ def load_pretrain_checkpoint(ckpt_path, device):
     model_type = ckpt["model_type"]
     vocab_size = ckpt["vocab_size"]
 
+    # SED checkpoints store the *post-reduction* num_decoder_layers in hparams
+    # (parallel_scaling.py overwrites arch["num_decoder_layers"] with
+    # len(eager.decoder_layers) before saving). build_model's SED branch
+    # re-applies max(1, (dec*3)//4), so passing the saved value verbatim
+    # would shrink twice and produce too few layers to load the state_dict.
+    #
+    # Workaround without touching training: pass an inflated preimage to
+    # build_model (smallest D such that (D*3)//4 == saved == ceil(saved*4/3)
+    # = (saved*4 + 2)//3), then restore the truthful saved value on the arch
+    # dict afterwards so downstream logging / wandb config see the actual
+    # built layer count. NOTE: this preimage formula is load-bearingly tied
+    # to the (dec*3)//4 reduction in parallel_scaling.build_model — update
+    # both together if that formula ever changes.
+    if model_type == "sed":
+        saved_dec = arch["num_decoder_layers"]
+        arch["num_decoder_layers"] = (saved_dec * 4 + 2) // 3
     # use_compile=False — torch.compile would re-trace on the first SFT
     # forward anyway, and skipping it makes per-checkpoint setup ~30s faster.
     model = build_model(model_type, arch, vocab_size, device, use_compile=False)
+    if model_type == "sed":
+        arch["num_decoder_layers"] = saved_dec
 
     # Strip the _orig_mod. prefix that torch.compile adds to state_dict keys
     # when models are saved post-compile. Pretrain checkpoints are saved from

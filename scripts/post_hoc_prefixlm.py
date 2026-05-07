@@ -339,10 +339,28 @@ def load_pretrain_checkpoint(ckpt_path, device):
     }
     model_type = raw["model_type"]
     vocab_size = raw["vocab_size"]
+    # SED checkpoints store the *post-reduction* num_decoder_layers in hparams
+    # (parallel_scaling.py overwrites arch["num_decoder_layers"] with
+    # len(eager.decoder_layers) before saving). build_model's SED branch
+    # re-applies max(1, (dec*3)//4), so passing the saved value verbatim
+    # would shrink twice and produce too few layers to load the state_dict.
+    #
+    # Workaround without touching training: pass an inflated preimage to
+    # build_model (smallest D such that (D*3)//4 == saved == ceil(saved*4/3)
+    # = (saved*4 + 2)//3), then restore the truthful saved value on the arch
+    # dict afterwards so downstream logging / wandb config see the actual
+    # built layer count. NOTE: this preimage formula is load-bearingly tied
+    # to the (dec*3)//4 reduction in parallel_scaling.build_model — update
+    # both together if that formula ever changes.
+    if model_type == "sed":
+        saved_dec = arch["num_decoder_layers"]
+        arch["num_decoder_layers"] = (saved_dec * 4 + 2) // 3
     # use_compile=True: ~30s warmup tax per checkpoint, but 2-3x steady-state
     # SFT throughput. Worth it now that --sft-tokens-frac scales budget with
     # pretrain (large cells run for tens of minutes — easy amortization).
     model = build_model(model_type, arch, vocab_size, device, use_compile=True)
+    if model_type == "sed":
+        arch["num_decoder_layers"] = saved_dec
     state_dict = raw["state_dict"]
     # Pretrain checkpoints save the EAGER state_dict (bare keys like
     # "embedding.weight"). After torch.compile, the wrapper renames every

@@ -521,8 +521,14 @@ def main():
                         "backward, doubling per-batch memory headroom).")
 
     # Eval
-    p.add_argument("--eval-batches", type=int, default=None,
-                   help="Cap on eval batches (None = whole eval set, ~1-2 min)")
+    p.add_argument("--eval-batches", type=int, default=100,
+                   help="Cap on eval batches per checkpoint (default 100 = "
+                        "~1,600 sequences ≈ 3.3M tokens, plenty for stable mean "
+                        "loss; SEM ~0.005 nats vs cross-arch differences ~0.05-0.5 "
+                        "nats). Pass 0 to disable the cap and scan the full ~98M "
+                        "eval tokens — useful for the publication run, but on "
+                        "small SFT cells the full scan dominates wallclock "
+                        "(~16 min vs ~2-3 sec capped).")
     p.add_argument("--eval-batch-size", type=int, default=16,
                    help="Eval batch size — can be larger than train since no backward")
 
@@ -810,11 +816,14 @@ def main():
                 collate_fn=eval_collator, drop_last=True,
                 num_workers=2, pin_memory=True,
             )
+            # --eval-batches 0 means "scan everything"; pass None to the eval
+            # loop in that case so it doesn't break out immediately.
+            eval_cap = args.eval_batches if args.eval_batches and args.eval_batches > 0 else None
             print(f"  [eval] held-out prefixLM loss (bs={eval_bs}"
-                  + (f", capped at {args.eval_batches} batches" if args.eval_batches else "")
+                  + (f", capped at {eval_cap} batches" if eval_cap else ", full scan")
                   + ")...")
             eval_loss, eval_n_batches, eval_n_valid, eval_elapsed = eval_prefixlm_loss(
-                model, eval_loader, device, max_batches=args.eval_batches)
+                model, eval_loader, device, max_batches=eval_cap)
             print(f"  [eval] held-out loss = {eval_loss:.4f}  "
                   f"({eval_n_batches} batches, {eval_n_valid:,} suffix tokens, "
                   f"{eval_elapsed:.0f}s)")
@@ -887,12 +896,16 @@ def main():
             if upload_to_hf:
                 for f in (postpfx_path, sidecar_path):
                     try:
+                        # training/hf_hub.upload_checkpoint signature:
+                        #   (local_path, repo_id, path_in_repo, repo_type="model", ...)
+                        # Note: no `private` kwarg — repo creation/visibility is
+                        # handled by verify_repo() at startup, not per-file upload.
                         upload_checkpoint(
-                            ckpt_path=f,
+                            local_path=f,
                             repo_id=args.hf_repo,
                             path_in_repo=f"{model_type}/{arch_label or 'unknown'}/"
                                          f"{tok_label}tok/{f.name}",
-                            private=args.hf_private,
+                            repo_type="model",
                         )
                         print(f"  [hf-upload] ✓ {f.name}")
                     except Exception as e:

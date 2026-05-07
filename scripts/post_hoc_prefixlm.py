@@ -517,7 +517,12 @@ def main():
     p.add_argument("--sft-tokens-frac", type=float, default=0.1,
                    help="Fraction of pretrain tokens-seen to use for SFT per checkpoint "
                         "(default 0.1 = 10%%). Ignored when --sft-tokens is set explicitly.")
-    p.add_argument("--sft-lr", type=float, default=2e-5)
+    p.add_argument("--sft-lr", type=float, default=2e-4,
+                   help="SFT base LR. μP-scales internally to "
+                        "base × MUP_BASE_DIM/dim for hidden weights, so 2e-4 "
+                        "→ ~2.5e-5 hidden LR at dim=512 (standard SFT range). "
+                        "Previous default of 2e-5 left hidden LR at 2.5e-6, "
+                        "which often left the SFT loss curve flat.")
     p.add_argument("--sft-grad-accum", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=8,
                    help="SFT micro-batch size; auto-halved for dd/sed (which "

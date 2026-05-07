@@ -693,8 +693,13 @@ def main():
 
     print(f"[plan] {len(ckpts)} checkpoint(s) to process:")
     for cp in ckpts:
-        out = postprefixlm_path_for(cp)
-        print(f"  - {cp}  →  {out.name}")
+        # cp is a remote string path (HF mode) or a local Path (--local-only).
+        # Use the matching path-mapping helper so we don't AttributeError.
+        if isinstance(cp, str):
+            out_name = remote_postprefixlm_path_for(cp).rsplit("/", 1)[-1]
+        else:
+            out_name = postprefixlm_path_for(cp).name
+        print(f"  - {cp}  →  {out_name}")
 
     if args.dry_run:
         print("[dry-run] exiting without running.")

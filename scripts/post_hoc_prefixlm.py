@@ -363,6 +363,49 @@ def load_pretrain_checkpoint(ckpt_path, device):
     return model, arch, model_type, hparams, raw
 
 
+def _parse_tok_label_to_int(label):
+    """'6B' → 6_000_000_000, '500M' → 500_000_000, '125M' → 125_000_000.
+    Returns None on failure (caller falls back to other sources)."""
+    if not label or label == "?":
+        return None
+    label = str(label).strip()
+    multipliers = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+    suffix = label[-1].upper()
+    if suffix in multipliers:
+        try:
+            return int(float(label[:-1]) * multipliers[suffix])
+        except (ValueError, IndexError):
+            return None
+    try:
+        return int(label)
+    except ValueError:
+        return None
+
+
+def get_pretrain_tokens(raw_ckpt, hparams, tok_label):
+    """Best-available pretrain-tokens-seen count for a checkpoint.
+
+    Priority:
+      1. raw_ckpt['tokens_seen']  — actual tokens at save time, most accurate
+      2. hparams['total_tokens']  — target budget for the pretrain run
+      3. parse tok_label like '6B' → 6_000_000_000 (last-resort fallback)
+
+    Raises ValueError if all three sources fail — caller should treat that
+    as a non-recoverable config error rather than guessing.
+    """
+    if "tokens_seen" in raw_ckpt and raw_ckpt["tokens_seen"]:
+        return int(raw_ckpt["tokens_seen"]), "raw_ckpt['tokens_seen']"
+    if hparams.get("total_tokens"):
+        return int(hparams["total_tokens"]), "hparams['total_tokens']"
+    parsed = _parse_tok_label_to_int(tok_label)
+    if parsed is not None:
+        return parsed, f"parsed from tok_label={tok_label!r}"
+    raise ValueError(
+        f"Cannot determine pretrain tokens — none of "
+        f"raw_ckpt['tokens_seen'], hparams['total_tokens'], or tok_label "
+        f"({tok_label!r}) yielded a usable value")
+
+
 def parse_run_id(ckpt_path, hparams):
     """Extract (model_type, arch_label, tok_label) from any available source.
 
@@ -456,8 +499,14 @@ def main():
     p.add_argument("--sft-eval-file", type=str,
                    default="data/Pretrain/slimpajama_prefixlm_eval_packed.jsonl",
                    help="Packed prefixLM held-out eval data")
-    p.add_argument("--sft-tokens", type=int, default=50_000_000,
-                   help="Approximate target token budget for SFT (default 50M).")
+    p.add_argument("--sft-tokens", type=int, default=None,
+                   help="Explicit SFT token budget per checkpoint. Default None means "
+                        "auto-derive as --sft-tokens-frac × this checkpoint's pretrain "
+                        "tokens-seen — so a 100M-tok pretrain gets 10M SFT tokens, a "
+                        "1B pretrain gets 100M, etc. Pass an int to override globally.")
+    p.add_argument("--sft-tokens-frac", type=float, default=0.1,
+                   help="Fraction of pretrain tokens-seen to use for SFT per checkpoint "
+                        "(default 0.1 = 10%%). Ignored when --sft-tokens is set explicitly.")
     p.add_argument("--sft-lr", type=float, default=2e-5)
     p.add_argument("--sft-grad-accum", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=8,
@@ -654,6 +703,18 @@ def main():
                   f"non_emb={ne:,}  vocab={raw_ckpt['vocab_size']:,}  "
                   f"pretrain_tok={tok_label}")
 
+            # ── Determine SFT token budget for this checkpoint ─────────────
+            # Default behavior: use --sft-tokens-frac × pretrain tokens-seen.
+            # --sft-tokens overrides if set (same value for every checkpoint).
+            if args.sft_tokens is not None:
+                sft_tokens = args.sft_tokens
+                sft_tokens_source = f"--sft-tokens override ({sft_tokens:,})"
+            else:
+                pretrain_tokens, src = get_pretrain_tokens(raw_ckpt, hparams, tok_label)
+                sft_tokens = int(pretrain_tokens * args.sft_tokens_frac)
+                sft_tokens_source = (f"{args.sft_tokens_frac*100:.0f}% × {pretrain_tokens:,} "
+                                     f"pretrain tokens (from {src})")
+
             # ── PrefixLM SFT setup ─────────────────────────────────────────
             # Halve bs / double ga for enc-dec to keep effective batch the
             # same while staying inside memory headroom (mirrors
@@ -673,11 +734,15 @@ def main():
                 num_workers=2, pin_memory=True,
             )
             sft_total_micro = max(sft_ga,
-                                  args.sft_tokens // (sft_bs * SEQ_LEN))
+                                  sft_tokens // (sft_bs * SEQ_LEN))
+            # Natural cap: don't request more batches than the loader can
+            # provide. With drop_last=True this is len(sft_train_ds)//sft_bs.
+            # Protects against pretrain_tokens × sft_tokens_frac > data file size.
             sft_total_micro = min(sft_total_micro, len(sft_loader))
             sft_steps = sft_total_micro // sft_ga
 
-            print(f"  [sft] {display}: ~{args.sft_tokens/1e6:.0f}M tokens  "
+            print(f"  [sft] {display}: ~{sft_tokens/1e6:.0f}M tokens  "
+                  f"[budget: {sft_tokens_source}]  "
                   f"({sft_total_micro} micro / {sft_steps} steps  "
                   f"bs={sft_bs} ga={sft_ga} lr={args.sft_lr})")
 
@@ -697,7 +762,7 @@ def main():
                     "num_encoder_layers": arch["num_encoder_layers"],
                     "num_decoder_layers": arch["num_decoder_layers"],
                     "vocab_size": raw_ckpt["vocab_size"],
-                    "sft_tokens_target": args.sft_tokens,
+                    "sft_tokens_target": sft_tokens,
                     "sft_lr": args.sft_lr,
                     "sft_batch_size": sft_bs,
                     "sft_grad_accum": sft_ga,
@@ -767,7 +832,7 @@ def main():
             sft_hparams.update({
                 "phase": "post_hoc_prefixlm",
                 "sft_objective": "prefixlm",
-                "sft_tokens_target": args.sft_tokens,
+                "sft_tokens_target": sft_tokens,
                 "sft_tokens_actual": sft_total_micro * sft_bs * SEQ_LEN,
                 "sft_lr": args.sft_lr,
                 "sft_batch_size": sft_bs,
@@ -797,7 +862,7 @@ def main():
                 "sft_train_time_s": sft_train_time,
                 "sft_n_steps": sft_n_steps,
                 "sft_mfu_pct": sft_mfu,
-                "sft_tokens_target": args.sft_tokens,
+                "sft_tokens_target": sft_tokens,
                 "sft_tokens_actual": sft_total_micro * sft_bs * SEQ_LEN,
                 "sft_lr": args.sft_lr,
                 "sft_batch_size": sft_bs,

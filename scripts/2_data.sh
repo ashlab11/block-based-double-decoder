@@ -173,27 +173,30 @@ else
 fi
 
 # ── 2d: SFT data (UltraChat) ────────────────────────────────────────────────
-# Used by parallel_scaling.py --run-sft. ~50M tokens, ~5 min download+tokenize.
-# Skipped if the JSONL already exists.
-echo ""
-echo "── 2d: SFT data (UltraChat 50M tokens) ──"
-mkdir -p data/SFT
-if [ -f "data/SFT/ultrachat.jsonl" ] && [ -f "data/SFT/ultrachat_eval.jsonl" ]; then
-    echo "  SFT data already exists, skipping."
-else
-    echo "  Tokenizing UltraChat with tokenizer/tokenizer_32k.json..."
-    python data/retrieval_scripts/ultrachat.py \
-        --tokenizer tokenizer/tokenizer_32k.json \
-        --target-tokens 50000000 \
-        --out-dir data/SFT
-fi
+# DISABLED: switched to prefixLM SFT on packed SlimPajama (step 2c.5 above).
+# UltraChat is no longer used by any active workflow — both --run-sft and the
+# new post_hoc_prefixlm.py pull from data/Pretrain/slimpajama_prefixlm_*_packed.jsonl.
+# Re-enable this block if you ever want chat-style SFT data again.
+#
+# echo ""
+# echo "── 2d: SFT data (UltraChat 50M tokens) ──"
+# mkdir -p data/SFT
+# if [ -f "data/SFT/ultrachat.jsonl" ] && [ -f "data/SFT/ultrachat_eval.jsonl" ]; then
+#     echo "  SFT data already exists, skipping."
+# else
+#     echo "  Tokenizing UltraChat with tokenizer/tokenizer_32k.json..."
+#     python data/retrieval_scripts/ultrachat.py \
+#         --tokenizer tokenizer/tokenizer_32k.json \
+#         --target-tokens 50000000 \
+#         --out-dir data/SFT
+# fi
 
 TRAIN_LINES=$(wc -l < data/Pretrain/slimpajama_6b_packed.jsonl)
-SFT_LINES=$(wc -l < data/SFT/ultrachat.jsonl 2>/dev/null || echo "0")
+SFT_LINES=$(wc -l < data/Pretrain/slimpajama_prefixlm_sft_packed.jsonl 2>/dev/null || echo "0")
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Data pipeline complete ✓"
 echo "  Packed pretrain sequences: $TRAIN_LINES"
-echo "  SFT pairs: $SFT_LINES"
-echo "  Next: bash scripts/3_preflight.sh"
+echo "  Packed prefixLM SFT sequences: $SFT_LINES"
+echo "  Next: python scripts/parallel_scaling.py ..."
 echo "═══════════════════════════════════════════════════════════════"

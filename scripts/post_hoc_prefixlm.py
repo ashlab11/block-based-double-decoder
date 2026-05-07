@@ -268,12 +268,19 @@ def list_hf_repo_files(repo_id):
 def filter_pretrain_paths(rfilenames, only_pattern=None, explicit_paths=None):
     """From a list of remote rfilenames, return the pretrain *pct100.pt paths
     matching `only_pattern` (fnmatch glob) or `explicit_paths` (literal list).
-    Excludes derived files (_postsft_, _postprefixlm_)."""
+
+    Excludes derived files. The marker test runs on the *basename* so it
+    catches both naming conventions: local form `dd_5M_6Btok_postprefixlm_pct100.pt`
+    (marker in the middle) and HF-cache form `<mt>/<arch>/<tok>tok/postprefixlm_pct100.pt`
+    (marker at the start of the filename, with `/` not `_` in front). The
+    earlier substring test `"_postprefixlm_" not in n` only caught the local
+    form and silently let HF-form artifacts re-enter the pretrain list.
+    """
     pretrain = [
         n for n in rfilenames
         if (n.endswith("_pct100.pt") or n.endswith("/pct100.pt") or n == "pct100.pt")
-        and "_postsft_" not in n
-        and "_postprefixlm_" not in n
+        and "postsft" not in n.rsplit("/", 1)[-1]
+        and "postprefixlm" not in n.rsplit("/", 1)[-1]
     ]
     if explicit_paths is not None:
         wanted = set(explicit_paths)

@@ -25,17 +25,27 @@ Inputs (produced by data/retrieval_scripts/slimpajama_prefixlm.py --pack):
     data/Pretrain/slimpajama_prefixlm_eval_packed.jsonl   (~100M tokens)
 
 Idempotent: --skip-existing skips checkpoints whose _postprefixlm sibling
-already exists; safe to re-run after pod restarts.
+already exists; safe to re-run after pod restarts. After each checkpoint
+the SFT'd weights + JSON sidecar are uploaded to --hf-repo immediately —
+if the pod dies mid-sweep, all completed work is durable.
 
-Example (process all checkpoints under checkpoints/):
+Default behavior (no flags): discovers every *_pct100 in the canonical
+HF model repo, downloads each, runs SFT + held-out eval, uploads results
+back to the same repo at <model_type>/<arch>/<tok>tok/.
+
+Examples:
+    # Default — process every pretrain checkpoint on HF
+    python scripts/post_hoc_prefixlm.py --skip-existing
+
+    # Process only specific HF paths
     python scripts/post_hoc_prefixlm.py \\
-        --search-dir checkpoints/ \\
-        --sft-tokens 50000000 \\
-        --skip-existing \\
-        --hf-repo "$HF_REPO"
+        --checkpoints 'dd/5M/6Btok/pct100.pt,sed/5M/6Btok/pct100.pt'
 
-Subset by glob:
-    python scripts/post_hoc_prefixlm.py --only-pattern '*dd_50M*' ...
+    # Filter by fnmatch glob (applied to repo paths)
+    python scripts/post_hoc_prefixlm.py --only-pattern '*5M*6B*'
+
+    # Use local checkpoints instead of HF
+    python scripts/post_hoc_prefixlm.py --local-only --search-dir checkpoints/
 """
 
 import argparse
@@ -131,6 +141,35 @@ def postprefixlm_path_for(ckpt_path):
     return ckpt_path.with_name(new)
 
 
+def download_specific_hf_checkpoints(repo_id, paths_in_repo, local_dir):
+    """Download an explicit list of paths-in-repo from a HF model repo.
+
+    Use when the user passed --checkpoints with a comma-separated list of
+    paths. No filtering, no listing — just resolve each one.
+    """
+    from huggingface_hub import hf_hub_download
+
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[hf] downloading {len(paths_in_repo)} explicit checkpoint(s) from {repo_id}",
+          flush=True)
+    local_paths = []
+    for i, rp in enumerate(paths_in_repo):
+        target = local_dir / rp
+        if target.exists():
+            print(f"[hf] [{i+1}/{len(paths_in_repo)}] cached: {rp}", flush=True)
+        else:
+            print(f"[hf] [{i+1}/{len(paths_in_repo)}] downloading: {rp}", flush=True)
+            try:
+                hf_hub_download(repo_id=repo_id, filename=rp, repo_type="model",
+                                local_dir=str(local_dir))
+            except Exception as e:
+                print(f"[hf] ERROR downloading {rp}: {e}  (skipping this one)")
+                continue
+        local_paths.append(target)
+    return sorted(set(local_paths))
+
+
 def discover_hf_checkpoints(repo_id, only_pattern, local_dir):
     """List all *_pct100.pt files in `repo_id` (a HF model repo), filter by
     `only_pattern` (fnmatch glob applied to the path-in-repo), and download
@@ -202,14 +241,37 @@ def load_pretrain_checkpoint(ckpt_path, device):
     return model, arch, model_type, hparams, raw
 
 
-def parse_run_id_from_filename(ckpt_path):
-    """Extract (model_type, arch, tok_label) from filename if encoded.
-    Returns ('?', '?', '?') if parsing fails — tolerant on purpose."""
-    parts = ckpt_path.stem.split("_")
-    try:
-        return parts[0], parts[1], parts[2].rstrip("tok")
-    except IndexError:
-        return "?", "?", "?"
+def parse_run_id(ckpt_path, hparams):
+    """Extract (model_type, arch_label, tok_label) from any available source.
+
+    Priority: hparams (most reliable) → filename (`dd_5M_6Btok_pct100.pt`) →
+    path (`<prefix>/dd/5M/6Btok/pct100.pt`, used by HF cache layout).
+
+    Returns three strings; uses '?' for any field that can't be inferred.
+    """
+    mt = hparams.get("model_type")
+    arch_label = hparams.get("arch_label")
+    tok_label = hparams.get("tokens_label") or hparams.get("tok_label")
+
+    # Try filename form: dd_5M_6Btok_pct100.pt
+    if not (mt and arch_label and tok_label):
+        parts = ckpt_path.stem.split("_")
+        if len(parts) >= 4 and parts[2].endswith("tok"):
+            mt = mt or parts[0]
+            arch_label = arch_label or parts[1]
+            tok_label = tok_label or parts[2][:-3]
+
+    # Fall back to path form: .../<mt>/<arch>/<tok>tok/<filename>
+    if not (mt and arch_label and tok_label):
+        path_parts = ckpt_path.parts
+        for i, seg in enumerate(path_parts):
+            if seg.endswith("tok") and len(seg) > 3 and i >= 2:
+                tok_label = tok_label or seg[:-3]
+                arch_label = arch_label or path_parts[i - 1]
+                mt = mt or path_parts[i - 2]
+                break
+
+    return mt or "?", arch_label or "?", tok_label or "?"
 
 
 # ── Held-out eval: mean prefixLM loss on the eval dataloader ────────────────
@@ -290,19 +352,28 @@ def main():
     p.add_argument("--tokenizer-file", type=str,
                    default="tokenizer/tokenizer_32k.json")
 
-    # HF persistence (defaults to the same repo as checkpoint storage)
-    p.add_argument("--hf-repo", type=str, default=None,
-                   help="If set, uploads each *_postprefixlm_pct100.pt and its JSON "
-                        "sidecar to this repo. Use the same repo as your pretrain "
-                        "--hf-repo so all artifacts live together.")
+    # HF source AND destination (defaults to the canonical checkpoints repo
+    # so the script "just works" on a fresh pod with no flags).
+    p.add_argument("--hf-repo", type=str,
+                   default="bpbradle/bbdd-scaling-checkpoints",
+                   help="HF model repo to (a) discover and download pretrain "
+                        "checkpoints from and (b) upload the resulting "
+                        "*_postprefixlm_pct100.pt + sidecar JSON back to. "
+                        "Default matches the parallel_scaling.py upload target.")
     p.add_argument("--hf-private", action="store_true")
-    p.add_argument("--from-hf", action="store_true",
-                   help="Discover *_pct100.pt files on --hf-repo (instead of "
-                        "scanning --search-dir locally), download them into "
-                        "--search-dir/from_hf/, then process. Combine with "
-                        "--only-pattern to filter (e.g. '*dd*5M*'). Useful on "
-                        "fresh pods where pretrain checkpoints live on HF "
-                        "rather than local disk.")
+    p.add_argument("--checkpoints", type=str, default=None,
+                   help="Comma-separated list of explicit paths-in-repo to "
+                        "process (e.g. 'dd/5M/6Btok/pct100.pt,sed/5M/6Btok/pct100.pt'). "
+                        "When set, skips repo-wide discovery and downloads only "
+                        "these. Combine with the default --hf-repo for free.")
+    p.add_argument("--local-only", action="store_true",
+                   help="Skip HF discovery; scan --search-dir for local "
+                        "*_pct100.pt files instead. Useful when checkpoints "
+                        "are already on disk from a prior run.")
+    p.add_argument("--no-upload", action="store_true",
+                   help="Skip the post-SFT upload step. Outputs stay on local "
+                        "disk only — DON'T USE on an ephemeral pod unless you "
+                        "have another persistence story.")
 
     p.add_argument("--seed", type=int, default=42,
                    help="Global seed for deterministic SFT/eval data order.")
@@ -328,34 +399,50 @@ def main():
         print("WARN: no GPU detected; SFT will be unusably slow on CPU.")
 
     # ── HF preflight (fail fast on auth/typo before loading any models) ────
-    upload_to_hf = bool(args.hf_repo)
-    if upload_to_hf:
+    upload_to_hf = bool(args.hf_repo) and not args.no_upload
+    needs_hf = upload_to_hf or (not args.local_only)
+    if needs_hf:
         if not hf_available():
-            print("ERROR: --hf-repo set but huggingface_hub not installed. "
+            print("ERROR: HF needed but huggingface_hub not installed. "
                   "Run: pip install huggingface_hub")
             sys.exit(1)
-        from training.hf_hub import verify_repo
-        try:
-            verify_repo(args.hf_repo, private=args.hf_private, repo_type="model")
-        except Exception as e:
-            print(f"ERROR: HF preflight failed for {args.hf_repo}: {e}")
-            sys.exit(1)
+        if upload_to_hf:
+            from training.hf_hub import verify_repo
+            try:
+                verify_repo(args.hf_repo, private=args.hf_private, repo_type="model")
+            except Exception as e:
+                print(f"ERROR: HF preflight failed for {args.hf_repo}: {e}")
+                sys.exit(1)
 
     # ── Discover work ──────────────────────────────────────────────────────
-    if args.from_hf:
-        if not args.hf_repo:
-            print("ERROR: --from-hf requires --hf-repo to be set "
-                  "(the model repo to discover and download from)")
-            sys.exit(1)
-        # Download into --search-dir/from_hf/ so outputs land predictably
-        # alongside the inputs and won't pollute --search-dir's top level.
-        hf_local_dir = Path(args.search_dir) / "from_hf"
-        ckpts = discover_hf_checkpoints(args.hf_repo, args.only_pattern,
-                                        hf_local_dir)
-    else:
+    # Default: pull every *_pct100 from --hf-repo. Three opt-outs:
+    #   --checkpoints "a,b,c"  → only those paths-in-repo
+    #   --only-pattern '*glob*' → fnmatch filter on repo paths
+    #   --local-only            → skip HF entirely, scan --search-dir
+    hf_local_dir = Path(args.search_dir) / "from_hf"
+
+    if args.local_only:
         ckpts = find_pretrain_checkpoints(args.search_dir)
         if args.only_pattern:
             ckpts = [p for p in ckpts if fnmatch(str(p), args.only_pattern)]
+    elif args.checkpoints:
+        if not args.hf_repo:
+            print("ERROR: --checkpoints requires --hf-repo (default should be set)")
+            sys.exit(1)
+        requested = [c.strip() for c in args.checkpoints.split(",") if c.strip()]
+        if not requested:
+            print("ERROR: --checkpoints was empty after splitting on commas")
+            sys.exit(1)
+        ckpts = download_specific_hf_checkpoints(args.hf_repo, requested,
+                                                 hf_local_dir)
+    else:
+        if not args.hf_repo:
+            print("ERROR: --hf-repo required for default HF discovery. "
+                  "Pass --local-only to scan --search-dir instead.")
+            sys.exit(1)
+        ckpts = discover_hf_checkpoints(args.hf_repo, args.only_pattern,
+                                        hf_local_dir)
+
     if args.skip_existing:
         ckpts = [p for p in ckpts if not postprefixlm_path_for(p).exists()]
 
@@ -404,8 +491,11 @@ def main():
                 ckpt_path, device)
             ne = (sum(p.numel() for p in model.parameters())
                   - model.embedding.weight.numel())
-            arch_label = hparams.get("arch_label")
-            tok_label = parse_run_id_from_filename(ckpt_path)[2]
+            # parse_run_id pulls from hparams first, then filename, then path
+            # — handles both local (`dd_5M_6Btok_pct100.pt`) and HF cache layout
+            # (`<prefix>/dd/5M/6Btok/pct100.pt`).
+            _mt_inf, _arch_inf, tok_label = parse_run_id(ckpt_path, hparams)
+            arch_label = hparams.get("arch_label") or _arch_inf
             display = f"{model_type}_{arch_label or 'unknown'}"
             print(f"  [load] {display}  dim={arch['dim']}  "
                   f"enc/dec={arch['num_encoder_layers']}/{arch['num_decoder_layers']}  "

@@ -635,7 +635,8 @@ def build_sft_optimizer(model, dim, base_lr, model_type=None):
 
 def sft_one_model(trainer, sft_loader, device, total_micro_batches,
                   grad_accum, base_lr, log_interval=None,
-                  gpu_tflops=None, tokens_per_micro=None):
+                  gpu_tflops=None, tokens_per_micro=None,
+                  on_step=None):
     """Run SFT on a single trainer's model for `total_micro_batches // grad_accum`
     optimizer steps. Modifies the model in-place.
     Returns (avg_loss, train_time_sec, n_steps, mfu_pct).
@@ -702,6 +703,7 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
             if step % log_interval == 0:
                 elapsed = time.time() - t0
                 mfu_str = ""
+                mfu_val = None
                 if track_mfu:
                     # SFT uses arch-aware FLOPs too — the per-arch multiplier
                     # is the same as pretrain since the model topology is
@@ -713,10 +715,26 @@ def sft_one_model(trainer, sft_loader, device, total_micro_batches,
                         micro * tokens_per_micro,
                         enc=arch["num_encoder_layers"],
                         dec=arch["num_decoder_layers"])
-                    mfu = flops / (max(elapsed, 1e-6) * gpu_tflops * 1e12) * 100
-                    mfu_str = f"  MFU={mfu:.1f}%"
+                    mfu_val = flops / (max(elapsed, 1e-6) * gpu_tflops * 1e12) * 100
+                    mfu_str = f"  MFU={mfu_val:.1f}%"
                 print(f"      [sft {trainer['display']}] step {step}/{total_steps}  "
                       f"loss={avg:.3f}  [{elapsed:.0f}s]{mfu_str}")
+                # Optional external callback (e.g. wandb logging from a caller).
+                # Failing the callback should NOT abort training — wrap defensively.
+                if on_step is not None:
+                    try:
+                        cb_metrics = {
+                            "sft/loss": float(avg),
+                            "sft/lr": float(opt.param_groups[0]["lr"]),
+                            "sft/elapsed_s": float(elapsed),
+                            "sft/tokens_seen": int(micro * tokens_per_micro)
+                                if tokens_per_micro else None,
+                        }
+                        if mfu_val is not None:
+                            cb_metrics["sft/mfu_pct"] = float(mfu_val)
+                        on_step(step, cb_metrics)
+                    except Exception as e:
+                        print(f"      [sft {trainer['display']}] on_step callback failed: {e}")
 
     train_time = time.time() - t0
     final_mfu = 0.0

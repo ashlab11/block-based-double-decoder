@@ -1,4 +1,44 @@
 #!/usr/bin/env python3
+"""
+The post_hoc_prefixlm.py script saves two artifacts per checkpoint to the HF model repo (default bpbradle/bbdd-scaling-checkpoints):
+
+1. The post-prefixLM SFT'd weights (<basename>_postprefixlm_pct100.pt)
+
+A torch-saved dict containing:
+- state_dict — the SFT'd model weights
+- arch — architecture config (dim, num_encoder_layers, num_decoder_layers)
+- model_type — dd, sed, or dec
+- vocab_size
+- hparams — augmented from the original pretrain hparams with new fields:
+  - phase: "post_hoc_prefixlm"
+  - sft_objective: "prefixlm"
+  - sft_tokens_target, sft_tokens_actual
+  - sft_lr, sft_batch_size, sft_grad_accum
+  - sft_train_file, sft_eval_file
+  - source_pretrain_ckpt (filename of the input)
+
+2. A JSON sidecar (<basename>_postprefixlm_pct100.json)
+
+Plain JSON with the eval-comparison-ready stats:
+- model_type, arch, arch_label, non_emb_params
+- pretrain_ckpt (source filename)
+- sft_objective: "prefixlm"
+- Training: sft_train_loss, sft_train_time_s, sft_n_steps, sft_mfu_pct, sft_tokens_target, sft_tokens_actual, sft_lr, sft_batch_size, sft_grad_accum
+- Eval (the headline number): eval_loss_held_out — token-weighted mean cross-entropy on the held-out prefixLM eval set, computed only over suffix positions (prefix labels are -100)
+- eval_n_batches, eval_n_valid_tokens, eval_elapsed_s
+- wallclock_s
+
+Where on HF
+
+Both files upload to: <hf-repo>/<model_type>/<arch_label>/<tok_label>tok/<filename>
+
+For example: bpbradle/bbdd-scaling-checkpoints/dd/5M/6Btok/dd_5M_6Btok_postprefixlm_pct100.pt and the matching .json next to it.
+
+This mirrors the path layout parallel_scaling.py uses for pretrain checkpoints, so post-prefixLM artifacts live in the same <mt>/<arch>/<tok>tok/ folder as their source .pt.
+
+The JSON sidecar is the file you'd actually scan after a sweep — one per checkpoint, with eval_loss_held_out being the cross-architecture comparison number you're after.
+"""
+
 """Post-hoc prefixLM SFT + held-out loss eval driver.
 
 For every ``*_pct100.pt`` under ``--search-dir`` (skipping ``*_postprefixlm_*``),
@@ -81,6 +121,76 @@ from training.hf_hub import upload_checkpoint, available as hf_available
 
 from collators.encoder_decoder.prefixlm import PrefixLMCollator
 from collators.decoder.prefixlm import DecoderPrefixLMCollator
+
+
+# ── Wandb (optional, opt-in) ───────────────────────────────────────────────
+# Lazy-imported so the script still runs in environments without wandb installed.
+# All helpers no-op when --wandb-project is not set or wandb isn't importable.
+
+_WANDB_OPTS = {"project": None, "entity": None, "prefix": None,
+               "_module": None, "_imported": False}
+
+
+def _wandb_module():
+    if not _WANDB_OPTS["_imported"]:
+        try:
+            import wandb as _wb
+            _WANDB_OPTS["_module"] = _wb
+        except ImportError:
+            print("[wandb] --wandb-project set but `wandb` not installed; "
+                  "logging disabled. `pip install wandb` to enable.")
+            _WANDB_OPTS["_module"] = None
+        _WANDB_OPTS["_imported"] = True
+    return _WANDB_OPTS["_module"]
+
+
+def _wandb_enabled():
+    return _WANDB_OPTS["project"] is not None and _wandb_module() is not None
+
+
+def _wandb_init_run(model_type, arch_label, tok_label, config):
+    """Open a new wandb run for one checkpoint's SFT pass. Returns the run
+    object (or None if wandb is disabled / init failed)."""
+    if not _wandb_enabled():
+        return None
+    wb = _wandb_module()
+    prefix = _WANDB_OPTS["prefix"]
+    name_parts = [p for p in (prefix, model_type, arch_label, f"{tok_label}tok") if p]
+    run_name = "_".join(name_parts)
+    try:
+        return wb.init(
+            project=_WANDB_OPTS["project"],
+            entity=_WANDB_OPTS["entity"],
+            name=run_name,
+            group=f"{arch_label}_{tok_label}tok",
+            tags=[model_type, arch_label, f"{tok_label}tok", "post_hoc_prefixlm"],
+            config=config,
+            reinit=True,
+        )
+    except Exception as e:
+        print(f"[wandb] init failed for {run_name}: {e}")
+        return None
+
+
+def _wandb_finish_run(run):
+    if run is None:
+        return
+    try:
+        run.finish()
+    except Exception as e:
+        print(f"[wandb] run.finish() failed: {e}")
+
+
+def _wandb_log(run, metrics, step=None):
+    if run is None:
+        return
+    try:
+        if step is not None:
+            run.log(metrics, step=step)
+        else:
+            run.log(metrics)
+    except Exception as e:
+        print(f"[wandb] log failed: {e}")
 
 
 # ── PrefixLM collator selector ─────────────────────────────────────────────
@@ -227,15 +337,27 @@ def discover_hf_checkpoints(repo_id, only_pattern, local_dir):
 
 def load_pretrain_checkpoint(ckpt_path, device):
     """Reconstruct the model from a parallel_scaling.py-format checkpoint.
-    Returns (model, arch, model_type, hparams, raw_ckpt)."""
+
+    The checkpoint dict has no top-level 'arch' key — `arch` is reconstructed
+    from `hparams['dim'/'num_encoder_layers'/'num_decoder_layers']`.
+    Mirrors post_hoc_sft.py:load_pretrain_checkpoint.
+
+    Returns (model, arch, model_type, hparams, raw_ckpt).
+    """
     raw = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-    arch = raw["arch"]
-    model_type = raw["model_type"]
     hparams = raw.get("hparams", {})
+    arch = {
+        "dim": hparams["dim"],
+        "num_encoder_layers": hparams["num_encoder_layers"],
+        "num_decoder_layers": hparams["num_decoder_layers"],
+    }
+    model_type = raw["model_type"]
     vocab_size = raw["vocab_size"]
     model = build_model(model_type, arch, vocab_size, device, use_compile=False)
     state_dict = raw["state_dict"]
-    # Strip torch.compile prefix if present
+    # Strip torch.compile prefix if present (defensive — pretrain checkpoints
+    # are saved from the eager submodule but a future caller might save the
+    # compiled wrapper directly).
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     return model, arch, model_type, hparams, raw
@@ -378,11 +500,40 @@ def main():
     p.add_argument("--seed", type=int, default=42,
                    help="Global seed for deterministic SFT/eval data order.")
 
+    # Wandb (optional, opt-in via --wandb-project)
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="If set, log each checkpoint's SFT run to wandb. One run "
+                        "per checkpoint; per-step sft/loss + sft/lr + sft/mfu_pct "
+                        "stream live, plus end-of-checkpoint eval/loss_held_out. "
+                        "Skipped silently if wandb is not installed.")
+    p.add_argument("--wandb-entity", type=str, default="block-based-double-decoders",
+                   help="Wandb entity (team/user). Defaults to 'block-based-double-decoders' "
+                        "so any --wandb-project name (including newly-created ones) lands "
+                        "under that team. Override only if you're working in a different org.")
+    p.add_argument("--wandb-run-name-prefix", type=str, default="prefixlm",
+                   help="Prefix for per-checkpoint wandb run names "
+                        "(<prefix>_<mt>_<arch_label>_<tok_label>tok). Default 'prefixlm'.")
+
     args = p.parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+
+    # Register wandb opts (no-op unless --wandb-project is set; lazy-imports
+    # the module on first use so we don't pay the import cost on a no-wandb run).
+    _WANDB_OPTS["project"] = args.wandb_project
+    _WANDB_OPTS["entity"] = args.wandb_entity
+    _WANDB_OPTS["prefix"] = args.wandb_run_name_prefix
+    if args.wandb_project:
+        if _wandb_module() is None:
+            # Already printed an install hint inside _wandb_module(); proceed
+            # with wandb disabled rather than aborting the whole sweep.
+            _WANDB_OPTS["project"] = None
+        else:
+            print(f"[wandb] enabled  project={args.wandb_project}  "
+                  f"entity={args.wandb_entity}  "
+                  f"prefix={args.wandb_run_name_prefix}")
 
     # Read tuned LR/WD tables (same convention as parallel_scaling.py).
     _load_tuned_lrs()
@@ -484,6 +635,7 @@ def main():
         print(f"{'='*70}")
         t_total = time.time()
         model = None  # set inside try, freed in finally
+        wandb_run = None  # set inside try, finished in finally
 
         try:
             print(f"  [load] reading {ckpt_path}...")
@@ -529,12 +681,47 @@ def main():
                   f"({sft_total_micro} micro / {sft_steps} steps  "
                   f"bs={sft_bs} ga={sft_ga} lr={args.sft_lr})")
 
+            # Init a wandb run for this checkpoint. Per-step metrics will
+            # stream via the on_step callback below; eval + summary metrics
+            # are logged after eval completes.
+            wandb_run = _wandb_init_run(
+                model_type=model_type,
+                arch_label=arch_label or "unknown",
+                tok_label=tok_label,
+                config={
+                    "model_type": model_type,
+                    "arch_label": arch_label,
+                    "tok_label": tok_label,
+                    "non_emb_params": ne,
+                    "dim": arch["dim"],
+                    "num_encoder_layers": arch["num_encoder_layers"],
+                    "num_decoder_layers": arch["num_decoder_layers"],
+                    "vocab_size": raw_ckpt["vocab_size"],
+                    "sft_tokens_target": args.sft_tokens,
+                    "sft_lr": args.sft_lr,
+                    "sft_batch_size": sft_bs,
+                    "sft_grad_accum": sft_ga,
+                    "sft_objective": "prefixlm",
+                    "source_pretrain_ckpt": ckpt_path.name,
+                    "sft_train_file": args.sft_train_file,
+                    "sft_eval_file": args.sft_eval_file,
+                    "phase": "post_hoc_prefixlm",
+                },
+            )
+
+            # Per-step callback — receives (step, dict) from sft_one_model
+            # at every log_interval. Closes over wandb_run so it can be None
+            # without breaking the SFT loop.
+            def _wandb_step_cb(step, metrics):
+                _wandb_log(wandb_run, metrics, step=step)
+
             sft_t0 = time.time()
             avg_sft_loss, sft_train_time, sft_n_steps, sft_mfu = sft_one_model(
                 {"model": model, "arch": arch, "model_type": model_type,
                  "ne": ne, "display": display},
                 sft_loader, device, sft_total_micro, sft_ga, args.sft_lr,
                 gpu_tflops=gpu_tflops, tokens_per_micro=sft_bs * SEQ_LEN,
+                on_step=_wandb_step_cb,
             )
             print(f"  [sft] done: train_loss={avg_sft_loss:.3f}  "
                   f"time={sft_train_time:.0f}s  MFU={sft_mfu:.1f}%")
@@ -560,6 +747,19 @@ def main():
             print(f"  [eval] held-out loss = {eval_loss:.4f}  "
                   f"({eval_n_batches} batches, {eval_n_valid:,} suffix tokens, "
                   f"{eval_elapsed:.0f}s)")
+
+            # Log end-of-checkpoint summary metrics to wandb. Per-step sft/* came
+            # from the on_step callback above; this is the headline eval result.
+            _wandb_log(wandb_run, {
+                "eval/loss_held_out": float(eval_loss),
+                "eval/n_batches": int(eval_n_batches),
+                "eval/n_valid_tokens": int(eval_n_valid),
+                "eval/elapsed_s": float(eval_elapsed),
+                "sft/final_loss": float(avg_sft_loss),
+                "sft/total_train_time_s": float(sft_train_time),
+                "sft/n_optimizer_steps": int(sft_n_steps),
+                "sft/final_mfu_pct": float(sft_mfu),
+            })
 
             # ── Save SFT'd weights + JSON sidecar ──────────────────────────
             postpfx_path = postprefixlm_path_for(ckpt_path)
@@ -652,6 +852,10 @@ def main():
             if model is not None:
                 del model
             torch.cuda.empty_cache()
+            # Close the wandb run for this checkpoint so its history flushes
+            # before we move on. Even on exception, finishing prevents a
+            # zombie run from blocking the next checkpoint's init.
+            _wandb_finish_run(wandb_run)
 
     # ── Summary table ──────────────────────────────────────────────────────
     print(f"\n{'='*70}")
